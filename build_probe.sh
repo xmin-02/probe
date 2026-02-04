@@ -1121,11 +1121,24 @@ EOF
     fi
 
     PROBE_SH="$SETUP_DIR/probe.sh"
+    PROBE_LOG_DIR="$SETUP_DIR/probe_log"
+    mkdir -p "$PROBE_LOG_DIR"
+
     cat > "$PROBE_SH" << EOF
 #!/bin/bash
 sudo pkill -9 syz-manager 2>/dev/null
+
+# Create log directory if not exists
+SCRIPT_DIR="\$( cd "\$( dirname "\${BASH_SOURCE[0]}" )" && pwd )"
+LOG_DIR="\$SCRIPT_DIR/probe_log"
+mkdir -p "\$LOG_DIR"
+
+# Generate log filename with current date/time
+LOG_FILE="\$LOG_DIR/probe_\$(date '+%y.%m.%d_%H:%M').log"
+
 echo "Starting PROBE fuzzer..."
-$PROBE_DIR/bin/syz-manager -config $CFG_FILE
+echo "Log file: \$LOG_FILE"
+$PROBE_DIR/bin/syz-manager -config $CFG_FILE 2>&1 | tee "\$LOG_FILE"
 EOF
 
     chmod +x "$PROBE_SH"
