@@ -262,6 +262,12 @@ eBPF 감지:
 - `executor/` — Guest VM 내 syz-executor와 통합
 - `pkg/fuzzer/fuzzer.go` — `signalPrio()`에 eBPF 신호 확장
 
+## 개발 규칙
+
+1. **코드 전에 계획 먼저**: 각 Phase 구현 전, 반드시 세부 개발 계획을 상의하고 합의한 후 구현 시작. 상의 없이 코딩 금지.
+2. **문서 업데이트**: 주요 변경 후 `probe.md` (EN) + `probe_kor.md` (KR) 모두 업데이트 후 GitHub 푸시.
+3. **범위**: `syzkaller/` 디렉토리만 수정. 리눅스 커널 소스 절대 불가.
+
 ## 구현 순서
 
 | Phase | 구성요소 | 난이도 | 효과 | 의존성 |

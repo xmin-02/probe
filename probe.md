@@ -263,6 +263,12 @@ eBPF detects:
 - `executor/` — integration with syz-executor in Guest VM
 - `pkg/fuzzer/fuzzer.go` — `signalPrio()` extended with eBPF signals
 
+## Development Rules
+
+1. **Plan before code**: Before implementing each Phase, MUST discuss and agree on a detailed development plan first. No coding without prior discussion.
+2. **Update docs**: After significant changes, update both `probe.md` (EN) and `probe_kor.md` (KR), then push to GitHub.
+3. **Scope**: Only modify `syzkaller/` directory. Never touch Linux kernel source.
+
 ## Implementation Order
 
 | Phase | Component | Difficulty | Impact | Dependencies |
