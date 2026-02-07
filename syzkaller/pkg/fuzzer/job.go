@@ -472,6 +472,82 @@ func (job *smashJob) getInfo() *JobInfo {
 	return job.info
 }
 
+// PROBE: focusJob performs intensive mutation of high-severity crash programs.
+// Unlike smashJob (25 iterations), focusJob runs up to focusMaxIters iterations
+// with diminishing-returns early exit when no new coverage is found.
+type focusJob struct {
+	exec  queue.Executor
+	p     *prog.Prog
+	title string
+	tier  int
+	info  *JobInfo
+}
+
+const (
+	focusMaxIters      = 300
+	focusNoProgressMax = 50
+)
+
+func (job *focusJob) run(fuzzer *Fuzzer) {
+	defer func() {
+		fuzzer.focusMu.Lock()
+		fuzzer.focusActive = false
+		fuzzer.focusMu.Unlock()
+	}()
+
+	start := time.Now()
+	rnd := fuzzer.rand()
+	var newCoverage, totalIters int
+	noProgress := 0
+	lastSignalLen := fuzzer.Cover.MaxSignalLen()
+
+	fuzzer.Logf(0, "PROBE: focus mode started for '%v' (tier %d)", job.title, job.tier)
+	job.info.Logf("focus target:\n%s", job.p.Serialize())
+
+	for i := 0; i < focusMaxIters; i++ {
+		p := job.p.Clone()
+		p.Mutate(rnd, prog.RecommendedCalls,
+			fuzzer.ChoiceTable(),
+			fuzzer.Config.NoMutateCalls,
+			fuzzer.Config.Corpus.Programs())
+		result := fuzzer.execute(job.exec, &queue.Request{
+			Prog:     p,
+			ExecOpts: setFlags(flatrpc.ExecFlagCollectSignal),
+			Stat:     fuzzer.statExecFocus,
+		})
+		if result.Stop() {
+			break
+		}
+		totalIters++
+		job.info.Execs.Add(1)
+
+		currentSignalLen := fuzzer.Cover.MaxSignalLen()
+		if currentSignalLen > lastSignalLen {
+			newCoverage++
+			noProgress = 0
+			lastSignalLen = currentSignalLen
+		} else {
+			noProgress++
+		}
+
+		if noProgress >= focusNoProgressMax {
+			break
+		}
+	}
+
+	exitReason := "completed"
+	if noProgress >= focusNoProgressMax {
+		exitReason = fmt.Sprintf("no-progress(%d)", focusNoProgressMax)
+	}
+	duration := time.Since(start).Round(time.Second)
+	fuzzer.Logf(0, "PROBE: focus mode ended for '%v' — iters: %d/%d, new_coverage: %d, exit_reason: %s, duration: %v",
+		job.title, totalIters, focusMaxIters, newCoverage, exitReason, duration)
+}
+
+func (job *focusJob) getInfo() *JobInfo {
+	return job.info
+}
+
 func randomCollide(origP *prog.Prog, rnd *rand.Rand) *prog.Prog {
 	if rnd.Intn(5) == 0 {
 		// Old-style collide with a 20% probability.

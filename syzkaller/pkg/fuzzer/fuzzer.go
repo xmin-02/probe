@@ -39,6 +39,11 @@ type Fuzzer struct {
 	ctMu         sync.Mutex // TODO: use RWLock.
 	ctRegenerate chan struct{}
 
+	// PROBE: Focus Mode state.
+	focusMu     sync.Mutex
+	focusTitles map[string]bool // titles that have been focused (prevents re-focus)
+	focusActive bool            // true while a focus job is running
+
 	execQueues
 }
 
@@ -62,6 +67,8 @@ func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
 		// We're okay to lose some of the messages -- if we are already
 		// regenerating the table, we don't want to repeat it right away.
 		ctRegenerate: make(chan struct{}),
+
+		focusTitles: map[string]bool{},
 	}
 	f.execQueues = newExecQueues(f)
 	f.updateChoiceTable(nil)
@@ -83,6 +90,7 @@ type execQueues struct {
 	triageCandidateQueue *queue.DynamicOrderer
 	candidateQueue       *queue.PlainQueue
 	triageQueue          *queue.DynamicOrderer
+	focusQueue           *queue.PlainQueue // PROBE
 	smashQueue           *queue.PlainQueue
 	source               queue.Source
 }
@@ -92,6 +100,7 @@ func newExecQueues(fuzzer *Fuzzer) execQueues {
 		triageCandidateQueue: queue.DynamicOrder(),
 		candidateQueue:       queue.Plain(),
 		triageQueue:          queue.DynamicOrder(),
+		focusQueue:           queue.Plain(), // PROBE
 		smashQueue:           queue.Plain(),
 	}
 	// Alternate smash jobs with exec/fuzz to spread attention to the wider area.
@@ -107,6 +116,7 @@ func newExecQueues(fuzzer *Fuzzer) execQueues {
 		ret.triageCandidateQueue,
 		ret.candidateQueue,
 		ret.triageQueue,
+		queue.Alternate(ret.focusQueue, 2), // PROBE: focus every 2nd request
 		queue.Alternate(ret.smashQueue, skipQueue),
 		queue.Callback(fuzzer.genFuzz),
 	)
@@ -373,6 +383,38 @@ func (fuzzer *Fuzzer) AddCandidates(candidates []Candidate) {
 		}
 		fuzzer.enqueue(fuzzer.candidateQueue, req, candidate.Flags|progCandidate, 0)
 	}
+}
+
+// PROBE: AddFocusCandidate queues a high-severity crash program for intensive mutation.
+// Returns false if the title is already being focused, was already focused, or another focus job is active.
+func (fuzzer *Fuzzer) AddFocusCandidate(p *prog.Prog, title string, tier int) bool {
+	fuzzer.focusMu.Lock()
+	defer fuzzer.focusMu.Unlock()
+
+	if fuzzer.focusTitles[title] || fuzzer.focusActive {
+		return false
+	}
+
+	fuzzer.focusTitles[title] = true
+	fuzzer.focusActive = true
+
+	var calls []string
+	for i := range p.Calls {
+		calls = append(calls, p.CallName(i))
+	}
+
+	fuzzer.startJob(fuzzer.statJobsFocus, &focusJob{
+		exec:  fuzzer.focusQueue,
+		p:     p.Clone(),
+		title: title,
+		tier:  tier,
+		info: &JobInfo{
+			Name:  p.String(),
+			Type:  "focus",
+			Calls: calls,
+		},
+	})
+	return true
 }
 
 func (fuzzer *Fuzzer) rand() *rand.Rand {

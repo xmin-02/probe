@@ -793,7 +793,16 @@ func (mgr *Manager) saveCrash(crash *manager.Crash) bool {
 	}
 
 	// PROBE: Extract and save variant trigger programs for Tier 1/2 crashes.
-	mgr.saveVariantProgram(crash)
+	triggerProg := mgr.saveVariantProgram(crash)
+
+	// PROBE: Trigger Focus Mode for Tier 1 (Critical) crashes.
+	if tier == crash_pkg.TierCritical && triggerProg != nil {
+		if f := mgr.fuzzer.Load(); f != nil {
+			if f.AddFocusCandidate(triggerProg, crash.Title, tier) {
+				log.Logf(0, "PROBE: focus mode queued for '%v'", crash.Title)
+			}
+		}
+	}
 
 	if first {
 		go mgr.emailCrash(crash)
@@ -801,14 +810,15 @@ func (mgr *Manager) saveCrash(crash *manager.Crash) bool {
 	return mgr.NeedRepro(crash)
 }
 
-// PROBE: saveVariantProgram extracts the trigger program from crash output and saves it as a variant.
-func (mgr *Manager) saveVariantProgram(crash *manager.Crash) {
+// PROBE: saveVariantProgram extracts the trigger program from crash output, saves it
+// as a variant, and returns it for use by Focus Mode.
+func (mgr *Manager) saveVariantProgram(crash *manager.Crash) *prog.Prog {
 	if len(crash.Output) == 0 {
-		return
+		return nil
 	}
 	entries := mgr.target.ParseLog(crash.Output, prog.NonStrict)
 	if len(entries) == 0 {
-		return
+		return nil
 	}
 	// Find the program that was executing when the crash occurred.
 	var triggerProg *prog.Prog
@@ -830,6 +840,7 @@ func (mgr *Manager) saveVariantProgram(crash *manager.Crash) {
 	} else if newVariant {
 		log.Logf(0, "PROBE: new variant for '%v' (tier %d)", crash.Title, crash.Type.Tier())
 	}
+	return triggerProg
 }
 
 func (mgr *Manager) needLocalRepro(crash *manager.Crash) bool {

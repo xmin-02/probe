@@ -42,6 +42,14 @@ func (cover *Cover) CopyMaxSignal() signal.Signal {
 	return cover.maxSignal.Copy()
 }
 
+// PROBE: MaxSignalLen returns the current size of the max signal set.
+// Used by focusJob to detect coverage progress.
+func (cover *Cover) MaxSignalLen() int {
+	cover.mu.RLock()
+	defer cover.mu.RUnlock()
+	return cover.maxSignal.Len()
+}
+
 func (cover *Cover) GrabSignalDelta() signal.Signal {
 	cover.mu.Lock()
 	defer cover.mu.Unlock()

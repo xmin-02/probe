@@ -112,7 +112,7 @@ Crashes (thousands/day)
 
 **Why grouping matters**: Same crash point ≠ same exploitability. A write-UAF and read-UAF at the same location have vastly different exploit potential. Deleting "duplicates" loses attack vectors that Focus Mode needs.
 
-## Phase 2: Focus Mode
+## Phase 2: Focus Mode [DONE]
 
 **Goal**: When a high-severity crash is found, switch to intensive exploitation of that finding.
 
@@ -126,40 +126,43 @@ Normal Mode (exploration)
           |
           +-- Low severity → Standard processing (25x smash)
           |
-          +-- High severity → FOCUS MODE
+          +-- High severity (Tier 1) → FOCUS MODE
                 |
                 +-- 1. Intensive mutation of crash program
-                |     +-- Syscall argument micro-variations
-                |     +-- Call ordering/timing permutations
-                |     +-- Related syscall substitution
-                |     +-- UAF: vary free↔reuse gap
-                |     +-- OOB: explore size boundaries
+                |     +-- 300 iterations (vs 25 in smash)
+                |     +-- Standard prog.Mutate() (Phase 4 adds UAF/OOB-specific)
                 |
-                +-- 2. Variant discovery & combination
-                |     +-- Upgrade read-UAF → write-UAF
-                |     +-- Expand 1-byte OOB → larger OOB
-                |     +-- Find different vulns in same code path
-                |     +-- Cross-combine variants from same group
-                |     |     (e.g., Variant D's free path
-                |     |      + Variant B's write pattern)
+                +-- 2. Diminishing returns exit
+                |     +-- 50 consecutive iterations with no new coverage → early exit
+                |     +-- Tracks max signal growth for progress detection
                 |
-                +-- 3. Exit on diminishing returns
-                      +-- N consecutive iterations with no new findings
+                +-- 3. Concurrency limits
+                      +-- Max 1 concurrent focus job
+                      +-- Same crash title never re-focused
+                      +-- Alternate(2): 1 focus request per 2 queue polls
 ```
 
-**Modification targets**:
-- `pkg/fuzzer/job.go` — add `focusJob` type
-- `pkg/fuzzer/fuzzer.go` — add `focusQueue` with high priority
+**Implementation**:
+- `pkg/fuzzer/job.go` — `focusJob` type (300 iters, diminishing returns exit)
+- `pkg/fuzzer/fuzzer.go` — `focusQueue`, `AddFocusCandidate()`, focus state tracking
+- `pkg/fuzzer/cover.go` — `MaxSignalLen()` for progress detection
+- `pkg/fuzzer/stats.go` — `statJobsFocus`, `statExecFocus`
+- `syz-manager/manager.go` — Tier 1 crash → Focus Mode trigger bridge
 
-**Queue priority** (updated):
+**Queue priority** (implemented):
 ```
 1. triageCandidateQueue
 2. candidateQueue
 3. triageQueue
-4. focusQueue            ← NEW: high-severity crash intensive mutation
-5. smashQueue
+4. focusQueue (Alternate 2)  ← PROBE: high-severity crash intensive mutation
+5. smashQueue (Alternate 3)
 6. genFuzz
 ```
+
+**Logging strategy**:
+- Entry: `Logf(0)` — `PROBE: focus mode started for 'X' (tier N)`
+- Exit:  `Logf(0)` — `PROBE: focus mode ended for 'X' — iters, new_coverage, exit_reason, duration`
+- Mid-session: no logs (internal counters only, summarized at exit)
 
 ## Phase 3: AI Triage + Focus Guide
 
@@ -279,7 +282,7 @@ eBPF detects:
 | Phase | Component | Difficulty | Impact | Dependencies |
 |-------|-----------|-----------|--------|-------------|
 | 1 | Crash Filtering & Dedup Pipeline | Low | Immediate noise reduction + variant preservation | None | **DONE** |
-| 2 | Focus Mode | Medium | Deep exploitation of high-severity findings | Phase 1 (needs severity tiers) |
+| 2 | Focus Mode | Medium | Deep exploitation of high-severity findings | Phase 1 (needs severity tiers) | **DONE** |
 | 3 | AI Triage (Claude Haiku 4.5) | Medium | Smart group-level crash analysis | Phase 1 (needs dedup groups), Phase 2 (needs Focus Mode) |
 | 4 | UAF/OOB Mutation Engine | Medium-High | Higher vuln discovery rate | None (can parallel with 2-3) |
 | 5 | eBPF Runtime Monitor | High | Real-time exploitability feedback | Phase 2 (needs Focus Mode feedback loop) |

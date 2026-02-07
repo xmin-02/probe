@@ -20,6 +20,7 @@ type Stats struct {
 	statJobsTriage          *stat.Val
 	statJobsTriageCandidate *stat.Val
 	statJobsSmash           *stat.Val
+	statJobsFocus           *stat.Val // PROBE
 	statJobsFaultInjection  *stat.Val
 	statJobsHints           *stat.Val
 	statExecTime            *stat.Val
@@ -29,6 +30,7 @@ type Stats struct {
 	statExecTriage          *stat.Val
 	statExecMinimize        *stat.Val
 	statExecSmash           *stat.Val
+	statExecFocus           *stat.Val // PROBE
 	statExecFaultInject     *stat.Val
 	statExecHint            *stat.Val
 	statExecSeed            *stat.Val
@@ -58,6 +60,8 @@ func newStats(target *prog.Target) Stats {
 			stat.StackedGraph("jobs"), stat.Link("/jobs?type=triage")),
 		statJobsSmash: stat.New("smash jobs", "Running smash jobs", stat.StackedGraph("jobs"),
 			stat.Link("/jobs?type=smash")),
+		statJobsFocus: stat.New("focus jobs", "Running focus mode jobs", stat.StackedGraph("jobs"),
+			stat.Link("/jobs?type=focus")),
 		statJobsFaultInjection: stat.New("fault jobs", "Running fault injection jobs", stat.StackedGraph("jobs")),
 		statJobsHints: stat.New("hints jobs", "Running hints jobs", stat.StackedGraph("jobs"),
 			stat.Link("/jobs?type=hints")),
@@ -73,6 +77,8 @@ func newStats(target *prog.Target) Stats {
 		statExecMinimize: stat.New("exec minimize", "Executions of programs during minimization",
 			stat.Rate{}, stat.StackedGraph("exec")),
 		statExecSmash: stat.New("exec smash", "Executions of smashed programs",
+			stat.Rate{}, stat.StackedGraph("exec")),
+		statExecFocus: stat.New("exec focus", "Executions of focus mode programs",
 			stat.Rate{}, stat.StackedGraph("exec")),
 		statExecFaultInject: stat.New("exec inject", "Executions of fault injection",
 			stat.Rate{}, stat.StackedGraph("exec")),

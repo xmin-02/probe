@@ -111,7 +111,7 @@
 
 **그룹핑이 중요한 이유**: 같은 크래시 지점 ≠ 같은 익스플로잇 가능성. 같은 위치의 write-UAF와 read-UAF는 익스플로잇 잠재력이 완전히 다름. "중복"을 삭제하면 포커스 모드에 필요한 공격 벡터를 잃게 됨.
 
-## Phase 2: 포커스 모드
+## Phase 2: 포커스 모드 [완료]
 
 **목표**: 고위험 크래시 발견 시 해당 발견을 집중적으로 파고드는 모드로 전환.
 
@@ -125,40 +125,43 @@
           |
           +-- 저위험 → 기존 처리 (25회 smash)
           |
-          +-- 고위험 → 포커스 모드 진입
+          +-- 고위험 (Tier 1) → 포커스 모드 진입
                 |
                 +-- 1. 크래시 프로그램 집중 뮤테이션
-                |     +-- syscall 인자 미세 변형
-                |     +-- 호출 순서/타이밍 순열
-                |     +-- 관련 syscall 치환
-                |     +-- UAF: free↔reuse 간격 조절
-                |     +-- OOB: 크기 경계 탐색
+                |     +-- 300회 반복 (smash의 25회 대비)
+                |     +-- 기본 prog.Mutate() 사용 (Phase 4에서 UAF/OOB 특화 추가)
                 |
-                +-- 2. 변종 탐색 & 조합
-                |     +-- read-UAF → write-UAF 업그레이드
-                |     +-- 1바이트 OOB → 더 큰 OOB로 확장
-                |     +-- 같은 코드 경로에서 다른 취약점 발견
-                |     +-- 같은 그룹 내 변종 간 크로스 조합
-                |     |     (예: 변종 D의 해제 경로
-                |     |      + 변종 B의 write 패턴)
+                +-- 2. 수확 체감 시 조기 탈출
+                |     +-- 50회 연속 새 커버리지 없으면 조기 종료
+                |     +-- max signal 증가 추적으로 진행 상황 감지
                 |
-                +-- 3. 수확 체감 시 탈출
-                      +-- N회 연속 새로운 발견 없으면 복귀
+                +-- 3. 동시성 제한
+                      +-- 동시 실행 최대 1개 focus job
+                      +-- 같은 크래시 타이틀 재포커스 불가
+                      +-- Alternate(2): 큐 폴링 2회당 focus 1회
 ```
 
-**수정 대상**:
-- `pkg/fuzzer/job.go` — `focusJob` 타입 추가
-- `pkg/fuzzer/fuzzer.go` — `focusQueue`를 높은 우선순위로 추가
+**구현 파일**:
+- `pkg/fuzzer/job.go` — `focusJob` 타입 (300회 반복, 수확 체감 종료)
+- `pkg/fuzzer/fuzzer.go` — `focusQueue`, `AddFocusCandidate()`, focus 상태 관리
+- `pkg/fuzzer/cover.go` — `MaxSignalLen()` 진행 감지용
+- `pkg/fuzzer/stats.go` — `statJobsFocus`, `statExecFocus`
+- `syz-manager/manager.go` — Tier 1 크래시 → 포커스 모드 트리거 브릿지
 
-**큐 우선순위** (변경):
+**큐 우선순위** (구현):
 ```
 1. triageCandidateQueue
 2. candidateQueue
 3. triageQueue
-4. focusQueue            ← 신규: 고위험 크래시 집중 뮤테이션
-5. smashQueue
+4. focusQueue (Alternate 2)  ← PROBE: 고위험 크래시 집중 뮤테이션
+5. smashQueue (Alternate 3)
 6. genFuzz
 ```
+
+**로그 전략**:
+- 진입: `Logf(0)` — `PROBE: focus mode started for 'X' (tier N)`
+- 탈출: `Logf(0)` — `PROBE: focus mode ended for 'X' — iters, new_coverage, exit_reason, duration`
+- 중간: 로그 없음 (내부 카운터만 추적, 탈출 시 요약 출력)
 
 ## Phase 3: AI 트리아지 + 포커스 가이드
 
@@ -278,7 +281,7 @@ eBPF 감지:
 | Phase | 구성요소 | 난이도 | 효과 | 의존성 |
 |-------|---------|--------|------|--------|
 | 1 | 크래시 필터링 & 중복 제거 파이프라인 | 낮음 | 즉각적 노이즈 감소 + 변종 다양성 보존 | 없음 | **완료** |
-| 2 | 포커스 모드 | 중간 | 고위험 발견 사항 심화 탐색 | Phase 1 (심각도 등급 필요) |
+| 2 | 포커스 모드 | 중간 | 고위험 발견 사항 심화 탐색 | Phase 1 (심각도 등급 필요) | **완료** |
 | 3 | AI 트리아지 (Claude Haiku 4.5) | 중간 | 스마트 그룹 단위 크래시 분석 | Phase 1 (중복 제거 그룹 필요), Phase 2 (포커스 모드 필요) |
 | 4 | UAF/OOB 뮤테이션 엔진 | 중간~높음 | 취약점 발견율 향상 | 없음 (2-3과 병렬 가능) |
 | 5 | eBPF 런타임 모니터 | 높음 | 실시간 익스플로잇 가능성 피드백 | Phase 2 (포커스 모드 피드백 루프 필요) |
