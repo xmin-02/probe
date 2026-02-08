@@ -238,37 +238,96 @@ Output per call: ~750 tokens (analysis + score + strategy)
 - Added OOB-specific strategy to `mutateSize()` (20% chance): off-by-one above/below, double size, zero size, page-size overshoot
 - Strategy uses actual buffer size (from `assignSizesCall`) as reference, `preserve=true` prevents recalculation
 
-## Phase 5: eBPF Runtime Monitor
+## Phase 5: eBPF Runtime Monitor — **DONE**
 
 **Goal**: Real-time kernel heap state tracking for exploitability assessment.
 
-**Constraint**: Runs inside Guest VM, attaches to existing kernel functions via kprobes/tracepoints. NO kernel source modification.
+**Constraint**: Runs inside Guest VM, attaches to existing kernel tracepoints. NO kernel source modification.
 
-### Monitoring targets
-- `kprobe/kmalloc`, `kprobe/kfree` — track slab object lifecycle
-- `kprobe/copy_from_user`, `kprobe/copy_to_user` — detect OOB access patterns
-- slab allocator tracepoints — cache reuse detection
+### Architecture
 
-### Feedback loop
 ```
-eBPF detects:
-  "Object freed, then same slab cache reallocated 42us later"
-  → High exploitability signal
-  → Fed back to fuzzer as priority signal
-
-eBPF detects:
-  "Write to reallocated object from different context"
-  → Critical signal → intensify Focus Mode
-
-eBPF detects:
-  "Free without reallocation, read-only access"
-  → Low exploitability → deprioritize
+Host (syz-manager)              Guest VM
+┌──────────────┐     SCP     ┌──────────────────────────┐
+│ bin/          │ ──────────→ │ syz-ebpf-loader          │
+│  syz-ebpf-   │             │   loads probe_ebpf.bpf.o  │
+│  loader      │             │   pins maps to /sys/fs/bpf│
+│  probe_ebpf  │             │   attaches tracepoints    │
+│  .bpf.o      │             │   exits                   │
+└──────────────┘             └──────────────────────────┘
+                                      │
+                                      ▼
+                             ┌──────────────────────────┐
+                             │ Kernel eBPF Programs      │
+                             │  trace_kfree → freed_objs │
+                             │  trace_kmalloc → reuse    │
+                             │  metrics map (pinned)     │
+                             └──────────────────────────┘
+                                      │
+                                      ▼
+                             ┌──────────────────────────┐
+                             │ syz-executor              │
+                             │  ebpf_init() → open map   │
+                             │  per-exec: read+reset     │
+                             │  UAF score in FlatBuffers  │
+                             └──────────────────────────┘
+                                      │
+                                      ▼
+                             Host (fuzzer feedback)
+                             ┌──────────────────────────┐
+                             │ processResult()           │
+                             │  eBPF metrics → stats     │
+                             │  UAF score ≥ 70 →         │
+                             │    Focus Mode trigger     │
+                             └──────────────────────────┘
 ```
 
-**Modification targets**:
-- New eBPF module (BPF C programs + loader)
-- `executor/` — integration with syz-executor in Guest VM
-- `pkg/fuzzer/fuzzer.go` — `signalPrio()` extended with eBPF signals
+### 5a. BPF C Program — **DONE**
+- `executor/ebpf/probe_ebpf.bpf.c` — hooks `tracepoint/kmem/kfree` and `tracepoint/kmem/kmalloc`
+- LRU hash map (8192 entries) tracks recently freed pointers with timestamps
+- Array map stores per-execution metrics: alloc_count, free_count, reuse_count, rapid_reuse_count, min_reuse_delay_ns
+- Detects slab reuse (free→alloc of same pointer) and rapid reuse (< 100us = UAF-favorable)
+
+### 5b. BPF Loader — **DONE**
+- `tools/syz-ebpf-loader/main.go` — standalone Go binary using `cilium/ebpf`
+- Loads BPF ELF object, attaches tracepoints, pins maps+links to `/sys/fs/bpf/probe/`
+- Static binary for VM deployment; exits after setup (BPF persists in kernel)
+
+### 5c. FlatBuffers Schema Extension — **DONE**
+- Added 6 fields to `ProgInfoRaw` in `pkg/flatrpc/flatrpc.fbs`:
+  - `ebpf_alloc_count`, `ebpf_free_count`, `ebpf_reuse_count`, `ebpf_rapid_reuse_count` (uint32)
+  - `ebpf_min_reuse_ns` (uint64), `ebpf_uaf_score` (uint32)
+- Backward compatible: default 0 for old executors
+
+### 5d. Executor C++ Integration — **DONE**
+- `executor_linux.h`: `ebpf_init()` opens pinned metrics map via raw `bpf()` syscall
+- `ebpf_read_and_reset()`: reads metrics + zeros for next execution (atomic)
+- `executor.cc`: init on startup, clear before execution, read+score in `finish_output()`
+- UAF score formula: rapid_reuse > 0 (+50), min_delay < 10us (+30), reuse > 5 (+20) = 0-100
+
+### 5e. Manager Deployment — **DONE**
+- Manager copies `syz-ebpf-loader` + `probe_ebpf.bpf.o` to each VM at startup
+- Runs loader via shell command chain before executor starts
+- bpffs mount added to VM fstab (`tools/trixie/etc/fstab`)
+- Graceful degradation: if eBPF fails, executor returns zero metrics, fuzzing continues
+
+### 5f. Fuzzer Feedback — **DONE**
+- `processResult()`: tracks `statEbpfReuses` and `statEbpfUafDetected` stats
+- Non-crashing UAF detection: UAF score ≥ 70 triggers `AddFocusCandidate()` → Focus Mode
+- Stats visible in web dashboard: `ebpf reuses` (rate), `ebpf uaf` (count)
+
+### Key Design Decisions
+- **Separate loader + executor reads**: Loader handles complex BPF loading (cilium/ebpf), executor does simple map reads (raw bpf() syscall). Clean separation.
+- **Tracepoints over kprobes**: `tracepoint/kmem/kfree` and `tracepoint/kmem/kmalloc` are stable ABI.
+- **LRU hash map**: freed_objects uses LRU to auto-evict old entries, preventing unbounded growth.
+- **Graceful degradation**: If eBPF isn't available, fuzzing continues normally with zero metrics.
+
+### Build
+```bash
+cd syzkaller
+make              # Builds executor with eBPF support
+make probe_ebpf   # Builds BPF object + loader to bin/linux_amd64/
+```
 
 ## Development Rules
 
@@ -284,7 +343,7 @@ eBPF detects:
 | 2 | Focus Mode | Medium | Deep exploitation of high-severity findings | Phase 1 (needs severity tiers) | **DONE** |
 | 3 | AI Triage (Claude Haiku 4.5) | Medium | Smart group-level crash analysis | Phase 1 (needs dedup groups), Phase 2 (needs Focus Mode) |
 | 4 | Practical Hardening (UAF/OOB) | Medium | Higher vuln discovery rate | None (can parallel with 2-3) | **DONE** |
-| 5 | eBPF Runtime Monitor | High | Real-time exploitability feedback | Phase 2 (needs Focus Mode feedback loop) |
+| 5 | eBPF Runtime Monitor | High | Real-time exploitability feedback | Phase 2 (needs Focus Mode feedback loop) | **DONE** |
 
 **Critical path**: Phase 1 → Phase 2 → Phase 3 (sequential dependency)
 **Parallel track**: Phase 4 can start any time independently
@@ -318,3 +377,6 @@ eBPF detects:
 | `pkg/manager/` | Manager business logic |
 | `sys/linux/*.txt` | Syscall descriptions (syzlang) |
 | `executor/executor.cc` | In-VM syscall executor (C++) |
+| `executor/ebpf/probe_ebpf.bpf.c` | eBPF heap monitor (BPF C) |
+| `tools/syz-ebpf-loader/main.go` | BPF loader binary (Go) |
+| `pkg/flatrpc/flatrpc.fbs` | FlatBuffers RPC schema |

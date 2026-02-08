@@ -237,37 +237,96 @@
 - `mutateSize()`에 OOB 특화 전략 추가 (20% 확률): off-by-one 상/하, 2배 크기, 0 크기, 페이지 크기 오버슈트
 - 실제 버퍼 크기(`assignSizesCall`에서 계산)를 기준으로 사용, `preserve=true`로 재계산 방지
 
-## Phase 5: eBPF 런타임 모니터
+## Phase 5: eBPF 런타임 모니터 — **완료**
 
 **목표**: 익스플로잇 가능성 평가를 위한 실시간 커널 힙 상태 추적.
 
-**제약**: Guest VM 내부에서 실행, kprobe/tracepoint를 통해 기존 커널 함수에 attach. 커널 소스 수정 없음.
+**제약**: Guest VM 내부에서 실행, tracepoint를 통해 기존 커널 함수에 attach. 커널 소스 수정 없음.
 
-### 모니터링 대상
-- `kprobe/kmalloc`, `kprobe/kfree` — slab 오브젝트 생명주기 추적
-- `kprobe/copy_from_user`, `kprobe/copy_to_user` — OOB 접근 패턴 감지
-- slab 할당자 tracepoint — 캐시 재사용 감지
+### 아키텍처
 
-### 피드백 루프
 ```
-eBPF 감지:
-  "오브젝트 해제 후 42μs만에 같은 slab 캐시에서 재할당"
-  → 높은 익스플로잇 가능성 신호
-  → 퍼저에 우선순위 신호로 피드백
-
-eBPF 감지:
-  "다른 컨텍스트에서 재할당된 오브젝트에 write 발생"
-  → 치명적 신호 → 포커스 모드 강화
-
-eBPF 감지:
-  "재할당 없이 read-only 접근"
-  → 낮은 익스플로잇 가능성 → 우선순위 하향
+호스트 (syz-manager)              Guest VM
+┌──────────────┐     SCP     ┌──────────────────────────┐
+│ bin/          │ ──────────→ │ syz-ebpf-loader          │
+│  syz-ebpf-   │             │   probe_ebpf.bpf.o 로드    │
+│  loader      │             │   맵을 /sys/fs/bpf에 고정   │
+│  probe_ebpf  │             │   tracepoint 연결          │
+│  .bpf.o      │             │   종료 (BPF는 커널에 유지)   │
+└──────────────┘             └──────────────────────────┘
+                                      │
+                                      ▼
+                             ┌──────────────────────────┐
+                             │ 커널 eBPF 프로그램          │
+                             │  trace_kfree → freed_objs │
+                             │  trace_kmalloc → 재사용 감지│
+                             │  metrics 맵 (고정)         │
+                             └──────────────────────────┘
+                                      │
+                                      ▼
+                             ┌──────────────────────────┐
+                             │ syz-executor              │
+                             │  ebpf_init() → 맵 열기     │
+                             │  실행당: read+reset        │
+                             │  UAF 점수를 FlatBuffers에   │
+                             └──────────────────────────┘
+                                      │
+                                      ▼
+                             호스트 (퍼저 피드백)
+                             ┌──────────────────────────┐
+                             │ processResult()           │
+                             │  eBPF 메트릭 → 통계        │
+                             │  UAF 점수 ≥ 70 →          │
+                             │    포커스 모드 트리거       │
+                             └──────────────────────────┘
 ```
 
-**수정 대상**:
-- 새 eBPF 모듈 (BPF C 프로그램 + 로더)
-- `executor/` — Guest VM 내 syz-executor와 통합
-- `pkg/fuzzer/fuzzer.go` — `signalPrio()`에 eBPF 신호 확장
+### 5a. BPF C 프로그램 — **완료**
+- `executor/ebpf/probe_ebpf.bpf.c` — `tracepoint/kmem/kfree`와 `tracepoint/kmem/kmalloc` 후킹
+- LRU 해시 맵 (8192 엔트리)으로 최근 해제된 포인터와 타임스탬프 추적
+- Array 맵에 실행당 메트릭 저장: alloc_count, free_count, reuse_count, rapid_reuse_count, min_reuse_delay_ns
+- Slab 재사용 (같은 포인터의 free→alloc) 및 빠른 재사용 (< 100μs = UAF 유리 조건) 감지
+
+### 5b. BPF 로더 — **완료**
+- `tools/syz-ebpf-loader/main.go` — `cilium/ebpf`를 사용하는 독립 Go 바이너리
+- BPF ELF 오브젝트 로드, tracepoint 연결, 맵+링크를 `/sys/fs/bpf/probe/`에 고정
+- VM 배포용 정적 바이너리; 셋업 후 종료 (BPF는 커널에 지속)
+
+### 5c. FlatBuffers 스키마 확장 — **완료**
+- `pkg/flatrpc/flatrpc.fbs`의 `ProgInfoRaw`에 6개 필드 추가:
+  - `ebpf_alloc_count`, `ebpf_free_count`, `ebpf_reuse_count`, `ebpf_rapid_reuse_count` (uint32)
+  - `ebpf_min_reuse_ns` (uint64), `ebpf_uaf_score` (uint32)
+- 하위 호환: 구버전 executor에서는 기본값 0
+
+### 5d. Executor C++ 통합 — **완료**
+- `executor_linux.h`: `ebpf_init()`으로 고정된 메트릭 맵을 raw `bpf()` syscall로 열기
+- `ebpf_read_and_reset()`: 메트릭 읽기 + 다음 실행을 위해 초기화 (원자적)
+- `executor.cc`: 시작 시 init, 실행 전 clear, `finish_output()`에서 read+점수 계산
+- UAF 점수 산식: rapid_reuse > 0 (+50), min_delay < 10μs (+30), reuse > 5 (+20) = 0-100
+
+### 5e. Manager 배포 — **완료**
+- Manager가 VM 시작 시 `syz-ebpf-loader` + `probe_ebpf.bpf.o`를 각 VM에 복사
+- Executor 시작 전 셸 명령 체인으로 로더 실행
+- VM fstab에 bpffs 마운트 추가 (`tools/trixie/etc/fstab`)
+- 그레이스풀 디그레이데이션: eBPF 실패 시 executor는 0 메트릭 반환, 퍼징 계속
+
+### 5f. 퍼저 피드백 — **완료**
+- `processResult()`: `statEbpfReuses`와 `statEbpfUafDetected` 통계 추적
+- 비크래시 UAF 감지: UAF 점수 ≥ 70이면 `AddFocusCandidate()` → 포커스 모드 트리거
+- 웹 대시보드에서 통계 확인: `ebpf reuses` (비율), `ebpf uaf` (카운트)
+
+### 주요 설계 결정
+- **로더와 executor 분리**: 로더가 복잡한 BPF 로딩 처리 (cilium/ebpf), executor는 간단한 맵 읽기 (raw bpf() syscall)
+- **kprobe 대신 tracepoint**: `tracepoint/kmem/kfree`, `tracepoint/kmem/kmalloc`는 안정적인 ABI
+- **LRU 해시 맵**: freed_objects가 LRU로 오래된 엔트리 자동 제거, 무한 성장 방지
+- **그레이스풀 디그레이데이션**: eBPF 미사용 시 정상적으로 0 메트릭으로 퍼징 계속
+
+### 빌드
+```bash
+cd syzkaller
+make              # eBPF 지원 포함 executor 빌드
+make probe_ebpf   # BPF 오브젝트 + 로더를 bin/linux_amd64/에 빌드
+```
 
 ## 개발 규칙
 
@@ -283,7 +342,7 @@ eBPF 감지:
 | 2 | 포커스 모드 | 중간 | 고위험 발견 사항 심화 탐색 | Phase 1 (심각도 등급 필요) | **완료** |
 | 3 | AI 트리아지 (Claude Haiku 4.5) | 중간 | 스마트 그룹 단위 크래시 분석 | Phase 1 (중복 제거 그룹 필요), Phase 2 (포커스 모드 필요) |
 | 4 | Practical Hardening (UAF/OOB) | 중간 | 취약점 발견율 향상 | 없음 (2-3과 병렬 가능) | **완료** |
-| 5 | eBPF 런타임 모니터 | 높음 | 실시간 익스플로잇 가능성 피드백 | Phase 2 (포커스 모드 피드백 루프 필요) |
+| 5 | eBPF 런타임 모니터 | 높음 | 실시간 익스플로잇 가능성 피드백 | Phase 2 (포커스 모드 피드백 루프 필요) | **완료** |
 
 **크리티컬 패스**: Phase 1 → Phase 2 → Phase 3 (순차 의존성)
 **병렬 트랙**: Phase 4는 독립적으로 언제든 시작 가능
@@ -317,3 +376,6 @@ eBPF 감지:
 | `pkg/manager/` | 매니저 비즈니스 로직 |
 | `sys/linux/*.txt` | Syscall 기술 (syzlang) |
 | `executor/executor.cc` | VM 내 syscall 실행기 (C++) |
+| `executor/ebpf/probe_ebpf.bpf.c` | eBPF 힙 모니터 (BPF C) |
+| `tools/syz-ebpf-loader/main.go` | BPF 로더 바이너리 (Go) |
+| `pkg/flatrpc/flatrpc.fbs` | FlatBuffers RPC 스키마 |

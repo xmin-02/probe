@@ -607,6 +607,9 @@ int main(int argc, char** argv)
 	start_time_ms = current_time_ms();
 
 	os_init(argc, argv, (char*)SYZ_DATA_OFFSET, SYZ_NUM_PAGES * SYZ_PAGE_SIZE);
+#if GOOS_linux
+	ebpf_init(); // PROBE: open pinned eBPF metrics map
+#endif
 	use_temporary_dir();
 	install_segv_handler();
 	current_thread = &threads[0];
@@ -945,6 +948,8 @@ void execute_one()
 	// Linux TASK_COMM_LEN is only 16, so the name needs to be compact.
 	snprintf(buf, sizeof(buf), "syz.%llu.%llu", procid, request_id);
 	prctl(PR_SET_NAME, buf);
+	// PROBE: Clear stale eBPF metrics before execution
+	ebpf_read_and_reset();
 #endif
 	if (flag_snapshot)
 		SnapshotStart();
@@ -1477,7 +1482,29 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
 		}
 		calls[call.index] = call.offset;
 	}
-	auto prog_info_off = rpc::CreateProgInfoRawDirect(fbb, &calls, &extra, 0, elapsed, freshness);
+	// PROBE: Read eBPF heap metrics collected during this execution.
+	uint32 ebpf_alloc = 0, ebpf_free = 0, ebpf_reuse = 0, ebpf_rapid = 0, ebpf_uaf_score = 0;
+	uint64 ebpf_min_ns = 0;
+#if GOOS_linux
+	{
+		auto metrics = ebpf_read_and_reset();
+		ebpf_alloc = (uint32)metrics.alloc_count;
+		ebpf_free = (uint32)metrics.free_count;
+		ebpf_reuse = (uint32)metrics.reuse_count;
+		ebpf_rapid = (uint32)metrics.rapid_reuse_count;
+		ebpf_min_ns = metrics.min_reuse_delay_ns;
+		// Compute UAF exploitability score (0-100)
+		if (metrics.rapid_reuse_count > 0)
+			ebpf_uaf_score += 50;
+		if (metrics.min_reuse_delay_ns > 0 && metrics.min_reuse_delay_ns < 10000)
+			ebpf_uaf_score += 30;
+		if (metrics.reuse_count > 5)
+			ebpf_uaf_score += 20;
+	}
+#endif
+	auto prog_info_off = rpc::CreateProgInfoRawDirect(fbb, &calls, &extra, 0, elapsed, freshness,
+							  ebpf_alloc, ebpf_free, ebpf_reuse, ebpf_rapid,
+							  ebpf_min_ns, ebpf_uaf_score);
 	flatbuffers::Offset<flatbuffers::String> error_off = 0;
 	if (status == kFailStatus)
 		error_off = fbb.CreateString("process failed");

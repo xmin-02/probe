@@ -3022,11 +3022,17 @@ func CreateComparisonRaw(builder *flatbuffers.Builder, pc uint64, op1 uint64, op
 }
 
 type ProgInfoRawT struct {
-	Calls     []*CallInfoRawT `json:"calls"`
-	ExtraRaw  []*CallInfoRawT `json:"extra_raw"`
-	Extra     *CallInfoRawT   `json:"extra"`
-	Elapsed   uint64          `json:"elapsed"`
-	Freshness uint64          `json:"freshness"`
+	Calls               []*CallInfoRawT `json:"calls"`
+	ExtraRaw            []*CallInfoRawT `json:"extra_raw"`
+	Extra               *CallInfoRawT   `json:"extra"`
+	Elapsed             uint64          `json:"elapsed"`
+	Freshness           uint64          `json:"freshness"`
+	EbpfAllocCount      uint32          `json:"ebpf_alloc_count"`
+	EbpfFreeCount       uint32          `json:"ebpf_free_count"`
+	EbpfReuseCount      uint32          `json:"ebpf_reuse_count"`
+	EbpfRapidReuseCount uint32          `json:"ebpf_rapid_reuse_count"`
+	EbpfMinReuseNs      uint64          `json:"ebpf_min_reuse_ns"`
+	EbpfUafScore        uint32          `json:"ebpf_uaf_score"`
 }
 
 func (t *ProgInfoRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
@@ -3066,6 +3072,12 @@ func (t *ProgInfoRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	ProgInfoRawAddExtra(builder, extraOffset)
 	ProgInfoRawAddElapsed(builder, t.Elapsed)
 	ProgInfoRawAddFreshness(builder, t.Freshness)
+	ProgInfoRawAddEbpfAllocCount(builder, t.EbpfAllocCount)
+	ProgInfoRawAddEbpfFreeCount(builder, t.EbpfFreeCount)
+	ProgInfoRawAddEbpfReuseCount(builder, t.EbpfReuseCount)
+	ProgInfoRawAddEbpfRapidReuseCount(builder, t.EbpfRapidReuseCount)
+	ProgInfoRawAddEbpfMinReuseNs(builder, t.EbpfMinReuseNs)
+	ProgInfoRawAddEbpfUafScore(builder, t.EbpfUafScore)
 	return ProgInfoRawEnd(builder)
 }
 
@@ -3087,6 +3099,12 @@ func (rcv *ProgInfoRaw) UnPackTo(t *ProgInfoRawT) {
 	t.Extra = rcv.Extra(nil).UnPack()
 	t.Elapsed = rcv.Elapsed()
 	t.Freshness = rcv.Freshness()
+	t.EbpfAllocCount = rcv.EbpfAllocCount()
+	t.EbpfFreeCount = rcv.EbpfFreeCount()
+	t.EbpfReuseCount = rcv.EbpfReuseCount()
+	t.EbpfRapidReuseCount = rcv.EbpfRapidReuseCount()
+	t.EbpfMinReuseNs = rcv.EbpfMinReuseNs()
+	t.EbpfUafScore = rcv.EbpfUafScore()
 }
 
 func (rcv *ProgInfoRaw) UnPack() *ProgInfoRawT {
@@ -3210,8 +3228,80 @@ func (rcv *ProgInfoRaw) MutateFreshness(n uint64) bool {
 	return rcv._tab.MutateUint64Slot(12, n)
 }
 
+func (rcv *ProgInfoRaw) EbpfAllocCount() uint32 {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(14))
+	if o != 0 {
+		return rcv._tab.GetUint32(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *ProgInfoRaw) MutateEbpfAllocCount(n uint32) bool {
+	return rcv._tab.MutateUint32Slot(14, n)
+}
+
+func (rcv *ProgInfoRaw) EbpfFreeCount() uint32 {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(16))
+	if o != 0 {
+		return rcv._tab.GetUint32(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *ProgInfoRaw) MutateEbpfFreeCount(n uint32) bool {
+	return rcv._tab.MutateUint32Slot(16, n)
+}
+
+func (rcv *ProgInfoRaw) EbpfReuseCount() uint32 {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(18))
+	if o != 0 {
+		return rcv._tab.GetUint32(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *ProgInfoRaw) MutateEbpfReuseCount(n uint32) bool {
+	return rcv._tab.MutateUint32Slot(18, n)
+}
+
+func (rcv *ProgInfoRaw) EbpfRapidReuseCount() uint32 {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(20))
+	if o != 0 {
+		return rcv._tab.GetUint32(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *ProgInfoRaw) MutateEbpfRapidReuseCount(n uint32) bool {
+	return rcv._tab.MutateUint32Slot(20, n)
+}
+
+func (rcv *ProgInfoRaw) EbpfMinReuseNs() uint64 {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(22))
+	if o != 0 {
+		return rcv._tab.GetUint64(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *ProgInfoRaw) MutateEbpfMinReuseNs(n uint64) bool {
+	return rcv._tab.MutateUint64Slot(22, n)
+}
+
+func (rcv *ProgInfoRaw) EbpfUafScore() uint32 {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(24))
+	if o != 0 {
+		return rcv._tab.GetUint32(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *ProgInfoRaw) MutateEbpfUafScore(n uint32) bool {
+	return rcv._tab.MutateUint32Slot(24, n)
+}
+
 func ProgInfoRawStart(builder *flatbuffers.Builder) {
-	builder.StartObject(5)
+	builder.StartObject(11)
 }
 func ProgInfoRawAddCalls(builder *flatbuffers.Builder, calls flatbuffers.UOffsetT) {
 	builder.PrependUOffsetTSlot(0, flatbuffers.UOffsetT(calls), 0)
@@ -3233,6 +3323,24 @@ func ProgInfoRawAddElapsed(builder *flatbuffers.Builder, elapsed uint64) {
 }
 func ProgInfoRawAddFreshness(builder *flatbuffers.Builder, freshness uint64) {
 	builder.PrependUint64Slot(4, freshness, 0)
+}
+func ProgInfoRawAddEbpfAllocCount(builder *flatbuffers.Builder, ebpfAllocCount uint32) {
+	builder.PrependUint32Slot(5, ebpfAllocCount, 0)
+}
+func ProgInfoRawAddEbpfFreeCount(builder *flatbuffers.Builder, ebpfFreeCount uint32) {
+	builder.PrependUint32Slot(6, ebpfFreeCount, 0)
+}
+func ProgInfoRawAddEbpfReuseCount(builder *flatbuffers.Builder, ebpfReuseCount uint32) {
+	builder.PrependUint32Slot(7, ebpfReuseCount, 0)
+}
+func ProgInfoRawAddEbpfRapidReuseCount(builder *flatbuffers.Builder, ebpfRapidReuseCount uint32) {
+	builder.PrependUint32Slot(8, ebpfRapidReuseCount, 0)
+}
+func ProgInfoRawAddEbpfMinReuseNs(builder *flatbuffers.Builder, ebpfMinReuseNs uint64) {
+	builder.PrependUint64Slot(9, ebpfMinReuseNs, 0)
+}
+func ProgInfoRawAddEbpfUafScore(builder *flatbuffers.Builder, ebpfUafScore uint32) {
+	builder.PrependUint32Slot(10, ebpfUafScore, 0)
 }
 func ProgInfoRawEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	return builder.EndObject()

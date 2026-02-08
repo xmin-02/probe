@@ -196,6 +196,20 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 			fuzzer.handleCallInfo(req, info, call)
 		}
 		fuzzer.handleCallInfo(req, res.Info.Extra, -1)
+
+		// PROBE: eBPF heap monitoring feedback (Phase 5).
+		if res.Info.EbpfReuseCount > 0 {
+			fuzzer.statEbpfReuses.Add(int(res.Info.EbpfReuseCount))
+		}
+		// Non-crashing UAF detection: high UAF score without crash → UAF-favorable pattern.
+		if res.Info.EbpfUafScore >= 70 && res.Status != queue.Hanged {
+			fuzzer.statEbpfUafDetected.Add(1)
+			fuzzer.Logf(0, "PROBE: eBPF detected UAF-favorable pattern (score=%d, reuse=%d, rapid=%d) in %s",
+				res.Info.EbpfUafScore, res.Info.EbpfReuseCount,
+				res.Info.EbpfRapidReuseCount, req.Prog)
+			// Trigger Focus Mode: tier 1 (critical) for non-crashing UAF patterns
+			fuzzer.AddFocusCandidate(req.Prog, fmt.Sprintf("PROBE:ebpf-uaf:%s", req.Prog.String()), 1)
+		}
 	}
 
 	// Corpus candidates may have flaky coverage, so we give them a second chance.

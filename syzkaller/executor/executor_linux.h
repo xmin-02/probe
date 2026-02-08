@@ -366,6 +366,100 @@ static const char* setup_kcov_reset_ioctl()
 	return error;
 }
 
+// PROBE: eBPF heap monitor integration (Phase 5).
+// Reads pinned BPF metrics map per-execution to detect slab reuse patterns.
+// The BPF programs are loaded by syz-ebpf-loader before executor starts.
+
+#ifndef __NR_bpf
+#define __NR_bpf 321
+#endif
+
+// BPF command constants
+#define PROBE_BPF_MAP_LOOKUP_ELEM 1
+#define PROBE_BPF_MAP_UPDATE_ELEM 2
+#define PROBE_BPF_OBJ_GET 7
+
+struct probe_metrics {
+	uint64 alloc_count;
+	uint64 free_count;
+	uint64 reuse_count;
+	uint64 rapid_reuse_count;
+	uint64 min_reuse_delay_ns;
+};
+
+static int ebpf_metrics_fd = -1;
+
+static void ebpf_init()
+{
+	// BPF_OBJ_GET: open pinned map by path
+	union {
+		struct {
+			uint64 pathname;
+			uint32 bpf_fd;
+			uint32 file_flags;
+		};
+		char buf[128];
+	} attr = {};
+	memset(&attr, 0, sizeof(attr));
+
+	const char* path = "/sys/fs/bpf/probe/metrics";
+	attr.pathname = (uint64)(unsigned long)path;
+	attr.bpf_fd = 0;
+	attr.file_flags = 0;
+
+	int fd = (int)syscall(__NR_bpf, PROBE_BPF_OBJ_GET, &attr, sizeof(attr));
+	if (fd < 0) {
+		debug("PROBE: eBPF metrics map not available (errno=%d)\n", errno);
+		return;
+	}
+	ebpf_metrics_fd = fd;
+	debug("PROBE: eBPF metrics map opened (fd=%d)\n", fd);
+}
+
+static struct probe_metrics ebpf_read_and_reset()
+{
+	struct probe_metrics m = {};
+	if (ebpf_metrics_fd < 0)
+		return m;
+
+	// BPF_MAP_LOOKUP_ELEM
+	uint32 key = 0;
+	struct {
+		uint64 map_fd;
+		uint64 key;
+		uint64 value;
+		uint64 flags;
+	} lookup_attr = {};
+	lookup_attr.map_fd = (uint64)(uint32)ebpf_metrics_fd;
+	lookup_attr.key = (uint64)(unsigned long)&key;
+	lookup_attr.value = (uint64)(unsigned long)&m;
+
+	long ret = syscall(__NR_bpf, PROBE_BPF_MAP_LOOKUP_ELEM,
+			   &lookup_attr, sizeof(lookup_attr));
+	if (ret < 0) {
+		debug("PROBE: eBPF metrics read failed (errno=%d)\n", errno);
+		return m;
+	}
+
+	// BPF_MAP_UPDATE_ELEM: zero out for next execution
+	struct probe_metrics zero = {};
+	struct {
+		uint64 map_fd;
+		uint64 key;
+		uint64 value;
+		uint64 flags;
+	} update_attr = {};
+	update_attr.map_fd = (uint64)(uint32)ebpf_metrics_fd;
+	update_attr.key = (uint64)(unsigned long)&key;
+	update_attr.value = (uint64)(unsigned long)&zero;
+	update_attr.flags = 0; // BPF_ANY
+
+	syscall(__NR_bpf, PROBE_BPF_MAP_UPDATE_ELEM,
+		&update_attr, sizeof(update_attr));
+
+	return m;
+}
+
 #define SYZ_HAVE_FEATURES 1
 static feature_t features[] = {
     {rpc::Feature::DelayKcovMmap, setup_delay_kcov},

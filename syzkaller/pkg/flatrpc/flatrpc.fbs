@@ -249,6 +249,14 @@ table ProgInfoRaw {
 	elapsed			:uint64;
 	// Number of programs executed in the same process before this one.
 	freshness		:uint64;
+	// PROBE: eBPF heap monitoring metrics (Phase 5).
+	// All fields default to 0 if executor has no eBPF support (backward compatible).
+	ebpf_alloc_count	:uint32;
+	ebpf_free_count		:uint32;
+	ebpf_reuse_count	:uint32;
+	ebpf_rapid_reuse_count	:uint32;
+	ebpf_min_reuse_ns	:uint64;
+	ebpf_uaf_score		:uint32;
 }
 
 // Result of executing a test program.

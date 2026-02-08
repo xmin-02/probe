@@ -669,6 +669,33 @@ func (mgr *Manager) runInstanceInner(ctx context.Context, inst *vm.Instance, opt
 		}
 	}
 
+	// PROBE: Deploy eBPF heap monitor to VM (Phase 5).
+	// Copy loader and BPF object, run loader before executor.
+	// Graceful degradation: if any step fails, continue without eBPF.
+	ebpfSetupCmd := ""
+	ebpfLoaderPath := filepath.Join(filepath.Dir(mgr.cfg.ExecutorBin), "syz-ebpf-loader")
+	ebpfBPFObjPath := filepath.Join(filepath.Dir(mgr.cfg.ExecutorBin), "probe_ebpf.bpf.o")
+	if _, err := os.Stat(ebpfLoaderPath); err == nil {
+		if _, err := os.Stat(ebpfBPFObjPath); err == nil {
+			vmLoader, copyErr := inst.Copy(ebpfLoaderPath)
+			if copyErr != nil {
+				log.Logf(1, "PROBE: VM %v: failed to copy eBPF loader: %v", inst.Index(), copyErr)
+			} else {
+				vmBPFObj, copyErr := inst.Copy(ebpfBPFObjPath)
+				if copyErr != nil {
+					log.Logf(1, "PROBE: VM %v: failed to copy BPF object: %v", inst.Index(), copyErr)
+				} else {
+					// Mount bpffs and run loader before executor.
+					// Failures are non-fatal — executor gracefully handles missing BPF maps.
+					ebpfSetupCmd = fmt.Sprintf(
+						"mount -t bpf bpf /sys/fs/bpf 2>/dev/null; %v %v 2>&1; ",
+						vmLoader, vmBPFObj)
+					log.Logf(1, "PROBE: VM %v: eBPF heap monitor deployed", inst.Index())
+				}
+			}
+		}
+	}
+
 	// Run the fuzzer binary.
 	start := time.Now()
 
@@ -676,7 +703,7 @@ func (mgr *Manager) runInstanceInner(ctx context.Context, inst *vm.Instance, opt
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse manager's address")
 	}
-	cmd := fmt.Sprintf("%v runner %v %v %v", executorBin, inst.Index(), host, port)
+	cmd := fmt.Sprintf("%v%v runner %v %v %v", ebpfSetupCmd, executorBin, inst.Index(), host, port)
 	ctxTimeout, cancel := context.WithTimeout(ctx, mgr.cfg.Timeouts.VMRunningTime)
 	defer cancel()
 	_, reps, err := inst.Run(ctxTimeout, mgr.reporter, cmd, opts...)
