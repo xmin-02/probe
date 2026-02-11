@@ -134,6 +134,7 @@ type CostTracker struct {
 }
 
 const maxHistorySize = 100
+const maxLogLines = 200
 const krwPerUSD = 1450
 
 // Model pricing: [input_per_1M_tokens, output_per_1M_tokens] in USD.
@@ -224,6 +225,12 @@ func (ct *CostTracker) Snapshot() CostSnapshot {
 
 func KRWPerUSD() int { return krwPerUSD }
 
+// LogEntry is a single log line with timestamp.
+type LogEntry struct {
+	Time    time.Time `json:"time"`
+	Message string    `json:"message"`
+}
+
 // Triager is the main AI triage orchestrator.
 type Triager struct {
 	cfg      mgrconfig.AITriageConfig
@@ -234,6 +241,10 @@ type Triager struct {
 	running  bool
 	lastRun  time.Time
 	strategy *StrategyResult
+
+	// Console log buffer for the /ai dashboard.
+	logMu  sync.Mutex
+	logBuf []LogEntry
 
 	// Callbacks set by the manager for applying results.
 	OnTriageResult   func(crashID string, result *TriageResult)
@@ -289,9 +300,37 @@ func (t *Triager) Cost() CostSnapshot {
 func (t *Triager) Model() string    { return t.cfg.Model }
 func (t *Triager) Provider() string { return detectProvider(t.cfg) }
 
+// logf writes to both the syz-manager log and the console buffer.
+func (t *Triager) logf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	log.Logf(0, "PROBE: AI: %s", msg)
+	t.logMu.Lock()
+	t.logBuf = append(t.logBuf, LogEntry{Time: time.Now(), Message: msg})
+	if len(t.logBuf) > maxLogLines {
+		t.logBuf = t.logBuf[len(t.logBuf)-maxLogLines:]
+	}
+	t.logMu.Unlock()
+}
+
+// LogLines returns the recent console log entries.
+func (t *Triager) LogLines() []LogEntry {
+	t.logMu.Lock()
+	defer t.logMu.Unlock()
+	out := make([]LogEntry, len(t.logBuf))
+	copy(out, t.logBuf)
+	return out
+}
+
+// LogLinesJSON returns log entries as JSON bytes (for interface{} access without import).
+func (t *Triager) LogLinesJSON() []byte {
+	lines := t.LogLines()
+	data, _ := json.Marshal(lines)
+	return data
+}
+
 // Run starts the 1-hour batch loop. Call from a goroutine.
 func (t *Triager) Run(ctx context.Context) {
-	log.Logf(0, "PROBE: AI triage started (model=%v, provider=%v)", t.cfg.Model, detectProvider(t.cfg))
+	t.logf("Triage started (model=%v, provider=%v)", t.cfg.Model, detectProvider(t.cfg))
 
 	// Run first batch after 2 minutes (let fuzzer warm up).
 	timer := time.NewTimer(2 * time.Minute)
@@ -313,6 +352,7 @@ func (t *Triager) RunStepA(ctx context.Context) {
 	t.mu.Lock()
 	if t.running {
 		t.mu.Unlock()
+		t.logf("Already running, skipping manual Step A")
 		return
 	}
 	t.running = true
@@ -324,7 +364,9 @@ func (t *Triager) RunStepA(ctx context.Context) {
 		t.mu.Unlock()
 	}()
 
+	t.logf("Manual Step A triggered")
 	t.stepA(ctx)
+	t.logf("Manual Step A finished")
 }
 
 // RunStepB runs strategy generation on demand (manual trigger).
@@ -332,6 +374,7 @@ func (t *Triager) RunStepB(ctx context.Context) {
 	t.mu.Lock()
 	if t.running {
 		t.mu.Unlock()
+		t.logf("Already running, skipping manual Step B")
 		return
 	}
 	t.running = true
@@ -343,7 +386,9 @@ func (t *Triager) RunStepB(ctx context.Context) {
 		t.mu.Unlock()
 	}()
 
+	t.logf("Manual Step B triggered")
 	t.stepB(ctx)
+	t.logf("Manual Step B finished")
 }
 
 func (t *Triager) runBatch(ctx context.Context) {
@@ -362,10 +407,10 @@ func (t *Triager) runBatch(ctx context.Context) {
 		t.mu.Unlock()
 	}()
 
-	log.Logf(0, "PROBE: AI batch cycle starting")
+	t.logf("Batch cycle starting...")
 	t.stepA(ctx)
 	t.stepB(ctx)
-	log.Logf(0, "PROBE: AI batch cycle complete")
+	t.logf("Batch cycle complete")
 }
 
 func (t *Triager) stepA(ctx context.Context) {
@@ -378,28 +423,42 @@ func (t *Triager) stepA(ctx context.Context) {
 		maxTier = 2
 	}
 
-	analyzed := 0
+	t.logf("[Step A] Scanning crashes... (%d total)", len(crashes))
+
+	// Build list of crashes to analyze.
+	var pending []CrashForAnalysis
 	for _, c := range crashes {
 		if c.Tier > maxTier {
 			continue
 		}
-		// Check if already analyzed.
 		existing := loadTriageResult(t.workdir, c.ID)
 		if existing != nil {
-			// Re-analyze if variants tripled.
-			if c.NumVariants < existing.InputTokens*3 { // Quick heuristic placeholder
+			if c.NumVariants < existing.InputTokens*3 {
 				continue
 			}
 		}
 		if c.Report == "" {
 			continue
 		}
+		pending = append(pending, c)
+	}
 
+	if len(pending) == 0 {
+		t.logf("[Step A] No new crashes to analyze")
+		return
+	}
+	t.logf("[Step A] %d crashes to analyze (tier <= %d)", len(pending), maxTier)
+
+	analyzed := 0
+	for i, c := range pending {
 		select {
 		case <-ctx.Done():
+			t.logf("[Step A] Cancelled")
 			return
 		default:
 		}
+
+		t.logf("[Step A] [%d/%d] Analyzing: %s", i+1, len(pending), c.Title)
 
 		result, err := t.analyzeCrash(ctx, c)
 		call := APICall{
@@ -407,11 +466,10 @@ func (t *Triager) stepA(ctx context.Context) {
 			Type: "crash",
 		}
 		if err != nil {
-			log.Logf(0, "PROBE: AI crash analysis failed for %v: %v", c.Title, err)
+			t.logf("[Step A] [%d/%d] FAILED: %v", i+1, len(pending), err)
 			call.Success = false
 			call.Error = err.Error()
 			t.cost.Record(call, t.cfg.Model)
-			// Rate limit: wait 3 seconds between calls.
 			time.Sleep(3 * time.Second)
 			continue
 		}
@@ -422,21 +480,19 @@ func (t *Triager) stepA(ctx context.Context) {
 		call.ResultSummary = fmt.Sprintf("score=%d", result.Score)
 		t.cost.Record(call, t.cfg.Model)
 
-		// Save to disk.
 		saveTriageResult(t.workdir, c.ID, result)
 
-		// Notify manager.
 		if t.OnTriageResult != nil {
 			t.OnTriageResult(c.ID, result)
 		}
 
 		analyzed++
-		log.Logf(0, "PROBE: AI crash analysis: %v → score=%d, class=%v",
-			c.Title, result.Score, result.ExploitClass)
+		t.logf("[Step A] [%d/%d] Done: %s → score=%d, class=%s, vuln=%s",
+			i+1, len(pending), c.Title, result.Score, result.ExploitClass, result.Reasoning.VulnType)
 
-		// Rate limit between API calls.
 		time.Sleep(3 * time.Second)
 	}
+	t.logf("[Step A] Complete: %d/%d crashes analyzed", analyzed, len(pending))
 	if analyzed > 0 {
 		saveCostTracker(t.workdir, t.cost)
 	}
@@ -446,10 +502,16 @@ func (t *Triager) stepB(ctx context.Context) {
 	if t.GetSnapshot == nil {
 		return
 	}
+	t.logf("[Step B] Collecting fuzzing snapshot...")
 	snapshot := t.GetSnapshot()
 	if snapshot == nil {
+		t.logf("[Step B] No snapshot available (fuzzer not ready)")
 		return
 	}
+
+	t.logf("[Step B] Snapshot: signal=%d, execs=%d, corpus=%d, crashes=%d",
+		snapshot.TotalSignal, snapshot.TotalExecs, snapshot.CorpusSize, len(snapshot.CrashSummaries))
+	t.logf("[Step B] Generating strategy via LLM...")
 
 	result, err := t.generateStrategy(ctx, snapshot)
 	call := APICall{
@@ -457,7 +519,7 @@ func (t *Triager) stepB(ctx context.Context) {
 		Type: "strategy",
 	}
 	if err != nil {
-		log.Logf(0, "PROBE: AI strategy generation failed: %v", err)
+		t.logf("[Step B] FAILED: %v", err)
 		call.Success = false
 		call.Error = err.Error()
 		t.cost.Record(call, t.cfg.Model)
@@ -471,7 +533,6 @@ func (t *Triager) stepB(ctx context.Context) {
 	call.ResultSummary = "applied"
 	t.cost.Record(call, t.cfg.Model)
 
-	// Store strategy.
 	t.mu.Lock()
 	t.strategy = result
 	t.mu.Unlock()
@@ -485,7 +546,7 @@ func (t *Triager) stepB(ctx context.Context) {
 	nWeights := len(result.SyscallWeights)
 	nSeeds := len(result.SeedPrograms)
 	nFocus := len(result.FocusTargets)
-	log.Logf(0, "PROBE: AI strategy applied: %d syscall weights, %d seeds, %d focus targets",
+	t.logf("[Step B] Strategy applied: %d syscall weights, %d seeds, %d focus targets",
 		nWeights, nSeeds, nFocus)
 	saveCostTracker(t.workdir, t.cost)
 }

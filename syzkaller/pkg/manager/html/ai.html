@@ -7,7 +7,7 @@ PROBE: AI-guided fuzzing dashboard page (Phase 3).
 <table class="list_table">
 <caption>AI Status:</caption>
 <tr><td class="title">Model</td><td>{{.Model}} ({{.Provider}})</td></tr>
-<tr><td class="title">Status</td><td>{{.Status}}{{if .NextBatchSec}} | Next batch: <span id="countdown"></span>{{end}}</td></tr>
+<tr><td class="title">Status</td><td><span id="ai-status">{{.Status}}</span>{{if .NextBatchSec}} | Next batch: <span id="countdown"></span>{{end}}</td></tr>
 <tr><td class="title">Today</td><td>{{.TodayCalls}} calls, {{.TodayTokens}} tokens, ${{printf "%.2f" .TodayCostUSD}} (~{{.TodayCostKRW}} KRW)</td></tr>
 <tr><td class="title">Total</td><td>{{.TotalCalls}} calls, {{.TotalTokens}} tokens, ${{printf "%.2f" .TotalCostUSD}} (~{{.TotalCostKRW}} KRW)</td></tr>
 </table>
@@ -15,14 +15,19 @@ PROBE: AI-guided fuzzing dashboard page (Phase 3).
 {{if not .Disabled}}
 <br>
 <b>Crash Exploitability Analysis</b>
-<form method="post" action="/api/ai/analyze" style="display:inline; margin-left:10px">
-	<input type="submit" value="Analyze Now">
-</form>
+<button id="analyzeBtn" onclick="triggerAI('analyze')" style="margin-left:10px">Analyze Now</button>
+<b>Fuzzing Strategy</b>
+<button id="stratBtn" onclick="triggerAI('strategize')" style="margin-left:10px">Strategize Now</button>
 ({{.AnalyzedCount}} analyzed, {{.PendingCount}} pending)
 <br><br>
 
+<b>Console</b>
+<div id="console" style="background:#1e1e1e; color:#d4d4d4; font-family:'Consolas','Courier New',monospace; font-size:12px; padding:10px; height:220px; overflow-y:auto; border:1px solid #555; border-radius:4px; margin-bottom:16px; white-space:pre-wrap;">Waiting for AI activity...
+</div>
+
 {{if .Crashes}}
 <table class="list_table">
+<caption>Crash Exploitability:</caption>
 <thead><tr>
 	<th><a onclick="return sortTable(this, 'Title', textSort)" href="#">Title</a></th>
 	<th><a onclick="return sortTable(this, 'Score', numSort)" href="#">Score</a></th>
@@ -45,12 +50,6 @@ PROBE: AI-guided fuzzing dashboard page (Phase 3).
 {{end}}
 
 <br>
-<b>Fuzzing Strategy</b>
-<form method="post" action="/api/ai/strategize" style="display:inline; margin-left:10px">
-	<input type="submit" value="Strategize Now">
-</form>
-<br><br>
-
 {{if .HasStrategy}}
 <table class="list_table">
 <caption>Last Strategy ({{formatTime .Strategy.Timestamp}}):</caption>
@@ -87,8 +86,9 @@ PROBE: AI-guided fuzzing dashboard page (Phase 3).
 </table>
 {{end}}
 
-{{if .NextBatchSec}}
 <script>
+// Countdown timer.
+{{if .NextBatchSec}}
 var nextBatch = {{.NextBatchSec}};
 setInterval(function() {
 	if (nextBatch <= 0) { nextBatch = 3600; }
@@ -97,14 +97,94 @@ setInterval(function() {
 	var el = document.getElementById('countdown');
 	if (el) el.textContent = m + 'm ' + (s < 10 ? '0' : '') + s + 's';
 }, 1000);
-// Initial display
 (function() {
 	var m = Math.floor(nextBatch/60), s = nextBatch%60;
 	var el = document.getElementById('countdown');
 	if (el) el.textContent = m + 'm ' + (s < 10 ? '0' : '') + s + 's';
 })();
-</script>
 {{end}}
+
+// Trigger AI analysis/strategy via AJAX.
+function triggerAI(action) {
+	var btn = document.getElementById(action === 'analyze' ? 'analyzeBtn' : 'stratBtn');
+	btn.disabled = true;
+	btn.textContent = action === 'analyze' ? 'Analyzing...' : 'Strategizing...';
+	fetch('/api/ai/' + action, {method: 'POST'}).then(function() {
+		pollLog();
+	}).catch(function(err) {
+		appendLog('ERROR: ' + err);
+		btn.disabled = false;
+		btn.textContent = action === 'analyze' ? 'Analyze Now' : 'Strategize Now';
+	});
+}
+
+// Console log polling.
+var lastLogLen = 0;
+var pollTimer = null;
+
+function appendLog(msg) {
+	var c = document.getElementById('console');
+	if (!c) return;
+	var ts = new Date().toLocaleTimeString('en-GB', {hour12: false});
+	c.textContent += '[' + ts + '] ' + msg + '\n';
+	c.scrollTop = c.scrollHeight;
+}
+
+function pollLog() {
+	fetch('/api/ai/log').then(function(r) { return r.json(); }).then(function(data) {
+		var c = document.getElementById('console');
+		if (!c) return;
+		// Update status indicator.
+		var statusEl = document.getElementById('ai-status');
+		if (statusEl) statusEl.textContent = data.running ? 'Running...' : 'Active';
+		// Append new log lines.
+		if (data.lines && data.lines.length > lastLogLen) {
+			for (var i = lastLogLen; i < data.lines.length; i++) {
+				var entry = data.lines[i];
+				var t = new Date(entry.time);
+				var ts = t.toLocaleTimeString('en-GB', {hour12: false});
+				c.textContent += '[' + ts + '] ' + entry.message + '\n';
+			}
+			lastLogLen = data.lines.length;
+			c.scrollTop = c.scrollHeight;
+		}
+		// Re-enable buttons when not running.
+		if (!data.running) {
+			var ab = document.getElementById('analyzeBtn');
+			var sb = document.getElementById('stratBtn');
+			if (ab) { ab.disabled = false; ab.textContent = 'Analyze Now'; }
+			if (sb) { sb.disabled = false; sb.textContent = 'Strategize Now'; }
+			// Stop polling after a few more seconds.
+			if (pollTimer) { clearTimeout(pollTimer); }
+			pollTimer = setTimeout(function() { pollTimer = null; }, 5000);
+			return;
+		}
+		// Continue polling while running.
+		setTimeout(pollLog, 1500);
+	}).catch(function() {
+		setTimeout(pollLog, 3000);
+	});
+}
+
+// Load initial log lines on page load.
+(function() {
+	fetch('/api/ai/log').then(function(r) { return r.json(); }).then(function(data) {
+		var c = document.getElementById('console');
+		if (!c || !data.lines || data.lines.length === 0) return;
+		c.textContent = '';
+		for (var i = 0; i < data.lines.length; i++) {
+			var entry = data.lines[i];
+			var t = new Date(entry.time);
+			var ts = t.toLocaleTimeString('en-GB', {hour12: false});
+			c.textContent += '[' + ts + '] ' + entry.message + '\n';
+		}
+		lastLogLen = data.lines.length;
+		c.scrollTop = c.scrollHeight;
+		// If currently running, start polling.
+		if (data.running) pollLog();
+	});
+})();
+</script>
 
 {{else}}
 <br>

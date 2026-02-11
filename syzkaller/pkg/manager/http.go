@@ -88,6 +88,7 @@ func (serv *HTTPServer) Serve(ctx context.Context) error {
 	handle("/addcandidate", serv.httpAddCandidate)
 	handle("/ai", serv.httpAI)                        // PROBE: AI dashboard
 	handle("/api/ai/analyze", serv.httpAIAnalyze)     // PROBE: manual Step A
+	handle("/api/ai/log", serv.httpAILog)             // PROBE: console log stream
 	handle("/api/ai/strategize", serv.httpAIStrategize) // PROBE: manual Step B
 	handle("/config", serv.httpConfig)
 	handle("/corpus", serv.httpCorpus)
@@ -1355,8 +1356,16 @@ func (serv *HTTPServer) httpAI(w http.ResponseWriter, r *http.Request) {
 	// For now, just show basic info from the Triager's exported methods via interface.
 	// The concrete type will be *aitriage.Triager, so we pull data via its methods
 	// which are called from the manager's ai_triage.go integration file.
-	data.Status = "Active"
-	data.NextBatchSec = 3600 // Will be updated by actual timer
+	// Check if triager is currently running.
+	type runningChecker interface {
+		IsRunning() bool
+	}
+	if t, ok := serv.Triager.(runningChecker); ok && t.IsRunning() {
+		data.Status = "Running..."
+	} else {
+		data.Status = "Active"
+	}
+	data.NextBatchSec = 3600
 
 	// Load crash analyses from disk.
 	if serv.CrashStore != nil {
@@ -1500,7 +1509,6 @@ func (serv *HTTPServer) httpAIAnalyze(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "AI triage is disabled", http.StatusBadRequest)
 		return
 	}
-	// Trigger Step A in background.
 	type stepARunner interface {
 		RunStepA(ctx context.Context)
 		IsRunning() bool
@@ -1510,7 +1518,7 @@ func (serv *HTTPServer) httpAIAnalyze(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/ai", http.StatusFound)
 			return
 		}
-		go t.RunStepA(r.Context())
+		go t.RunStepA(context.Background())
 	}
 	http.Redirect(w, r, "/ai", http.StatusFound)
 }
@@ -1533,9 +1541,53 @@ func (serv *HTTPServer) httpAIStrategize(w http.ResponseWriter, r *http.Request)
 			http.Redirect(w, r, "/ai", http.StatusFound)
 			return
 		}
-		go t.RunStepB(r.Context())
+		go t.RunStepB(context.Background())
 	}
 	http.Redirect(w, r, "/ai", http.StatusFound)
+}
+
+// httpAILog returns console log entries as JSON for AJAX polling.
+func (serv *HTTPServer) httpAILog(w http.ResponseWriter, r *http.Request) {
+	type logGetter interface {
+		LogLines() []struct {
+			Time    time.Time `json:"time"`
+			Message string    `json:"message"`
+		}
+		IsRunning() bool
+	}
+	type logEntry struct {
+		Time    time.Time `json:"time"`
+		Message string    `json:"message"`
+	}
+	type logResponse struct {
+		Running bool       `json:"running"`
+		Lines   []logEntry `json:"lines"`
+	}
+
+	resp := logResponse{}
+	if serv.Triager != nil {
+		// Use a broader interface to get log lines.
+		type logProvider interface {
+			IsRunning() bool
+		}
+		if t, ok := serv.Triager.(logProvider); ok {
+			resp.Running = t.IsRunning()
+		}
+		// Get log lines via JSON round-trip to avoid import cycle.
+		type rawLogProvider interface {
+			LogLinesJSON() []byte
+		}
+		if t, ok := serv.Triager.(rawLogProvider); ok {
+			var lines []logEntry
+			if data := t.LogLinesJSON(); data != nil {
+				json.Unmarshal(data, &lines)
+			}
+			resp.Lines = lines
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 func formatTokens(n int) string {
