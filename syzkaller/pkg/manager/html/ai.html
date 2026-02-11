@@ -45,19 +45,25 @@ PROBE: AI-guided fuzzing dashboard page (Phase 3).
 	<th><a onclick="return sortTable(this, 'Score', numSort)" href="#">Score</a></th>
 	<th><a onclick="return sortTable(this, 'Class', textSort)" href="#">Class</a></th>
 	<th><a onclick="return sortTable(this, 'Vuln', textSort)" href="#">Vuln</a></th>
-	<th>Detail</th>
 	<th><a onclick="return sortTable(this, 'Time', textSort)" href="#">Time</a></th>
 </tr></thead>
 <tbody>
-{{range .Crashes}}
-<tr>
-	<td class="title"><a href="/crash?id={{.ID}}">{{.Title}}</a></td>
-	<td class="stat" {{if .ScoreColor}}style="background:{{.ScoreColor}}"{{end}}>{{if .HasScore}}{{.Score}}{{else}}-{{end}}</td>
-	<td>{{.ExploitClass}}</td>
-	<td>{{.VulnType}}</td>
-	<td style="font-size:11px; max-width:400px">{{if .HasScore}}{{.Summary}}{{else}}<span style="color:#999">pending</span>{{end}}</td>
-	<td class="time">{{if .HasScore}}{{formatTime .AnalyzedAt}}{{else}}-{{end}}</td>
+{{range $i, $c := .Crashes}}
+<tr {{if $c.HasScore}}onclick="toggleDetail('detail-{{$i}}')" style="cursor:pointer"{{end}}>
+	<td class="title"><a href="/crash?id={{$c.ID}}">{{$c.Title}}</a></td>
+	<td class="stat" {{if $c.ScoreColor}}style="background:{{$c.ScoreColor}}"{{end}}>{{if $c.HasScore}}{{$c.Score}}{{else}}-{{end}}</td>
+	<td>{{$c.ExploitClass}}</td>
+	<td>{{$c.VulnType}}</td>
+	<td class="time">{{if $c.HasScore}}{{formatTime $c.AnalyzedAt}}{{else}}<span style="color:#999">pending</span>{{end}}</td>
 </tr>
+{{if $c.HasScore}}
+<tr id="detail-{{$i}}" style="display:none">
+	<td colspan="5" style="background:#f8f8f0; padding:8px 16px; font-size:12px; border-left:3px solid {{$c.ScoreColor}}">
+		<b>Summary:</b> {{$c.Summary}}<br>
+		<b>Confidence:</b> {{$c.Confidence}} | <b>Primitive:</b> {{$c.Primitive}} | <b>Slab:</b> {{$c.SlabCache}} | <b>Timing:</b> {{$c.TimingWindow}}
+	</td>
+</tr>
+{{end}}
 {{end}}
 </tbody>
 </table>
@@ -117,6 +123,12 @@ setInterval(function() {
 	if (el) el.textContent = m + 'm ' + (s < 10 ? '0' : '') + s + 's';
 })();
 {{end}}
+
+// Toggle crash detail row.
+function toggleDetail(id) {
+	var el = document.getElementById(id);
+	if (el) el.style.display = el.style.display === 'none' ? '' : 'none';
+}
 
 // Trigger AI analysis/strategy via AJAX.
 function triggerAI(action) {
