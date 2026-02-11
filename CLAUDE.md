@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 PROBE is a Linux kernel fuzzing infrastructure built around Google's [syzkaller](https://github.com/google/syzkaller) — an unsupervised coverage-guided kernel fuzzer. The project automates the full setup: kernel compilation, QEMU VM image creation, BusyBox rootfs building, syzkaller compilation, and fuzzing configuration generation.
 
-Target setup: Linux 6.18.8 kernel on x86_64, fuzzed via QEMU VMs managed by syz-manager.
+Target setup: Linux 6.1.20 kernel on x86_64 (development/testing), fuzzed via QEMU VMs managed by syz-manager. Will switch to latest stable kernel for production use.
 
 ## Build Commands
 
