@@ -225,6 +225,9 @@ type Config struct {
 	// More details can be found in pkg/asset/config.go.
 	AssetStorage *asset.Config `json:"asset_storage"`
 
+	// PROBE: AI-guided fuzzing configuration.
+	AITriage AITriageConfig `json:"ai_triage,omitempty"`
+
 	// Experimental options.
 	Experimental Experimental
 
@@ -278,6 +281,15 @@ type FocusArea struct {
 
 	// Weight is a positive number that determines how much focus should be put on this area.
 	Weight float64 `json:"weight"`
+}
+
+// PROBE: AITriageConfig configures AI-guided fuzzing (Phase 3).
+type AITriageConfig struct {
+	Provider string `json:"provider,omitempty"` // "anthropic" or "openai", auto-detected from model name
+	Model    string `json:"model"`              // e.g. "claude-sonnet-4-5-20250929"
+	APIKey   string `json:"api_key"`
+	APIURL   string `json:"api_url,omitempty"` // custom endpoint (default: provider's official URL)
+	MaxTier  int    `json:"max_tier,omitempty"`  // max crash tier to analyze (default: 2)
 }
 
 type Subsystem struct {

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
+	"github.com/google/syzkaller/pkg/aitriage"
 	"github.com/google/syzkaller/pkg/asset"
 	"github.com/google/syzkaller/pkg/corpus"
 	"github.com/google/syzkaller/pkg/db"
@@ -110,6 +111,9 @@ type Manager struct {
 	fsckChecker  image.FsckChecker
 
 	reproLoop *manager.ReproLoop
+
+	// PROBE: AI-guided fuzzing (Phase 3).
+	triager *aitriage.Triager
 
 	Stats
 }
@@ -384,6 +388,9 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 			}
 		}()
 	}
+	// PROBE: Initialize AI triage (Phase 3).
+	mgr.initAITriage(ctx)
+
 	go mgr.trackUsedFiles()
 	go mgr.processFuzzingResults(ctx)
 	mgr.pool.Loop(ctx)

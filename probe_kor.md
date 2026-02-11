@@ -31,11 +31,11 @@
 |    - 그룹 내 변종 간 크로스 조합                        |
 |    - 수확 체감 시 자동 복귀                             |
 |                                                       |
-|  [Phase 3] AI 트리아지 + 포커스 가이드                  |
-|    - Claude Haiku 4.5로 크래시 분석                     |
-|    - 포커스 모드용 뮤테이션 전략 제안                    |
-|    - 그룹 단위 분석 (크래시 개별이 아닌)                |
-|    - 크래시 후 분석 (퍼징 루프 오버헤드 없음)            |
+|  [Phase 3] AI 가이드 퍼징 [완료]                       |
+|    - 멀티 프로바이더 LLM (Anthropic + OpenAI)          |
+|    - 크래시 익스플로잇 점수화 (0-100)                   |
+|    - 퍼징 전략: syscall 가중치, 시드, 포커스            |
+|    - /ai 대시보드 + 비용 추적 (USD+KRW)                |
 |                                                       |
 |  [Phase 4] UAF/OOB 뮤테이션 엔진                       |
 |    - UAF 패턴 시퀀스 생성                               |
@@ -163,53 +163,62 @@
 - 탈출: `Logf(0)` — `PROBE: focus mode ended for 'X' — iters, new_coverage, exit_reason, duration`
 - 중간: 로그 없음 (내부 카운터만 추적, 탈출 시 요약 출력)
 
-## Phase 3: AI 트리아지 + 포커스 가이드
+## Phase 3: AI 가이드 퍼징 — **완료**
 
-**목표**: LLM을 활용한 크래시 익스플로잇 가능성 분석 및 포커스 모드 뮤테이션 전략 수립.
+**목표**: LLM을 퍼징 전체 과정에 통합 — 크래시 익스플로잇 분석, 커버리지 전략, 시드 생성, 뮤테이션 튜닝, Focus 타겟 추천.
 
-**모델**: Claude Haiku 4.5 (Anthropic API)
-- 선정 근거: 크래시 리포트 분석은 구조화된 텍스트 처리 — 소형/고속 모델로 충분
-- 개발 도구와 같은 제공사(Anthropic)로 관리 편의성 확보
-- 중복 제거 파이프라인으로 하루 3~5개 그룹만 분석하므로 비용 무시 가능
+**아키텍처**: 1시간 배치 사이클, 2단계 분석:
+- **Step A**: 크래시 분석 (크래시 그룹별 개별 API 호출, 0-100 점수)
+- **Step B**: 퍼징 전략 (커버리지+크래시 요약 기반 1회 호출, syscall 가중치/시드/뮤테이션 힌트/포커스 타겟 생성)
 
-**적용 지점** (퍼징 루프 오버헤드 없음):
+**모델**: 설정 가능 (권장: Claude Sonnet 4.5, ~1,810원/일). 멀티 프로바이더 지원 (Anthropic + OpenAI 호환).
 
-### 3a. 크래시 익스플로잇 가능성 분석 (그룹 단위)
+**설정** (`probe.cfg`):
+```json
+"ai_triage": {
+    "model": "claude-sonnet-4-5-20250929",
+    "api_key": "sk-ant-api03-xxx",
+    "max_tier": 2
+}
 ```
-크래시 그룹 감지 → 그룹 대표 + 모든 변종 프로그램을 LLM에 전달
-  → "이 UAF는 nft_set_elem에서 발생, 같은 slab 재할당으로
-     익스플로잇 가능, 권한 상승 가능성 높음.
-     변종 B(write 경로)가 가장 위험.
-     변종 D의 해제 경로와 B의 write를 조합하면
-     더 안정적인 익스플로잇 가능."
-  → 익스플로잇 가능성 스코어 + 근거
-  → 포커스 모드 진입 여부 + 우선 변종 결정에 활용
-```
+프로바이더 자동 감지: `claude-*` → Anthropic, 그 외 → OpenAI.
 
-### 3b. 포커스 모드 전략
-```
-포커스 모드 진입 → 크래시 프로그램 + 컨텍스트를 LLM에 전달
-  → "이 UAF를 심화하려면:
-     1. close() 전에 ioctl(SET_FLAG) 추가
-     2. 버퍼 크기를 PAGE_SIZE 배수로 시도
-     3. 다른 스레드에서 동시에 read() 호출"
-  → 뮤테이션 힌트를 focusJob에 전달
-```
+### 구현 내용
 
-### 3c. 비용 추정
+**신규 패키지 `pkg/aitriage/`**:
+- `aitriage.go` — 핵심 타입 (TriageResult, StrategyResult, CostTracker), 1시간 배치 루프 Triager
+- `client.go` — LLMClient 인터페이스 + Anthropic/OpenAI 구현 (raw net/http, 3회 재시도, 60초 타임아웃)
+- `prompt_crash.go` — KASAN 리포트 파서, 크래시 익스플로잇 프롬프트 (5대 기준, JSON 출력)
+- `prompt_strategy.go` — FuzzingSnapshot 수집, 전략 프롬프트 (syscall 가중치, 시드, 뮤테이션, 포커스)
 
-| 시나리오 | LLM 호출 수/일 | 월간 비용 (Haiku 4.5) |
-|----------|---------------|----------------------|
-| 저볼륨 | 3~5개 그룹 | ~$0.80 |
-| 중볼륨 | 10~15개 그룹 | ~$2.50 |
-| 고볼륨 | 30~50개 그룹 | ~$8.00 |
+**전략 적용**:
+- `prog/prio.go`: `ChoiceTable.ApplyWeights()` — 외부 syscall 가중치 보정
+- `pkg/fuzzer/fuzzer.go`: `InjectSeed()` — syzkaller 프로그램 텍스트 파싱 후 triage 큐 주입
+- `pkg/fuzzer/fuzzer.go`: `ApplyAIWeights()` — ChoiceTable에 가중치 전달
+- Focus 타겟 → 고점수 크래시에 `AddFocusCandidate()` 호출
 
-호출당 입력: ~1,500 토큰 (KASAN 리포트 + 스택 트레이스 + 변종 목록)
-호출당 출력: ~750 토큰 (분석 + 스코어 + 전략)
+**대시보드**:
+- `main.html`: 크래시 테이블에 AI Score 컬럼 (색상 코딩: 빨강 70+, 노랑 40-69, 초록 0-39)
+- `crash.html`: AI 익스플로잇 분석 섹션 (점수, 클래스, 취약점 유형)
+- `ai.html`: `/ai` 페이지 — 상태, 비용 추적 (USD+KRW), 크래시 분석 테이블, 전략 상세, API 호출 히스토리, 수동 트리거 버튼
+- `common.html`: 네비게이션 바에 AI 탭 추가
 
-**수정 대상**:
-- `pkg/` 또는 `syz-manager/`에 LLM 통합 모듈 신규 생성
-- 포커스 모드 job이 외부 뮤테이션 힌트를 수용하도록 수정
+**매니저 통합** (`syz-manager/ai_triage.go`):
+- Config에서 Triager 초기화, 백그라운드 고루틴 실행
+- 콜백: GetCrashes, GetSnapshot, OnTriageResult, OnStrategyResult
+- Score >= 70 → 자동 Focus Mode 트리거
+- 수동 트리거: POST `/api/ai/analyze`, POST `/api/ai/strategize`
+
+**Graceful Degradation**: `ai_triage` 설정 없음 → triager nil, AI 비활성, `/ai`에 "disabled" 표시, 퍼징 정상.
+
+### 비용 추정 (24시간, ~126K input + ~58K output 토큰)
+
+| 모델 | 24시간 USD | 24시간 KRW | 비고 |
+|------|-----------|-----------|------|
+| Claude Sonnet 4.5 | $1.25 | ~1,810원 | 권장 |
+| Claude Haiku 4.5 | $0.42 | ~609원 | 가성비 |
+| GPT-4o | $0.90 | ~1,305원 | OpenAI |
+| GPT-4o-mini | $0.05 | ~73원 | 최저가 |
 
 ## Phase 4: Practical Hardening — **완료**
 

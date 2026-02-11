@@ -58,6 +58,9 @@ type HTTPServer struct {
 	Pools       map[string]*vm.Dispatcher
 	TogglePause func(paused bool)
 
+	// PROBE: AI triage (Phase 3).
+	Triager interface{} // *aitriage.Triager, set by manager; typed as interface to avoid import cycle
+
 	// Can be set dynamically after calling Serve.
 	Corpus          atomic.Pointer[corpus.Corpus]
 	Fuzzer          atomic.Pointer[fuzzer.Fuzzer]
@@ -83,6 +86,9 @@ func (serv *HTTPServer) Serve(ctx context.Context) error {
 	handle("/", serv.httpMain)
 	handle("/action", serv.httpAction)
 	handle("/addcandidate", serv.httpAddCandidate)
+	handle("/ai", serv.httpAI)                        // PROBE: AI dashboard
+	handle("/api/ai/analyze", serv.httpAIAnalyze)     // PROBE: manual Step A
+	handle("/api/ai/strategize", serv.httpAIStrategize) // PROBE: manual Step B
 	handle("/config", serv.httpConfig)
 	handle("/corpus", serv.httpCorpus)
 	handle("/corpus.db", serv.httpDownloadCorpus)
@@ -365,6 +371,58 @@ func makeUICrashType(info *BugInfo, startTime time.Time, repros map[string]bool)
 	}
 }
 
+// PROBE: makeUICrashTypeWithAI populates AI fields if workdir is provided.
+func makeUICrashTypeWithAI(info *BugInfo, startTime time.Time, repros map[string]bool, workdir string) UICrashType {
+	ct := makeUICrashType(info, startTime, repros)
+	if workdir != "" {
+		if tr := loadAITriageResult(workdir, info.ID); tr != nil {
+			ct.AIScore = tr.Score
+			ct.AIScoreColor = aiScoreColor(tr.Score)
+			ct.AIVulnType = tr.VulnType
+			ct.AIClass = tr.ExploitClass
+		}
+	}
+	return ct
+}
+
+// PROBE: aiScoreColor returns a background color for AI score cells.
+func aiScoreColor(score int) string {
+	if score >= 70 {
+		return "#FF8674"
+	}
+	if score >= 40 {
+		return "#FFFFAA"
+	}
+	if score > 0 {
+		return "#C8FFC8"
+	}
+	return "#F0F0F0"
+}
+
+// PROBE: aiTriageOnDisk represents the minimal fields we need from ai-triage.json.
+type aiTriageOnDisk struct {
+	Score        int    `json:"score"`
+	ExploitClass string `json:"exploit_class"`
+	VulnType     string `json:"-"`
+	Reasoning    struct {
+		VulnType string `json:"vuln_type"`
+	} `json:"reasoning"`
+}
+
+func loadAITriageResult(workdir, crashID string) *aiTriageOnDisk {
+	path := filepath.Join(workdir, "crashes", crashID, "ai-triage.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var result aiTriageOnDisk
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil
+	}
+	result.VulnType = result.Reasoning.VulnType
+	return &result
+}
+
 // higherRankTooltip generates the prioritized list of the titles with higher Rank
 // than the firstTitle has.
 func higherRankTooltip(firstTitle string, titlesInfo []*report.TitleFreqRank) string {
@@ -400,7 +458,7 @@ func (serv *HTTPServer) httpCrash(w http.ResponseWriter, r *http.Request) {
 	}
 	data := UICrashPage{
 		UIPageHeader: serv.pageHeader(r, info.Title),
-		UICrashType:  makeUICrashType(info, serv.StartTime, nil),
+		UICrashType:  makeUICrashTypeWithAI(info, serv.StartTime, nil, serv.Cfg.Workdir),
 	}
 	executeTemplate(w, crashTemplate, data)
 }
@@ -969,7 +1027,7 @@ func (serv *HTTPServer) collectCrashes(workdir string) ([]UICrashType, error) {
 	repros := serv.ReproLoop.Reproducing()
 	var ret []UICrashType
 	for _, info := range list {
-		ret = append(ret, makeUICrashType(info, serv.StartTime, repros))
+		ret = append(ret, makeUICrashTypeWithAI(info, serv.StartTime, repros, workdir))
 	}
 	return ret, nil
 }
@@ -1084,11 +1142,15 @@ type UICrashPage struct {
 
 type UICrashType struct {
 	BugInfo
-	RankTooltip string
-	New         bool // was first found in the current run
-	Active      bool // was found in the current run
-	Triaged     string
-	Crashes     []UICrash
+	RankTooltip  string
+	New          bool // was first found in the current run
+	Active       bool // was found in the current run
+	Triaged      string
+	Crashes      []UICrash
+	AIScore      int    // PROBE: AI exploitability score (0=not analyzed)
+	AIScoreColor string // PROBE: background color for score cell
+	AIVulnType   string // PROBE: vulnerability type from AI analysis
+	AIClass      string // PROBE: exploit class from AI analysis
 }
 
 type UICrash struct {
@@ -1234,6 +1296,336 @@ type UITextPage struct {
 	HTML template.HTML
 }
 
+// PROBE: AI triage interface for avoiding import cycle.
+type aiTriager interface {
+	IsRunning() bool
+	Model() string
+	Provider() string
+	Cost() interface{} // returns aitriage.CostTracker
+	LastStrategy() interface{}
+	RunStepA(ctx context.Context)
+	RunStepB(ctx context.Context)
+}
+
+func (serv *HTTPServer) httpAI(w http.ResponseWriter, r *http.Request) {
+	data := UIAIPageData{
+		UIPageHeader: serv.pageHeader(r, "AI"),
+	}
+
+	if serv.Triager == nil {
+		data.Disabled = true
+		data.Model = "none"
+		data.Status = "Disabled"
+		executeTemplate(w, aiTemplate, &data)
+		return
+	}
+
+	// Use type assertion to access triager methods.
+	// We use a simple struct-based approach since we know the concrete type's methods.
+	type triagerInfo interface {
+		IsRunning() bool
+		Model() string
+		Provider() string
+	}
+	type costInfo struct {
+		TotalCalls   int
+		TotalInput   int
+		TotalOutput  int
+		TotalCostUSD float64
+		TodayCostUSD float64
+		TodayCalls   int
+		TodayInput   int
+		TodayOutput  int
+		History      []struct {
+			Time          time.Time
+			Type          string
+			InputTokens   int
+			OutputTokens  int
+			CostUSD       float64
+			Success       bool
+			ResultSummary string
+			Error         string
+		}
+	}
+
+	// Access via reflection-free JSON round-trip approach.
+	triagerJSON, _ := json.Marshal(serv.Triager)
+	_ = triagerJSON
+
+	// For now, just show basic info from the Triager's exported methods via interface.
+	// The concrete type will be *aitriage.Triager, so we pull data via its methods
+	// which are called from the manager's ai_triage.go integration file.
+	data.Status = "Active"
+	data.NextBatchSec = 3600 // Will be updated by actual timer
+
+	// Load crash analyses from disk.
+	if serv.CrashStore != nil {
+		list, _ := serv.CrashStore.BugList()
+		for _, info := range list {
+			crash := UIAICrash{
+				ID:    info.ID,
+				Title: info.Title,
+			}
+			if tr := loadAITriageResult(serv.Cfg.Workdir, info.ID); tr != nil {
+				crash.Score = tr.Score
+				crash.HasScore = true
+				crash.ScoreColor = aiScoreColor(tr.Score)
+				crash.ExploitClass = tr.ExploitClass
+				crash.VulnType = tr.VulnType
+				data.AnalyzedCount++
+			} else {
+				data.PendingCount++
+			}
+			data.Crashes = append(data.Crashes, crash)
+		}
+	}
+
+	// Load strategy from disk.
+	strategyPath := filepath.Join(serv.Cfg.Workdir, "ai-strategy.json")
+	if stratData, err := os.ReadFile(strategyPath); err == nil {
+		var strat struct {
+			Summary        string `json:"summary"`
+			Timestamp      time.Time `json:"timestamp"`
+			SyscallWeights []struct {
+				Name   string  `json:"name"`
+				Weight float64 `json:"weight"`
+			} `json:"syscall_weights"`
+			SeedPrograms []struct{} `json:"seed_programs"`
+			MutationHints struct {
+				SpliceWeight    float64 `json:"splice_weight"`
+				InsertWeight    float64 `json:"insert_weight"`
+				MutateArgWeight float64 `json:"mutate_arg_weight"`
+				RemoveWeight    float64 `json:"remove_weight"`
+				Reason          string  `json:"reason"`
+			} `json:"mutation_hints"`
+			FocusTargets []struct {
+				CrashTitle string `json:"crash_title"`
+				Priority   int    `json:"priority"`
+			} `json:"focus_targets"`
+		}
+		if json.Unmarshal(stratData, &strat) == nil {
+			data.HasStrategy = true
+			data.Strategy.Summary = strat.Summary
+			data.Strategy.Timestamp = strat.Timestamp
+			for _, sw := range strat.SyscallWeights {
+				data.Strategy.SyscallWeights = append(data.Strategy.SyscallWeights, UIAISyscallWeight{
+					Name: sw.Name, Weight: sw.Weight,
+				})
+			}
+			data.Strategy.SeedsInjected = len(strat.SeedPrograms)
+			data.Strategy.MutationSummary = strat.MutationHints.Reason
+			if data.Strategy.MutationSummary == "" {
+				data.Strategy.MutationSummary = fmt.Sprintf("splice=%.1f insert=%.1f mutate=%.1f remove=%.1f",
+					strat.MutationHints.SpliceWeight, strat.MutationHints.InsertWeight,
+					strat.MutationHints.MutateArgWeight, strat.MutationHints.RemoveWeight)
+			}
+			for _, ft := range strat.FocusTargets {
+				data.Strategy.FocusTargets = append(data.Strategy.FocusTargets, UIAIFocusTarget{
+					CrashTitle: ft.CrashTitle, Priority: ft.Priority,
+				})
+			}
+		}
+	}
+
+	// Load cost tracker from disk.
+	costPath := filepath.Join(serv.Cfg.Workdir, "ai-cost.json")
+	if costData, err := os.ReadFile(costPath); err == nil {
+		var cost struct {
+			TotalCalls   int       `json:"total_calls"`
+			TotalInput   int       `json:"total_input_tokens"`
+			TotalOutput  int       `json:"total_output_tokens"`
+			TotalCostUSD float64   `json:"total_cost_usd"`
+			TodayCostUSD float64   `json:"today_cost_usd"`
+			TodayCalls   int       `json:"today_calls"`
+			TodayInput   int       `json:"today_input_tokens"`
+			TodayOutput  int       `json:"today_output_tokens"`
+			History      []struct {
+				Time          time.Time `json:"time"`
+				Type          string    `json:"type"`
+				InputTokens   int       `json:"input_tokens"`
+				OutputTokens  int       `json:"output_tokens"`
+				CostUSD       float64   `json:"cost_usd"`
+				Success       bool      `json:"success"`
+				ResultSummary string    `json:"result_summary"`
+				Error         string    `json:"error"`
+			} `json:"history"`
+		}
+		if json.Unmarshal(costData, &cost) == nil {
+			data.TotalCalls = cost.TotalCalls
+			data.TotalTokens = formatTokens(cost.TotalInput + cost.TotalOutput)
+			data.TotalCostUSD = cost.TotalCostUSD
+			data.TotalCostKRW = int(cost.TotalCostUSD * 1450)
+			data.TodayCalls = cost.TodayCalls
+			data.TodayTokens = formatTokens(cost.TodayInput + cost.TodayOutput)
+			data.TodayCostUSD = cost.TodayCostUSD
+			data.TodayCostKRW = int(cost.TodayCostUSD * 1450)
+
+			// History (reverse order: newest first).
+			for i := len(cost.History) - 1; i >= 0; i-- {
+				h := cost.History[i]
+				data.History = append(data.History, UIAPICall{
+					Time:          h.Time,
+					Type:          h.Type,
+					Input:         h.InputTokens,
+					Output:        h.OutputTokens,
+					CostUSD:       h.CostUSD,
+					Success:       h.Success,
+					ResultSummary: h.ResultSummary,
+					Error:         h.Error,
+				})
+			}
+		}
+	}
+
+	// Get model/provider info from the config directly.
+	data.Model = serv.Cfg.AITriage.Model
+	data.Provider = serv.Cfg.AITriage.Provider
+	if data.Provider == "" {
+		if strings.HasPrefix(data.Model, "claude-") {
+			data.Provider = "anthropic"
+		} else {
+			data.Provider = "openai"
+		}
+	}
+
+	executeTemplate(w, aiTemplate, &data)
+}
+
+func (serv *HTTPServer) httpAIAnalyze(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "only POST supported", http.StatusMethodNotAllowed)
+		return
+	}
+	if serv.Triager == nil {
+		http.Error(w, "AI triage is disabled", http.StatusBadRequest)
+		return
+	}
+	// Trigger Step A in background.
+	type stepARunner interface {
+		RunStepA(ctx context.Context)
+		IsRunning() bool
+	}
+	if t, ok := serv.Triager.(stepARunner); ok {
+		if t.IsRunning() {
+			http.Redirect(w, r, "/ai", http.StatusFound)
+			return
+		}
+		go t.RunStepA(r.Context())
+	}
+	http.Redirect(w, r, "/ai", http.StatusFound)
+}
+
+func (serv *HTTPServer) httpAIStrategize(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "only POST supported", http.StatusMethodNotAllowed)
+		return
+	}
+	if serv.Triager == nil {
+		http.Error(w, "AI triage is disabled", http.StatusBadRequest)
+		return
+	}
+	type stepBRunner interface {
+		RunStepB(ctx context.Context)
+		IsRunning() bool
+	}
+	if t, ok := serv.Triager.(stepBRunner); ok {
+		if t.IsRunning() {
+			http.Redirect(w, r, "/ai", http.StatusFound)
+			return
+		}
+		go t.RunStepB(r.Context())
+	}
+	http.Redirect(w, r, "/ai", http.StatusFound)
+}
+
+func formatTokens(n int) string {
+	if n >= 1000000 {
+		return fmt.Sprintf("%.1fM", float64(n)/1e6)
+	}
+	if n >= 1000 {
+		return fmt.Sprintf("%.1fK", float64(n)/1e3)
+	}
+	return fmt.Sprintf("%d", n)
+}
+
+// PROBE: AI dashboard page data types (Phase 3).
+
+type UIAIPageData struct {
+	UIPageHeader
+
+	Disabled bool
+
+	// Status.
+	Model        string
+	Provider     string
+	Status       string
+	NextBatchSec int
+
+	// Cost.
+	TodayCalls   int
+	TodayTokens  string
+	TodayCostUSD float64
+	TodayCostKRW int
+	TotalCalls   int
+	TotalTokens  string
+	TotalCostUSD float64
+	TotalCostKRW int
+
+	// Crash Analysis.
+	Crashes       []UIAICrash
+	AnalyzedCount int
+	PendingCount  int
+
+	// Strategy.
+	HasStrategy bool
+	Strategy    UIAIStrategy
+
+	// History.
+	History []UIAPICall
+}
+
+type UIAICrash struct {
+	ID           string
+	Title        string
+	Score        int
+	HasScore     bool
+	ScoreColor   string
+	ExploitClass string
+	VulnType     string
+	AnalyzedAt   time.Time
+}
+
+type UIAIStrategy struct {
+	Timestamp       time.Time
+	Summary         string
+	SyscallWeights  []UIAISyscallWeight
+	SeedsInjected   int
+	SeedsAccepted   int
+	MutationSummary string
+	FocusTargets    []UIAIFocusTarget
+}
+
+type UIAISyscallWeight struct {
+	Name   string
+	Weight float64
+}
+
+type UIAIFocusTarget struct {
+	CrashTitle string
+	Priority   int
+}
+
+type UIAPICall struct {
+	Time          time.Time
+	Type          string
+	Input         int
+	Output        int
+	CostUSD       float64
+	Success       bool
+	ResultSummary string
+	Error         string
+}
+
 var (
 	mainTemplate          = createPage("main", UISummaryData{})
 	syscallsTemplate      = createPage("syscalls", UISyscallsData{})
@@ -1245,6 +1637,7 @@ var (
 	rawCoverTemplate      = createPage("raw_cover", UIRawCoverPage{})
 	jobListTemplate       = createPage("job_list", UIJobList{})
 	textTemplate          = createPage("text", UITextPage{})
+	aiTemplate            = createPage("ai", UIAIPageData{}) // PROBE: AI dashboard
 )
 
 //go:embed html/*.html

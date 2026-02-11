@@ -534,6 +534,38 @@ func (fuzzer *Fuzzer) logCurrentStats() {
 	}
 }
 
+// PROBE: ApplyAIWeights applies LLM-recommended syscall weight adjustments to the ChoiceTable.
+func (fuzzer *Fuzzer) ApplyAIWeights(weights map[int]float64) {
+	fuzzer.ctMu.Lock()
+	defer fuzzer.ctMu.Unlock()
+	if fuzzer.ct != nil {
+		fuzzer.ct.ApplyWeights(weights)
+	}
+}
+
+// PROBE: InjectSeed parses a syzkaller-format program text and injects it as a triage candidate.
+func (fuzzer *Fuzzer) InjectSeed(progText string) error {
+	p, err := fuzzer.target.Deserialize([]byte(progText), prog.NonStrict)
+	if err != nil {
+		return err
+	}
+	req := &queue.Request{
+		Prog:      p,
+		ExecOpts:  setFlags(flatrpc.ExecFlagCollectSignal),
+		Stat:      fuzzer.statExecCandidate,
+		Important: true,
+	}
+	fuzzer.enqueue(fuzzer.candidateQueue, req, ProgMinimized|ProgSmashed|progCandidate, 0)
+	return nil
+}
+
+// PROBE: SetAIMutationHints stores LLM mutation hints.
+// Accepts aitriage.MutationHints via interface{} to avoid import cycle.
+// Currently logged for reference; full mutation adjustment can be extended later.
+func (fuzzer *Fuzzer) SetAIMutationHints(hints interface{}) {
+	fuzzer.Logf(0, "PROBE: AI mutation hints received: %+v", hints)
+}
+
 func setFlags(execFlags flatrpc.ExecFlag) flatrpc.ExecOpts {
 	return flatrpc.ExecOpts{
 		ExecFlags: execFlags,

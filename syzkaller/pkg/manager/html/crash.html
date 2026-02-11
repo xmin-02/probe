@@ -9,6 +9,15 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 Report: <a href="/report?id={{.ID}}">{{.Triaged}}</a>
 {{end}}
 
+{{if .AIScore}}
+<table class="list_table">
+	<caption>AI Exploitability Analysis:</caption>
+	<tr><td class="title">Score</td><td style="background:{{.AIScoreColor}}"><b>{{.AIScore}}</b>/100</td></tr>
+	<tr><td class="title">Exploit Class</td><td>{{.AIClass}}</td></tr>
+	<tr><td class="title">Vulnerability Type</td><td>{{.AIVulnType}}</td></tr>
+</table>
+{{end}}
+
 <table class="list_table">
 	<thead>
 	<tr>

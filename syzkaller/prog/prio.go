@@ -300,6 +300,48 @@ func (ct *ChoiceTable) Generatable(call int) bool {
 	return ct.runs[call] != nil
 }
 
+// PROBE: ApplyWeights adjusts the ChoiceTable priorities by external multipliers.
+// weights maps syscallID → multiplier (e.g. 2.0 = double priority).
+// Values are clamped to [0.1, 10.0]. The cumulative sums are recomputed.
+func (ct *ChoiceTable) ApplyWeights(weights map[int]float64) {
+	if len(weights) == 0 {
+		return
+	}
+	for i, run := range ct.runs {
+		if run == nil {
+			continue
+		}
+		// First, recover the individual weights from cumulative sums.
+		individual := make([]int32, len(run))
+		individual[0] = run[0]
+		for j := 1; j < len(run); j++ {
+			individual[j] = run[j] - run[j-1]
+		}
+		// Apply multipliers.
+		for id, mult := range weights {
+			if id >= 0 && id < len(individual) && individual[id] > 0 {
+				if mult < 0.1 {
+					mult = 0.1
+				}
+				if mult > 10.0 {
+					mult = 10.0
+				}
+				individual[id] = int32(float64(individual[id]) * mult)
+				if individual[id] < 1 {
+					individual[id] = 1
+				}
+			}
+		}
+		// Recompute cumulative sums.
+		var sum int32
+		for j := range run {
+			sum += individual[j]
+			run[j] = sum
+		}
+		_ = i
+	}
+}
+
 func (ct *ChoiceTable) choose(r *rand.Rand, bias int) int {
 	if r.Intn(100) < 5 {
 		// Let's make 5% decisions totally at random.

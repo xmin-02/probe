@@ -31,11 +31,11 @@
 |    - Variant combination across groups                |
 |    - Auto-return on diminishing returns               |
 |                                                       |
-|  [Phase 3] AI Triage + Focus Guide                    |
-|    - Claude Haiku 4.5 for crash analysis              |
-|    - Mutation strategy suggestions for Focus Mode     |
-|    - Group-level analysis (not per-crash)             |
-|    - Post-crash analysis (no hot-loop overhead)       |
+|  [Phase 3] AI-Guided Fuzzing [DONE]                   |
+|    - Multi-provider LLM (Anthropic + OpenAI)          |
+|    - Crash exploitability scoring (0-100)             |
+|    - Fuzzing strategy: syscall weights, seeds, focus  |
+|    - /ai dashboard with cost tracking (USD+KRW)       |
 |                                                       |
 |  [Phase 4] UAF/OOB Mutation Engine                    |
 |    - UAF pattern sequence generation                  |
@@ -164,53 +164,62 @@ Normal Mode (exploration)
 - Exit:  `Logf(0)` — `PROBE: focus mode ended for 'X' — iters, new_coverage, exit_reason, duration`
 - Mid-session: no logs (internal counters only, summarized at exit)
 
-## Phase 3: AI Triage + Focus Guide
+## Phase 3: AI-Guided Fuzzing — **DONE**
 
-**Goal**: Use LLM for crash exploitability analysis and Focus Mode mutation strategy.
+**Goal**: Integrate LLM into the full fuzzing pipeline — crash exploitability analysis, coverage strategy, seed generation, mutation tuning, and Focus target recommendations.
 
-**Model**: Claude Haiku 4.5 (via Anthropic API)
-- Rationale: Crash report analysis is structured text processing — small, fast model is sufficient
-- Managed by same provider as development tools (Anthropic) for convenience
-- Cost is negligible after dedup pipeline reduces to ~3-5 groups/day
+**Architecture**: 2-step batch cycle every 1 hour:
+- **Step A**: Crash analysis (individual API calls per crash group, scoring 0-100)
+- **Step B**: Fuzzing strategy (single API call with coverage+crash summary, produces syscall weights, seeds, mutation hints, focus targets)
 
-**Application points** (no hot-loop overhead):
+**Model**: Configurable (recommended: Claude Sonnet 4.5, ~$1.25/day). Multi-provider support (Anthropic + OpenAI-compatible).
 
-### 3a. Crash Exploitability Analysis (Group-Level)
+**Config** (`probe.cfg`):
+```json
+"ai_triage": {
+    "model": "claude-sonnet-4-5-20250929",
+    "api_key": "sk-ant-api03-xxx",
+    "max_tier": 2
+}
 ```
-Crash group detected → Group representative + all variant programs sent to LLM
-  → "This UAF in nft_set_elem can be exploited via
-     same-slab reallocation, privilege escalation possible.
-     Variant B (write path) is most dangerous.
-     Variant D's free path combined with B's write
-     could yield a more reliable exploit."
-  → Exploitability score + reasoning
-  → Informs Focus Mode entry decision + which variant to prioritize
-```
+Provider auto-detected from model name (`claude-*` → Anthropic, otherwise → OpenAI).
 
-### 3b. Focus Mode Strategy
-```
-Focus Mode entry → crash program + context sent to LLM
-  → "To deepen this UAF:
-     1. Add ioctl(SET_FLAG) before close()
-     2. Try buffer sizes at PAGE_SIZE multiples
-     3. Add concurrent read() from another thread"
-  → Mutation hints fed to focusJob
-```
+### What was implemented
 
-### 3c. Cost Estimate
+**New package `pkg/aitriage/`**:
+- `aitriage.go` — Core types (TriageResult, StrategyResult, CostTracker), Triager with 1-hour batch loop
+- `client.go` — LLMClient interface + Anthropic/OpenAI implementations (raw net/http, 3x retry, 60s timeout)
+- `prompt_crash.go` — KASAN report parser, crash exploitability prompt (5 criteria, JSON output)
+- `prompt_strategy.go` — FuzzingSnapshot collection, strategy prompt (syscall weights, seeds, mutations, focus)
 
-| Scenario | LLM Calls/Day | Monthly Cost (Haiku 4.5) |
-|----------|---------------|--------------------------|
-| Low volume | 3-5 groups | ~$0.80 |
-| Medium volume | 10-15 groups | ~$2.50 |
-| High volume | 30-50 groups | ~$8.00 |
+**Strategy application**:
+- `prog/prio.go`: `ChoiceTable.ApplyWeights()` — external syscall weight multipliers on cumulative sums
+- `pkg/fuzzer/fuzzer.go`: `InjectSeed()` — parse syzkaller program text, inject as triage candidate
+- `pkg/fuzzer/fuzzer.go`: `ApplyAIWeights()` — forward weights to ChoiceTable
+- Focus targets → `AddFocusCandidate()` for high-score crashes
 
-Input per call: ~1,500 tokens (KASAN report + stack trace + variant list)
-Output per call: ~750 tokens (analysis + score + strategy)
+**Dashboard**:
+- `main.html`: AI Score column on crash table (color-coded: red 70+, yellow 40-69, green 0-39)
+- `crash.html`: AI Exploitability Analysis section (score, class, vuln type)
+- `ai.html`: `/ai` page — status, cost tracking (USD+KRW), crash analysis table, strategy details, API call history, manual trigger buttons
+- `common.html`: AI tab in navigation bar
 
-**Modification targets**:
-- New module in `pkg/` or `syz-manager/` for LLM integration
-- Focus Mode job to accept external mutation hints
+**Manager integration** (`syz-manager/ai_triage.go`):
+- Triager initialization from config, background goroutine
+- Callbacks: GetCrashes, GetSnapshot, OnTriageResult, OnStrategyResult
+- Score >= 70 → auto-trigger Focus Mode
+- Manual triggers: POST `/api/ai/analyze`, POST `/api/ai/strategize`
+
+**Graceful degradation**: No `ai_triage` config → triager nil, AI disabled, `/ai` shows "disabled", fuzzing unchanged.
+
+### Cost Estimate (24h, ~126K input + ~58K output tokens)
+
+| Model | 24h USD | 24h KRW | Note |
+|-------|---------|---------|------|
+| Claude Sonnet 4.5 | $1.25 | ~1,810 | Recommended |
+| Claude Haiku 4.5 | $0.42 | ~609 | Budget |
+| GPT-4o | $0.90 | ~1,305 | OpenAI |
+| GPT-4o-mini | $0.05 | ~73 | Minimum |
 
 ## Phase 4: Practical Hardening — **DONE**
 

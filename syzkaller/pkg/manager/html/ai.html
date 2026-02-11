@@ -1,0 +1,112 @@
+{{/*
+Copyright 2024 syzkaller project authors. All rights reserved.
+Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+PROBE: AI-guided fuzzing dashboard page (Phase 3).
+*/}}
+
+<table class="list_table">
+<caption>AI Status:</caption>
+<tr><td class="title">Model</td><td>{{.Model}} ({{.Provider}})</td></tr>
+<tr><td class="title">Status</td><td>{{.Status}}{{if .NextBatchSec}} | Next batch: <span id="countdown"></span>{{end}}</td></tr>
+<tr><td class="title">Today</td><td>{{.TodayCalls}} calls, {{.TodayTokens}} tokens, ${{printf "%.2f" .TodayCostUSD}} (~{{.TodayCostKRW}} KRW)</td></tr>
+<tr><td class="title">Total</td><td>{{.TotalCalls}} calls, {{.TotalTokens}} tokens, ${{printf "%.2f" .TotalCostUSD}} (~{{.TotalCostKRW}} KRW)</td></tr>
+</table>
+
+{{if not .Disabled}}
+<br>
+<b>Crash Exploitability Analysis</b>
+<form method="post" action="/api/ai/analyze" style="display:inline; margin-left:10px">
+	<input type="submit" value="Analyze Now">
+</form>
+({{.AnalyzedCount}} analyzed, {{.PendingCount}} pending)
+<br><br>
+
+{{if .Crashes}}
+<table class="list_table">
+<thead><tr>
+	<th><a onclick="return sortTable(this, 'Title', textSort)" href="#">Title</a></th>
+	<th><a onclick="return sortTable(this, 'Score', numSort)" href="#">Score</a></th>
+	<th><a onclick="return sortTable(this, 'Class', textSort)" href="#">Class</a></th>
+	<th><a onclick="return sortTable(this, 'Vuln', textSort)" href="#">Vuln</a></th>
+	<th><a onclick="return sortTable(this, 'Time', textSort)" href="#">Time</a></th>
+</tr></thead>
+<tbody>
+{{range .Crashes}}
+<tr>
+	<td class="title"><a href="/crash?id={{.ID}}">{{.Title}}</a></td>
+	<td class="stat" {{if .ScoreColor}}style="background:{{.ScoreColor}}"{{end}}>{{if .HasScore}}{{.Score}}{{else}}-{{end}}</td>
+	<td>{{.ExploitClass}}</td>
+	<td>{{.VulnType}}</td>
+	<td class="time">{{if .HasScore}}{{formatTime .AnalyzedAt}}{{else}}pending{{end}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{end}}
+
+<br>
+<b>Fuzzing Strategy</b>
+<form method="post" action="/api/ai/strategize" style="display:inline; margin-left:10px">
+	<input type="submit" value="Strategize Now">
+</form>
+<br><br>
+
+{{if .HasStrategy}}
+<table class="list_table">
+<caption>Last Strategy ({{formatTime .Strategy.Timestamp}}):</caption>
+<tr><td class="title">Summary</td><td>{{.Strategy.Summary}}</td></tr>
+<tr><td class="title">Syscall Weights</td><td>{{range .Strategy.SyscallWeights}}{{.Name}} {{printf "%.1f" .Weight}}x | {{end}}{{if not .Strategy.SyscallWeights}}-{{end}}</td></tr>
+<tr><td class="title">Seeds</td><td>{{.Strategy.SeedsInjected}} injected ({{.Strategy.SeedsAccepted}} accepted)</td></tr>
+<tr><td class="title">Mutation</td><td>{{.Strategy.MutationSummary}}</td></tr>
+<tr><td class="title">Focus</td><td>{{range .Strategy.FocusTargets}}{{.CrashTitle}} (p{{.Priority}}) | {{end}}{{if not .Strategy.FocusTargets}}-{{end}}</td></tr>
+</table>
+{{end}}
+
+{{if .History}}
+<br>
+<table class="list_table">
+<caption>API Call History (last {{len .History}}):</caption>
+<thead><tr>
+	<th><a onclick="return sortTable(this, 'Time', textSort)" href="#">Time</a></th>
+	<th>Type</th>
+	<th>Tokens (in/out)</th>
+	<th><a onclick="return sortTable(this, 'Cost', floatSort)" href="#">Cost</a></th>
+	<th>Result</th>
+</tr></thead>
+<tbody>
+{{range .History}}
+<tr>
+	<td class="time">{{formatTime .Time}}</td>
+	<td>{{.Type}}</td>
+	<td class="stat">{{.Input}}/{{.Output}}</td>
+	<td class="stat">${{printf "%.3f" .CostUSD}}</td>
+	<td>{{if .Success}}{{.ResultSummary}}{{else}}<span style="color:red">{{.Error}}</span>{{end}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{end}}
+
+{{if .NextBatchSec}}
+<script>
+var nextBatch = {{.NextBatchSec}};
+setInterval(function() {
+	if (nextBatch <= 0) { nextBatch = 3600; }
+	nextBatch--;
+	var m = Math.floor(nextBatch/60), s = nextBatch%60;
+	var el = document.getElementById('countdown');
+	if (el) el.textContent = m + 'm ' + (s < 10 ? '0' : '') + s + 's';
+}, 1000);
+// Initial display
+(function() {
+	var m = Math.floor(nextBatch/60), s = nextBatch%60;
+	var el = document.getElementById('countdown');
+	if (el) el.textContent = m + 'm ' + (s < 10 ? '0' : '') + s + 's';
+})();
+</script>
+{{end}}
+
+{{else}}
+<br>
+<p>AI triage is disabled. Configure <code>ai_triage</code> in your config file with <code>model</code> and <code>api_key</code> to enable.</p>
+{{end}}
