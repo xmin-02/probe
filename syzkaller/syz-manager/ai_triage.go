@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/google/syzkaller/pkg/aitriage"
 	"github.com/google/syzkaller/pkg/log"
@@ -167,22 +168,29 @@ func (mgr *Manager) aiOnStrategyResult(result *aitriage.StrategyResult) {
 		result.WeightErrors = unmatchedNames
 	}
 
-	// 2. Inject seed programs.
+	// 2. Apply seed hints — find corpus programs matching requested syscalls.
 	seedsInjected, seedsAccepted := 0, 0
 	var seedErrors []string
-	for _, seed := range result.SeedPrograms {
+	for _, hint := range result.SeedHints {
 		seedsInjected++
-		if err := f.InjectSeed(seed.Code); err != nil {
-			errMsg := fmt.Sprintf("%s: %v", seed.Target, err)
-			log.Logf(0, "PROBE: AI seed parse error: %s", errMsg)
+		best := mgr.findCorpusForSyscalls(hint.Syscalls, 2)
+		if len(best) == 0 {
+			errMsg := fmt.Sprintf("%s: no corpus match for %v", hint.Target, hint.Syscalls)
+			log.Logf(0, "PROBE: AI seed hint: %s", errMsg)
 			seedErrors = append(seedErrors, errMsg)
-		} else {
+			continue
+		}
+		for _, p := range best {
+			f.InjectProgram(p)
 			seedsAccepted++
 		}
+		log.Logf(0, "PROBE: AI seed hint '%s': injected %d programs for %v",
+			hint.Target, len(best), hint.Syscalls)
 	}
 	if seedsInjected > 0 {
-		log.Logf(0, "PROBE: AI seeds: %d injected, %d accepted", seedsInjected, seedsAccepted)
+		log.Logf(0, "PROBE: AI seed hints: %d hints, %d programs injected", seedsInjected, seedsAccepted)
 	}
+	result.SeedsInjected = seedsInjected
 	result.SeedsAccepted = seedsAccepted
 	result.SeedErrors = seedErrors
 
@@ -215,4 +223,45 @@ func (mgr *Manager) aiOnStrategyResult(result *aitriage.StrategyResult) {
 
 	// Re-save strategy with applied results (seeds accepted, weight match counts).
 	aitriage.SaveStrategyResult(mgr.cfg.Workdir, result)
+}
+
+// findCorpusForSyscalls searches the corpus for programs that contain the most
+// of the requested syscalls, returning up to `limit` best matches.
+func (mgr *Manager) findCorpusForSyscalls(targetSyscalls []string, limit int) []*prog.Prog {
+	targetSet := make(map[string]bool)
+	for _, s := range targetSyscalls {
+		targetSet[s] = true
+	}
+
+	type scored struct {
+		prog  *prog.Prog
+		score int
+	}
+
+	programs := mgr.corpus.Programs()
+	var matches []scored
+	for _, p := range programs {
+		score := 0
+		seen := make(map[string]bool)
+		for i := range p.Calls {
+			name := p.CallName(i)
+			if targetSet[name] && !seen[name] {
+				score++
+				seen[name] = true
+			}
+		}
+		if score > 0 {
+			matches = append(matches, scored{p, score})
+		}
+	}
+
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].score > matches[j].score
+	})
+
+	var result []*prog.Prog
+	for i := 0; i < limit && i < len(matches); i++ {
+		result = append(result, matches[i].prog)
+	}
+	return result
 }

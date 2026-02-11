@@ -87,6 +87,7 @@ func (serv *HTTPServer) Serve(ctx context.Context) error {
 	handle("/action", serv.httpAction)
 	handle("/addcandidate", serv.httpAddCandidate)
 	handle("/ai", serv.httpAI)                        // PROBE: AI dashboard
+	handle("/ai/analytics", serv.httpAIAnalytics)    // PROBE: AI analytics
 	handle("/ai/crash", serv.httpAICrash)             // PROBE: AI crash detail
 	handle("/api/ai/analyze", serv.httpAIAnalyze)     // PROBE: manual Step A
 	handle("/api/ai/log", serv.httpAILog)             // PROBE: console log stream
@@ -1449,7 +1450,11 @@ func (serv *HTTPServer) httpAI(w http.ResponseWriter, r *http.Request) {
 				Name   string  `json:"name"`
 				Weight float64 `json:"weight"`
 			} `json:"syscall_weights"`
-			SeedPrograms []struct{} `json:"seed_programs"`
+			SeedHints []struct {
+				Syscalls []string `json:"syscalls"`
+				Target   string   `json:"target"`
+				Reason   string   `json:"reason"`
+			} `json:"seed_hints"`
 			MutationHints struct {
 				SpliceWeight    float64 `json:"splice_weight"`
 				InsertWeight    float64 `json:"insert_weight"`
@@ -1461,6 +1466,7 @@ func (serv *HTTPServer) httpAI(w http.ResponseWriter, r *http.Request) {
 				CrashTitle string `json:"crash_title"`
 				Priority   int    `json:"priority"`
 			} `json:"focus_targets"`
+			SeedsInjected  int      `json:"seeds_injected"`
 			SeedsAccepted  int      `json:"seeds_accepted"`
 			WeightsApplied int      `json:"weights_applied"`
 			SeedErrors     []string `json:"seed_errors"`
@@ -1475,7 +1481,12 @@ func (serv *HTTPServer) httpAI(w http.ResponseWriter, r *http.Request) {
 					Name: sw.Name, Weight: sw.Weight,
 				})
 			}
-			data.Strategy.SeedsInjected = len(strat.SeedPrograms)
+			for _, sh := range strat.SeedHints {
+				data.Strategy.SeedHints = append(data.Strategy.SeedHints, UIAISeedHint{
+					Syscalls: sh.Syscalls, Target: sh.Target, Reason: sh.Reason,
+				})
+			}
+			data.Strategy.SeedsInjected = strat.SeedsInjected
 			data.Strategy.SeedsAccepted = strat.SeedsAccepted
 			data.Strategy.WeightsApplied = strat.WeightsApplied
 			data.Strategy.WeightsTotal = len(strat.SyscallWeights)
@@ -1770,6 +1781,7 @@ type UIAIStrategy struct {
 	Timestamp       time.Time
 	Summary         string
 	SyscallWeights  []UIAISyscallWeight
+	SeedHints       []UIAISeedHint
 	SeedsInjected   int
 	SeedsAccepted   int
 	WeightsApplied  int
@@ -1783,6 +1795,12 @@ type UIAIStrategy struct {
 type UIAISyscallWeight struct {
 	Name   string
 	Weight float64
+}
+
+type UIAISeedHint struct {
+	Syscalls []string
+	Target   string
+	Reason   string
 }
 
 type UIAIFocusTarget struct {
@@ -1828,6 +1846,433 @@ type UIAICrashPage struct {
 	OutputTokens  int
 }
 
+// PROBE: AI Analytics dashboard data types (Phase 3).
+
+type UIAIAnalyticsData struct {
+	UIPageHeader
+	Disabled bool
+
+	// Summary cards.
+	TotalCostUSD      float64
+	TotalCostKRW      int
+	TodayCostUSD      float64
+	ProjectedMonthUSD float64
+	ProjectedMonthKRW int
+	AnalyzedCount     int
+	HighRiskCount     int
+	SuccessRate       float64
+
+	// Section 1: Cost.
+	DailyCostJSON      template.JS
+	CostBreakdownJSON  template.JS
+	CumulativeCostJSON template.JS
+	TokenEfficiency    []UITokenEfficiency
+
+	// Section 2: Crash.
+	ScoreDistJSON    template.JS
+	ExploitClassJSON template.JS
+	VulnTypes        []UIVulnTypeStat
+	AvgScore         float64
+	MaxScore         int
+
+	// Section 3: Strategy.
+	TotalSeedsInjected int
+	TotalSeedsAccepted int
+	TotalWeightsApplied int
+	TotalWeightsTotal   int
+	FocusTriggered      int
+	StrategyRuns        []UIStrategyRun
+
+	// Section 4: API.
+	AvgCrashTokens    UIAvgTokens
+	AvgStrategyTokens UIAvgTokens
+	ErrorLog          []UIAPIError
+	CallsPerDayJSON   template.JS
+	TotalCalls        int
+}
+
+type UITokenEfficiency struct {
+	Label string
+	Input int
+	Output int
+	Cost  float64
+}
+
+type UIVulnTypeStat struct {
+	Type  string
+	Count int
+	Pct   float64
+}
+
+type UIStrategyRun struct {
+	Time           time.Time
+	SeedsInjected  int
+	SeedsAccepted  int
+	WeightsApplied int
+	Summary        string
+}
+
+type UIAvgTokens struct {
+	AvgInput  int
+	AvgOutput int
+	Count     int
+}
+
+type UIAPIError struct {
+	Time  time.Time
+	Type  string
+	Error string
+}
+
+func (serv *HTTPServer) httpAIAnalytics(w http.ResponseWriter, r *http.Request) {
+	data := UIAIAnalyticsData{
+		UIPageHeader: serv.pageHeader(r, "AI Analytics"),
+	}
+
+	if serv.Triager == nil {
+		data.Disabled = true
+		executeTemplate(w, aiAnalyticsTemplate, &data)
+		return
+	}
+
+	// Parse analytics data from triager.
+	type analyticsProvider interface {
+		AnalyticsJSON() []byte
+	}
+	type costProvider interface {
+		CostJSON() []byte
+	}
+
+	var ad struct {
+		DailyStats   []dailyStat    `json:"daily_stats"`
+		TotalCalls   int            `json:"total_calls"`
+		TotalInput   int            `json:"total_input_tokens"`
+		TotalOutput  int            `json:"total_output_tokens"`
+		TotalCostUSD float64        `json:"total_cost_usd"`
+		TodayCostUSD float64        `json:"today_cost_usd"`
+		TodayCalls   int            `json:"today_calls"`
+		History      []historyEntry `json:"history"`
+	}
+	if ap, ok := serv.Triager.(analyticsProvider); ok {
+		json.Unmarshal(ap.AnalyticsJSON(), &ad)
+	} else if cp, ok := serv.Triager.(costProvider); ok {
+		// Fallback: use CostJSON if AnalyticsJSON not available.
+		json.Unmarshal(cp.CostJSON(), &ad)
+	}
+
+	data.TotalCostUSD = ad.TotalCostUSD
+	data.TotalCostKRW = int(ad.TotalCostUSD * 1450)
+	data.TodayCostUSD = ad.TodayCostUSD
+	data.TotalCalls = ad.TotalCalls
+
+	// === Section 1: Cost Analytics ===
+	serv.buildCostAnalytics(&data, ad.DailyStats, ad.History)
+
+	// === Section 2: Crash Analysis Stats ===
+	serv.buildCrashStats(&data)
+
+	// === Section 3: Strategy Effectiveness ===
+	serv.buildStrategyStats(&data)
+
+	// === Section 4: API Performance ===
+	serv.buildAPIPerformance(&data, ad.DailyStats, ad.History)
+
+	executeTemplate(w, aiAnalyticsTemplate, &data)
+}
+
+func (serv *HTTPServer) buildCostAnalytics(data *UIAIAnalyticsData, daily []dailyStat, history []historyEntry) {
+	// Daily cost bar chart data: [["Date", "Crash", "Strategy"], ...]
+	var dailyCostRows []string
+	var cumulativeRows []string
+	cumulative := 0.0
+	totalCrashCost := 0.0
+	totalStrategyCost := 0.0
+
+	for _, d := range daily {
+		// Estimate crash vs strategy cost split.
+		crashCost := 0.0
+		strategyCost := 0.0
+		if d.Calls > 0 {
+			crashRatio := float64(d.CrashCalls) / float64(d.Calls)
+			crashCost = d.CostUSD * crashRatio
+			strategyCost = d.CostUSD * (1.0 - crashRatio)
+		}
+		totalCrashCost += crashCost
+		totalStrategyCost += strategyCost
+		cumulative += d.CostUSD
+
+		dailyCostRows = append(dailyCostRows,
+			fmt.Sprintf("['%s', %.4f, %.4f]", d.Date[5:], crashCost, strategyCost))
+		cumulativeRows = append(cumulativeRows,
+			fmt.Sprintf("['%s', %.4f]", d.Date[5:], cumulative))
+	}
+
+	data.DailyCostJSON = template.JS("[" + strings.Join(dailyCostRows, ",") + "]")
+	data.CumulativeCostJSON = template.JS("[" + strings.Join(cumulativeRows, ",") + "]")
+
+	// Cost breakdown pie: crash vs strategy.
+	data.CostBreakdownJSON = template.JS(fmt.Sprintf(
+		"[['Crash Analysis', %.4f], ['Strategy', %.4f]]", totalCrashCost, totalStrategyCost))
+
+	// Token efficiency.
+	crashInput, crashOutput, crashCount := 0, 0, 0
+	stratInput, stratOutput, stratCount := 0, 0, 0
+	for _, h := range history {
+		if h.Type == "crash" {
+			crashInput += h.InputTokens
+			crashOutput += h.OutputTokens
+			crashCount++
+		} else if h.Type == "strategy" {
+			stratInput += h.InputTokens
+			stratOutput += h.OutputTokens
+			stratCount++
+		}
+	}
+	if crashCount > 0 {
+		crashCost := 0.0
+		for _, h := range history {
+			if h.Type == "crash" {
+				crashCost += h.CostUSD
+			}
+		}
+		data.TokenEfficiency = append(data.TokenEfficiency, UITokenEfficiency{
+			Label: "Crash Analysis", Input: crashInput / crashCount, Output: crashOutput / crashCount, Cost: crashCost / float64(crashCount),
+		})
+	}
+	if stratCount > 0 {
+		stratCost := 0.0
+		for _, h := range history {
+			if h.Type == "strategy" {
+				stratCost += h.CostUSD
+			}
+		}
+		data.TokenEfficiency = append(data.TokenEfficiency, UITokenEfficiency{
+			Label: "Strategy", Input: stratInput / stratCount, Output: stratOutput / stratCount, Cost: stratCost / float64(stratCount),
+		})
+	}
+
+	// Monthly projection based on recent 7-day average.
+	if len(daily) > 0 {
+		days := len(daily)
+		if days > 7 {
+			days = 7
+		}
+		recentCost := 0.0
+		for i := len(daily) - days; i < len(daily); i++ {
+			recentCost += daily[i].CostUSD
+		}
+		avgPerDay := recentCost / float64(days)
+		data.ProjectedMonthUSD = avgPerDay * 30
+		data.ProjectedMonthKRW = int(data.ProjectedMonthUSD * 1450)
+	}
+}
+
+// dailyStat is a package-level type alias for the local struct in httpAIAnalytics.
+// We define it at method level instead by accepting it as a parameter type.
+type dailyStat = struct {
+	Date          string  `json:"date"`
+	Calls         int     `json:"calls"`
+	CrashCalls    int     `json:"crash_calls"`
+	StrategyCalls int     `json:"strategy_calls"`
+	InputTokens   int     `json:"input_tokens"`
+	OutputTokens  int     `json:"output_tokens"`
+	CostUSD       float64 `json:"cost_usd"`
+	Successes     int     `json:"successes"`
+	Failures      int     `json:"failures"`
+}
+
+type historyEntry = struct {
+	Time          time.Time `json:"time"`
+	Type          string    `json:"type"`
+	InputTokens   int       `json:"input_tokens"`
+	OutputTokens  int       `json:"output_tokens"`
+	CostUSD       float64   `json:"cost_usd"`
+	Success       bool      `json:"success"`
+	ResultSummary string    `json:"result_summary"`
+	Error         string    `json:"error"`
+}
+
+func (serv *HTTPServer) buildCrashStats(data *UIAIAnalyticsData) {
+	if serv.CrashStore == nil {
+		return
+	}
+	list, err := serv.CrashStore.BugList()
+	if err != nil {
+		return
+	}
+
+	// Score distribution buckets: 0-9, 10-19, ..., 90-100.
+	buckets := make([]int, 10)
+	classCount := make(map[string]int)
+	vulnCount := make(map[string]int)
+	totalScore := 0
+	maxScore := 0
+	analyzed := 0
+	highRisk := 0
+
+	for _, info := range list {
+		if isInternalCrashTitle(info.Title) {
+			continue
+		}
+		tr := loadAITriageResult(serv.Cfg.Workdir, info.ID)
+		if tr == nil {
+			continue
+		}
+		analyzed++
+		score := tr.Score
+		totalScore += score
+		if score > maxScore {
+			maxScore = score
+		}
+		if score >= 70 {
+			highRisk++
+		}
+		bucket := score / 10
+		if bucket > 9 {
+			bucket = 9
+		}
+		buckets[bucket]++
+		if tr.ExploitClass != "" {
+			classCount[tr.ExploitClass]++
+		}
+		if tr.VulnType != "" {
+			vulnCount[tr.VulnType]++
+		}
+	}
+
+	data.AnalyzedCount = analyzed
+	data.HighRiskCount = highRisk
+	if analyzed > 0 {
+		data.AvgScore = float64(totalScore) / float64(analyzed)
+	}
+	data.MaxScore = maxScore
+
+	// Score distribution chart.
+	var scoreDist []string
+	labels := []string{"0-9", "10-19", "20-29", "30-39", "40-49", "50-59", "60-69", "70-79", "80-89", "90-100"}
+	for i, label := range labels {
+		scoreDist = append(scoreDist, fmt.Sprintf("['%s', %d]", label, buckets[i]))
+	}
+	data.ScoreDistJSON = template.JS("[" + strings.Join(scoreDist, ",") + "]")
+
+	// Exploit class pie chart.
+	var classPie []string
+	for cls, cnt := range classCount {
+		classPie = append(classPie, fmt.Sprintf("['%s', %d]", cls, cnt))
+	}
+	sort.Strings(classPie)
+	data.ExploitClassJSON = template.JS("[" + strings.Join(classPie, ",") + "]")
+
+	// Vuln type table.
+	for vt, cnt := range vulnCount {
+		pct := 0.0
+		if analyzed > 0 {
+			pct = float64(cnt) * 100.0 / float64(analyzed)
+		}
+		data.VulnTypes = append(data.VulnTypes, UIVulnTypeStat{Type: vt, Count: cnt, Pct: pct})
+	}
+	sort.Slice(data.VulnTypes, func(i, j int) bool {
+		return data.VulnTypes[i].Count > data.VulnTypes[j].Count
+	})
+}
+
+func (serv *HTTPServer) buildStrategyStats(data *UIAIAnalyticsData) {
+	// Load all strategy history from workdir.
+	stratPath := filepath.Join(serv.Cfg.Workdir, "ai-strategy.json")
+	stratData, err := os.ReadFile(stratPath)
+	if err != nil {
+		return
+	}
+	var strat struct {
+		Summary        string    `json:"summary"`
+		Timestamp      time.Time `json:"timestamp"`
+		SeedsInjected  int       `json:"seeds_injected"`
+		SeedsAccepted  int       `json:"seeds_accepted"`
+		WeightsApplied int       `json:"weights_applied"`
+		SyscallWeights []struct {
+			Name string `json:"name"`
+		} `json:"syscall_weights"`
+		FocusTargets []struct {
+			CrashTitle string `json:"crash_title"`
+		} `json:"focus_targets"`
+	}
+	if json.Unmarshal(stratData, &strat) != nil {
+		return
+	}
+	data.TotalSeedsInjected = strat.SeedsInjected
+	data.TotalSeedsAccepted = strat.SeedsAccepted
+	data.TotalWeightsApplied = strat.WeightsApplied
+	data.TotalWeightsTotal = len(strat.SyscallWeights)
+	data.FocusTriggered = len(strat.FocusTargets)
+
+	summary := strat.Summary
+	if len(summary) > 120 {
+		summary = summary[:120] + "..."
+	}
+	data.StrategyRuns = append(data.StrategyRuns, UIStrategyRun{
+		Time:           strat.Timestamp,
+		SeedsInjected:  strat.SeedsInjected,
+		SeedsAccepted:  strat.SeedsAccepted,
+		WeightsApplied: strat.WeightsApplied,
+		Summary:        summary,
+	})
+}
+
+func (serv *HTTPServer) buildAPIPerformance(data *UIAIAnalyticsData, daily []dailyStat, history []historyEntry) {
+	totalSuccess := 0
+	totalFail := 0
+	crashIn, crashOut, crashN := 0, 0, 0
+	stratIn, stratOut, stratN := 0, 0, 0
+
+	for _, h := range history {
+		if h.Success {
+			totalSuccess++
+		} else {
+			totalFail++
+		}
+		if h.Type == "crash" && h.Success {
+			crashIn += h.InputTokens
+			crashOut += h.OutputTokens
+			crashN++
+		} else if h.Type == "strategy" && h.Success {
+			stratIn += h.InputTokens
+			stratOut += h.OutputTokens
+			stratN++
+		}
+		if !h.Success && h.Error != "" {
+			data.ErrorLog = append(data.ErrorLog, UIAPIError{
+				Time: h.Time, Type: h.Type, Error: h.Error,
+			})
+		}
+	}
+
+	total := totalSuccess + totalFail
+	if total > 0 {
+		data.SuccessRate = float64(totalSuccess) * 100.0 / float64(total)
+	}
+	if crashN > 0 {
+		data.AvgCrashTokens = UIAvgTokens{AvgInput: crashIn / crashN, AvgOutput: crashOut / crashN, Count: crashN}
+	}
+	if stratN > 0 {
+		data.AvgStrategyTokens = UIAvgTokens{AvgInput: stratIn / stratN, AvgOutput: stratOut / stratN, Count: stratN}
+	}
+
+	// Calls per day chart.
+	var callRows []string
+	for _, d := range daily {
+		callRows = append(callRows, fmt.Sprintf("['%s', %d, %d]", d.Date[5:], d.CrashCalls, d.StrategyCalls))
+	}
+	data.CallsPerDayJSON = template.JS("[" + strings.Join(callRows, ",") + "]")
+
+	// Reverse error log (newest first), cap at 20.
+	for i, j := 0, len(data.ErrorLog)-1; i < j; i, j = i+1, j-1 {
+		data.ErrorLog[i], data.ErrorLog[j] = data.ErrorLog[j], data.ErrorLog[i]
+	}
+	if len(data.ErrorLog) > 20 {
+		data.ErrorLog = data.ErrorLog[:20]
+	}
+}
+
 var (
 	mainTemplate          = createPage("main", UISummaryData{})
 	syscallsTemplate      = createPage("syscalls", UISyscallsData{})
@@ -1839,8 +2284,9 @@ var (
 	rawCoverTemplate      = createPage("raw_cover", UIRawCoverPage{})
 	jobListTemplate       = createPage("job_list", UIJobList{})
 	textTemplate          = createPage("text", UITextPage{})
-	aiTemplate            = createPage("ai", UIAIPageData{})      // PROBE: AI dashboard
-	aiCrashTemplate       = createPage("aicrash", UIAICrashPage{}) // PROBE: AI crash detail
+	aiTemplate            = createPage("ai", UIAIPageData{})               // PROBE: AI dashboard
+	aiCrashTemplate       = createPage("aicrash", UIAICrashPage{})         // PROBE: AI crash detail
+	aiAnalyticsTemplate   = createPage("aianalytics", UIAIAnalyticsData{}) // PROBE: AI analytics
 )
 
 //go:embed html/*.html

@@ -15,26 +15,25 @@ and recommend actions to maximize vulnerability discovery.
 
 Your recommendations must be in these categories:
 1. SYSCALL WEIGHTS: Which syscalls to prioritize or deprioritize
-2. SEED PROGRAMS: New syscall sequences targeting unexplored areas
+2. SEED HINTS: Combinations of syscalls that should appear together in test programs
 3. MUTATION STRATEGY: How to adjust mutation weights
 4. FOCUS TARGETS: Which crashes deserve intensive exploration
 
 CRITICAL RULES:
-- For syscall_weights and seed_programs, you MUST ONLY use syscall names from the
+- For syscall_weights and seed_hints, you MUST ONLY use syscall names from the
   "Available Syscalls" list provided below. Do NOT invent syscall names.
   If no exact match exists, skip that recommendation.
-- Seed programs MUST use valid syzkaller program format. Example:
-  "r0 = socket(0x2, 0x1, 0x0)\nbind(r0, &AUTO, AUTO)\nlisten(r0, 0x5)\naccept(r0, 0x0, 0x0)"
-  Each line is one syscall. Use r0, r1, r2 for return values. Use &AUTO for auto-generated pointers.
-  Use 0x prefix for hex constants. Do NOT use kernel function names as syscalls.
+- SEED HINTS: Suggest 2-5 syscall names that should appear together in a test program.
+  The fuzzer will find existing corpus programs matching these syscalls.
+  Use ONLY names from the Available Syscalls list. Do NOT write program code.
 - Weight adjustments are multipliers (1.0 = no change, 2.0 = double priority)
 - Be specific and actionable. Vague suggestions are useless.
-- Limit to at most 10 syscall weight adjustments, 3 seed programs, and 3 focus targets.
+- Limit to at most 10 syscall weight adjustments, 5 seed hints, and 3 focus targets.
 
 You MUST respond with ONLY a valid JSON object matching this schema:
 {
   "syscall_weights": [{"name": "syscall_name", "weight": 1.5, "reason": "why"}],
-  "seed_programs": [{"code": "syzkaller program text", "target": "goal", "reason": "why"}],
+  "seed_hints": [{"syscalls": ["syscall1", "syscall2", "syscall3"], "target": "goal", "reason": "why"}],
   "mutation_hints": {
     "splice_weight": 1.0,
     "insert_weight": 1.0,
@@ -82,7 +81,7 @@ func buildStrategyPrompt(snapshot *FuzzingSnapshot) (string, string) {
 		sb.WriteString("\n")
 
 		// Provide full list of available syscall names for weight/seed recommendations.
-		sb.WriteString("### Available Syscalls (use ONLY these names for syscall_weights and seed_programs)\n")
+		sb.WriteString("### Available Syscalls (use ONLY these names for syscall_weights and seed_hints)\n")
 		// Sort alphabetically for clarity.
 		allNames := make([]string, 0, len(snapshot.SyscallCoverage))
 		for name := range snapshot.SyscallCoverage {

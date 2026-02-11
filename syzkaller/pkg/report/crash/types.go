@@ -158,10 +158,16 @@ func (t Type) Tier() int {
 	// Tier 2: Potentially exploitable, not direct UAF/OOB.
 	case MemorySafetyUBSAN, KCSANAssert, RefcountWARNING,
 		KASANNullPtrDerefWrite, KASANNullPtrDerefRead,
-		NullPtrDerefBUG, KMSANInfoLeak, MemorySafetyBUG, KMSANUninitValue:
+		NullPtrDerefBUG, KMSANInfoLeak, MemorySafetyBUG, KMSANUninitValue,
+		// Kernel warnings/bugs can indicate real security issues.
+		Warning, Bug, UBSAN, LockdepBug, AtomicSleep,
+		KCSANDataRace, KASANUnknown, KFENCEUnknown, KMSANUnknown, KCSANUnknown,
+		UnexpectedReboot:
 		return TierImportant
-	// Tier 3: Low value for exploitation.
-	default:
+	// Tier 3: Infrastructure noise only (not real kernel bugs).
+	case LostConnection, SyzFailure, Hang, DoS, MemoryLeak:
 		return TierLow
+	default:
+		return TierImportant
 	}
 }

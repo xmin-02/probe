@@ -1,0 +1,274 @@
+{{/*
+Copyright 2024 syzkaller project authors. All rights reserved.
+Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+PROBE: AI Analytics dashboard page (Phase 3).
+*/}}
+
+{{if .Disabled}}
+<p>AI triage is disabled. Configure <code>ai_triage</code> in your config file to enable analytics.</p>
+{{else}}
+
+<style>
+.analytics-cards {
+	display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px;
+}
+.analytics-card {
+	background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px;
+	padding: 16px 20px; min-width: 150px; flex: 1;
+}
+.analytics-card .label { font-size: 12px; color: #6c757d; text-transform: uppercase; }
+.analytics-card .value { font-size: 24px; font-weight: bold; margin-top: 4px; }
+.analytics-card .sub { font-size: 11px; color: #999; margin-top: 2px; }
+.chart-row { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 20px; }
+.chart-box { flex: 1; min-width: 400px; border: 1px solid #ddd; border-radius: 6px; padding: 10px; background: #fff; }
+.chart-box-small { flex: 1; min-width: 300px; max-width: 400px; border: 1px solid #ddd; border-radius: 6px; padding: 10px; background: #fff; }
+.section-title { font-size: 18px; font-weight: bold; margin: 24px 0 12px 0; padding-bottom: 6px; border-bottom: 2px solid #4285f4; }
+.section-title:first-of-type { margin-top: 12px; }
+</style>
+
+<p><a href="/ai">&larr; Back to AI Dashboard</a></p>
+
+<div class="analytics-cards">
+	<div class="analytics-card">
+		<div class="label">Total Cost</div>
+		<div class="value">${{printf "%.2f" .TotalCostUSD}}</div>
+		<div class="sub">~{{.TotalCostKRW}} KRW</div>
+	</div>
+	<div class="analytics-card">
+		<div class="label">Today</div>
+		<div class="value">${{printf "%.3f" .TodayCostUSD}}</div>
+	</div>
+	<div class="analytics-card">
+		<div class="label">Projected/Month</div>
+		<div class="value">${{printf "%.2f" .ProjectedMonthUSD}}</div>
+		<div class="sub">~{{.ProjectedMonthKRW}} KRW</div>
+	</div>
+	<div class="analytics-card">
+		<div class="label">Analyzed</div>
+		<div class="value">{{.AnalyzedCount}}</div>
+		<div class="sub">crashes</div>
+	</div>
+	<div class="analytics-card">
+		<div class="label">High Risk</div>
+		<div class="value" style="color:#c0392b">{{.HighRiskCount}}</div>
+		<div class="sub">score &ge; 70</div>
+	</div>
+	<div class="analytics-card">
+		<div class="label">Success Rate</div>
+		<div class="value">{{printf "%.1f" .SuccessRate}}%</div>
+		<div class="sub">{{.TotalCalls}} total calls</div>
+	</div>
+</div>
+
+<div class="section-title">1. Cost Analytics</div>
+<div class="chart-row">
+	<div class="chart-box"><div id="chart_daily_cost" style="height:300px"></div></div>
+	<div class="chart-box-small"><div id="chart_cost_breakdown" style="height:300px"></div></div>
+</div>
+<div class="chart-row">
+	<div class="chart-box"><div id="chart_cumulative" style="height:280px"></div></div>
+</div>
+{{if .TokenEfficiency}}
+<table class="list_table" style="width:auto">
+<caption>Token Efficiency (avg per call):</caption>
+<thead><tr><th>Type</th><th>Avg Input</th><th>Avg Output</th><th>Avg Cost</th></tr></thead>
+<tbody>
+{{range .TokenEfficiency}}
+<tr><td>{{.Label}}</td><td class="stat">{{.Input}}</td><td class="stat">{{.Output}}</td><td class="stat">${{printf "%.4f" .Cost}}</td></tr>
+{{end}}
+</tbody>
+</table>
+{{end}}
+
+<div class="section-title">2. Crash Analysis</div>
+<div class="chart-row">
+	<div class="chart-box"><div id="chart_score_dist" style="height:300px"></div></div>
+	<div class="chart-box-small"><div id="chart_exploit_class" style="height:300px"></div></div>
+</div>
+<table class="list_table" style="width:auto">
+<caption>Statistics:</caption>
+<tr><td class="title">Analyzed</td><td>{{.AnalyzedCount}} crashes</td></tr>
+<tr><td class="title">Avg Score</td><td>{{printf "%.1f" .AvgScore}}</td></tr>
+<tr><td class="title">Max Score</td><td>{{.MaxScore}}</td></tr>
+<tr><td class="title">High Risk (&ge;70)</td><td>{{.HighRiskCount}}</td></tr>
+</table>
+{{if .VulnTypes}}
+<br>
+<table class="list_table" style="width:auto">
+<caption>Vulnerability Types:</caption>
+<thead><tr><th>Type</th><th>Count</th><th>%</th></tr></thead>
+<tbody>
+{{range .VulnTypes}}
+<tr><td>{{.Type}}</td><td class="stat">{{.Count}}</td><td class="stat">{{printf "%.1f" .Pct}}%</td></tr>
+{{end}}
+</tbody>
+</table>
+{{end}}
+
+<div class="section-title">3. Strategy Effectiveness</div>
+<table class="list_table" style="width:auto">
+<caption>Strategy Summary:</caption>
+<tr><td class="title">Seeds Injected</td><td>{{.TotalSeedsInjected}}</td></tr>
+<tr><td class="title">Seeds Accepted</td><td>{{.TotalSeedsAccepted}}</td></tr>
+<tr><td class="title">Weights Applied</td><td>{{.TotalWeightsApplied}} / {{.TotalWeightsTotal}}</td></tr>
+<tr><td class="title">Focus Targets</td><td>{{.FocusTriggered}}</td></tr>
+</table>
+{{if .StrategyRuns}}
+<br>
+<table class="list_table" style="width:auto">
+<caption>Recent Strategy Runs:</caption>
+<thead><tr><th>Time</th><th>Seeds</th><th>Weights</th><th>Summary</th></tr></thead>
+<tbody>
+{{range .StrategyRuns}}
+<tr>
+	<td class="time">{{formatTime .Time}}</td>
+	<td class="stat">{{.SeedsInjected}}&rarr;{{.SeedsAccepted}}</td>
+	<td class="stat">{{.WeightsApplied}}</td>
+	<td style="max-width:500px; word-wrap:break-word; white-space:pre-wrap">{{.Summary}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{end}}
+
+<div class="section-title">4. API Performance</div>
+<div class="chart-row">
+	<div class="chart-box"><div id="chart_calls_per_day" style="height:280px"></div></div>
+</div>
+<table class="list_table" style="width:auto">
+<caption>Token Usage by Type:</caption>
+<thead><tr><th>Type</th><th>Calls</th><th>Avg Input</th><th>Avg Output</th></tr></thead>
+<tbody>
+<tr><td>Crash Analysis</td><td class="stat">{{.AvgCrashTokens.Count}}</td><td class="stat">{{.AvgCrashTokens.AvgInput}}</td><td class="stat">{{.AvgCrashTokens.AvgOutput}}</td></tr>
+<tr><td>Strategy</td><td class="stat">{{.AvgStrategyTokens.Count}}</td><td class="stat">{{.AvgStrategyTokens.AvgInput}}</td><td class="stat">{{.AvgStrategyTokens.AvgOutput}}</td></tr>
+</tbody>
+</table>
+{{if .ErrorLog}}
+<br>
+<table class="list_table" style="width:auto">
+<caption>Recent Errors (last {{len .ErrorLog}}):</caption>
+<thead><tr><th>Time</th><th>Type</th><th>Error</th></tr></thead>
+<tbody>
+{{range .ErrorLog}}
+<tr>
+	<td class="time">{{formatTime .Time}}</td>
+	<td>{{.Type}}</td>
+	<td style="color:red; max-width:600px; word-wrap:break-word">{{.Error}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{end}}
+
+<script src="https://www.gstatic.com/charts/loader.js"></script>
+<script>
+google.charts.load('current', {packages: ['corechart']});
+google.charts.setOnLoadCallback(drawAllCharts);
+
+function drawAllCharts() {
+	drawDailyCost();
+	drawCostBreakdown();
+	drawCumulativeCost();
+	drawScoreDist();
+	drawExploitClass();
+	drawCallsPerDay();
+}
+
+function drawDailyCost() {
+	var raw = {{.DailyCostJSON}};
+	if (!raw || raw.length === 0) return;
+	var dt = new google.visualization.DataTable();
+	dt.addColumn('string', 'Date');
+	dt.addColumn('number', 'Crash');
+	dt.addColumn('number', 'Strategy');
+	dt.addRows(raw);
+	new google.visualization.ColumnChart(document.getElementById('chart_daily_cost')).draw(dt, {
+		title: 'Daily Cost (USD)', isStacked: true,
+		colors: ['#4285f4', '#fbbc04'],
+		legend: {position: 'top'},
+		chartArea: {width: '85%', height: '70%'},
+		vAxis: {format: '$#,##0.00'}
+	});
+}
+
+function drawCostBreakdown() {
+	var raw = {{.CostBreakdownJSON}};
+	if (!raw || raw.length === 0) return;
+	var dt = new google.visualization.DataTable();
+	dt.addColumn('string', 'Type');
+	dt.addColumn('number', 'Cost');
+	dt.addRows(raw);
+	new google.visualization.PieChart(document.getElementById('chart_cost_breakdown')).draw(dt, {
+		title: 'Cost Breakdown',
+		colors: ['#4285f4', '#fbbc04'],
+		chartArea: {width: '90%', height: '75%'},
+		pieHole: 0.3
+	});
+}
+
+function drawCumulativeCost() {
+	var raw = {{.CumulativeCostJSON}};
+	if (!raw || raw.length === 0) return;
+	var dt = new google.visualization.DataTable();
+	dt.addColumn('string', 'Date');
+	dt.addColumn('number', 'Cumulative');
+	dt.addRows(raw);
+	new google.visualization.LineChart(document.getElementById('chart_cumulative')).draw(dt, {
+		title: 'Cumulative Cost (USD)',
+		colors: ['#34a853'],
+		curveType: 'function',
+		legend: {position: 'none'},
+		chartArea: {width: '85%', height: '70%'},
+		vAxis: {format: '$#,##0.00'}
+	});
+}
+
+function drawScoreDist() {
+	var raw = {{.ScoreDistJSON}};
+	if (!raw || raw.length === 0) return;
+	var dt = new google.visualization.DataTable();
+	dt.addColumn('string', 'Range');
+	dt.addColumn('number', 'Count');
+	dt.addRows(raw);
+	new google.visualization.ColumnChart(document.getElementById('chart_score_dist')).draw(dt, {
+		title: 'Score Distribution',
+		colors: ['#ea4335'],
+		legend: {position: 'none'},
+		chartArea: {width: '85%', height: '70%'},
+		vAxis: {minValue: 0}
+	});
+}
+
+function drawExploitClass() {
+	var raw = {{.ExploitClassJSON}};
+	if (!raw || raw.length === 0) return;
+	var dt = new google.visualization.DataTable();
+	dt.addColumn('string', 'Class');
+	dt.addColumn('number', 'Count');
+	dt.addRows(raw);
+	new google.visualization.PieChart(document.getElementById('chart_exploit_class')).draw(dt, {
+		title: 'Exploit Classes',
+		chartArea: {width: '90%', height: '75%'},
+		pieHole: 0.3
+	});
+}
+
+function drawCallsPerDay() {
+	var raw = {{.CallsPerDayJSON}};
+	if (!raw || raw.length === 0) return;
+	var dt = new google.visualization.DataTable();
+	dt.addColumn('string', 'Date');
+	dt.addColumn('number', 'Crash');
+	dt.addColumn('number', 'Strategy');
+	dt.addRows(raw);
+	new google.visualization.ColumnChart(document.getElementById('chart_calls_per_day')).draw(dt, {
+		title: 'API Calls per Day', isStacked: true,
+		colors: ['#4285f4', '#fbbc04'],
+		legend: {position: 'top'},
+		chartArea: {width: '85%', height: '70%'},
+		vAxis: {minValue: 0}
+	});
+}
+</script>
+
+{{end}}

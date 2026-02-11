@@ -58,6 +58,8 @@ type StrategyResult struct {
 	Timestamp       time.Time       `json:"timestamp"`
 	InputTokens     int             `json:"input_tokens"`
 	OutputTokens    int             `json:"output_tokens"`
+	SeedHints       []SeedHint      `json:"seed_hints,omitempty"`
+	SeedsInjected   int             `json:"seeds_injected,omitempty"`
 	SeedsAccepted   int             `json:"seeds_accepted,omitempty"`
 	WeightsApplied  int             `json:"weights_applied,omitempty"`
 	SeedErrors      []string        `json:"seed_errors,omitempty"`
@@ -74,6 +76,15 @@ type SeedProgram struct {
 	Code   string `json:"code"`
 	Target string `json:"target"`
 	Reason string `json:"reason"`
+}
+
+// SeedHint describes a combination of syscalls the fuzzer should explore together.
+// Instead of generating raw program text (which fails parsing), the LLM suggests
+// syscall combinations and the manager finds matching corpus programs.
+type SeedHint struct {
+	Syscalls []string `json:"syscalls"`
+	Target   string   `json:"target"`
+	Reason   string   `json:"reason"`
 }
 
 type MutationHints struct {
@@ -122,6 +133,19 @@ type APICall struct {
 	Error         string    `json:"error,omitempty"`
 }
 
+// DailySummary holds aggregated stats for a single day.
+type DailySummary struct {
+	Date          string  `json:"date"`
+	Calls         int     `json:"calls"`
+	CrashCalls    int     `json:"crash_calls"`
+	StrategyCalls int     `json:"strategy_calls"`
+	InputTokens   int     `json:"input_tokens"`
+	OutputTokens  int     `json:"output_tokens"`
+	CostUSD       float64 `json:"cost_usd"`
+	Successes     int     `json:"successes"`
+	Failures      int     `json:"failures"`
+}
+
 // CostTracker tracks cumulative API usage and costs.
 type CostTracker struct {
 	mu           sync.Mutex
@@ -133,8 +157,9 @@ type CostTracker struct {
 	TodayDate    string    `json:"today_date"`
 	TodayCalls   int       `json:"today_calls"`
 	TodayInput   int       `json:"today_input_tokens"`
-	TodayOutput  int       `json:"today_output_tokens"`
-	History      []APICall `json:"history"`
+	TodayOutput  int            `json:"today_output_tokens"`
+	History      []APICall      `json:"history"`
+	DailyStats   []DailySummary `json:"daily_stats"`
 }
 
 const maxHistorySize = 100
@@ -182,6 +207,38 @@ func (ct *CostTracker) Record(call APICall, model string) {
 	if len(ct.History) > maxHistorySize {
 		ct.History = ct.History[len(ct.History)-maxHistorySize:]
 	}
+
+	ct.recordDaily(call)
+}
+
+const maxDailyStats = 90
+
+func (ct *CostTracker) recordDaily(call APICall) {
+	today := time.Now().Format("2006-01-02")
+	var ds *DailySummary
+	if len(ct.DailyStats) > 0 && ct.DailyStats[len(ct.DailyStats)-1].Date == today {
+		ds = &ct.DailyStats[len(ct.DailyStats)-1]
+	} else {
+		ct.DailyStats = append(ct.DailyStats, DailySummary{Date: today})
+		ds = &ct.DailyStats[len(ct.DailyStats)-1]
+	}
+	ds.Calls++
+	ds.InputTokens += call.InputTokens
+	ds.OutputTokens += call.OutputTokens
+	ds.CostUSD += call.CostUSD
+	if call.Type == "crash" {
+		ds.CrashCalls++
+	} else if call.Type == "strategy" {
+		ds.StrategyCalls++
+	}
+	if call.Success {
+		ds.Successes++
+	} else {
+		ds.Failures++
+	}
+	if len(ct.DailyStats) > maxDailyStats {
+		ct.DailyStats = ct.DailyStats[len(ct.DailyStats)-maxDailyStats:]
+	}
 }
 
 // CostSnapshot is a mutex-free copy of CostTracker for reading.
@@ -196,6 +253,7 @@ type CostSnapshot struct {
 	TodayInput   int
 	TodayOutput  int
 	History      []APICall
+	DailyStats   []DailySummary
 }
 
 func (ct *CostTracker) Snapshot() CostSnapshot {
@@ -224,6 +282,8 @@ func (ct *CostTracker) Snapshot() CostSnapshot {
 	}
 	snap.History = make([]APICall, len(ct.History))
 	copy(snap.History, ct.History)
+	snap.DailyStats = make([]DailySummary, len(ct.DailyStats))
+	copy(snap.DailyStats, ct.DailyStats)
 	return snap
 }
 
@@ -365,6 +425,31 @@ func (t *Triager) CostJSON() []byte {
 		TodayCalls:   snap.TodayCalls,
 		TodayInput:   snap.TodayInput,
 		TodayOutput:  snap.TodayOutput,
+		History:      snap.History,
+	})
+	return data
+}
+
+// AnalyticsJSON returns daily stats and history as JSON for the analytics dashboard.
+func (t *Triager) AnalyticsJSON() []byte {
+	snap := t.cost.Snapshot()
+	data, _ := json.Marshal(struct {
+		DailyStats   []DailySummary `json:"daily_stats"`
+		TotalCalls   int            `json:"total_calls"`
+		TotalInput   int            `json:"total_input_tokens"`
+		TotalOutput  int            `json:"total_output_tokens"`
+		TotalCostUSD float64        `json:"total_cost_usd"`
+		TodayCostUSD float64        `json:"today_cost_usd"`
+		TodayCalls   int            `json:"today_calls"`
+		History      []APICall      `json:"history"`
+	}{
+		DailyStats:   snap.DailyStats,
+		TotalCalls:   snap.TotalCalls,
+		TotalInput:   snap.TotalInput,
+		TotalOutput:  snap.TotalOutput,
+		TotalCostUSD: snap.TotalCostUSD,
+		TodayCostUSD: snap.TodayCostUSD,
+		TodayCalls:   snap.TodayCalls,
 		History:      snap.History,
 	})
 	return data
@@ -612,10 +697,10 @@ func (t *Triager) stepB(ctx context.Context) {
 	}
 
 	nWeights := len(result.SyscallWeights)
-	nSeeds := len(result.SeedPrograms)
+	nHints := len(result.SeedHints)
 	nFocus := len(result.FocusTargets)
-	t.logf("[Step B] Strategy applied: %d syscall weights, %d seeds, %d focus targets",
-		nWeights, nSeeds, nFocus)
+	t.logf("[Step B] Strategy applied: %d syscall weights, %d seed hints, %d focus targets",
+		nWeights, nHints, nFocus)
 	saveCostTracker(t.workdir, t.cost)
 }
 
