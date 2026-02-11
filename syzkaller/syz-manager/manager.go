@@ -671,7 +671,6 @@ func (mgr *Manager) runInstanceInner(ctx context.Context, inst *vm.Instance, opt
 
 	// PROBE: Deploy eBPF heap monitor to VM (Phase 5).
 	// Copy loader and BPF object, run loader before executor.
-	// All output is redirected to /dev/null to avoid interfering with crash reporter.
 	// Graceful degradation: if any step fails, continue without eBPF.
 	ebpfSetupCmd := ""
 	ebpfLoaderPath := filepath.Join(filepath.Dir(mgr.cfg.ExecutorBin), "syz-ebpf-loader")
@@ -687,11 +686,15 @@ func (mgr *Manager) runInstanceInner(ctx context.Context, inst *vm.Instance, opt
 					log.Logf(1, "PROBE: VM %v: failed to copy BPF object: %v", inst.Index(), copyErr)
 				} else {
 					// Mount bpffs and run loader before executor.
-					// All output goes to /dev/null; use exec to replace shell with executor.
+					// mkdir -p ensures mountpoint exists even without fstab entry.
+					// timeout prevents loader hang from blocking executor startup.
+					// Failures are non-fatal — executor gracefully handles missing BPF maps.
 					ebpfSetupCmd = fmt.Sprintf(
-						"mount -t bpf bpf /sys/fs/bpf >/dev/null 2>&1; %v %v >/dev/null 2>&1; ",
+						"mkdir -p /sys/fs/bpf >/dev/null 2>&1; "+
+							"mount -t bpf bpf /sys/fs/bpf >/dev/null 2>&1; "+
+							"timeout 10 %v %v >/tmp/probe-ebpf.log 2>&1; ",
 						vmLoader, vmBPFObj)
-					log.Logf(1, "PROBE: VM %v: eBPF heap monitor deployed", inst.Index())
+					log.Logf(0, "PROBE: VM %v: eBPF heap monitor deployment queued", inst.Index())
 				}
 			}
 		}
@@ -704,7 +707,7 @@ func (mgr *Manager) runInstanceInner(ctx context.Context, inst *vm.Instance, opt
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse manager's address")
 	}
-	cmd := fmt.Sprintf("%vexec %v runner %v %v %v", ebpfSetupCmd, executorBin, inst.Index(), host, port)
+	cmd := fmt.Sprintf("%v%v runner %v %v %v", ebpfSetupCmd, executorBin, inst.Index(), host, port)
 	ctxTimeout, cancel := context.WithTimeout(ctx, mgr.cfg.Timeouts.VMRunningTime)
 	defer cancel()
 	_, reps, err := inst.Run(ctxTimeout, mgr.reporter, cmd, opts...)

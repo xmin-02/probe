@@ -51,14 +51,13 @@ struct trace_event_raw_common {
 	int common_pid;
 };
 
-// /sys/kernel/debug/tracing/events/kmem/kmalloc/format:
+// /sys/kernel/debug/tracing/events/kmem/kmalloc/format (kernel 6.1.20):
 //   field:unsigned long call_site;  offset:8;  size:8;  signed:0;
 //   field:const void * ptr;         offset:16; size:8;  signed:0;
 //   field:size_t bytes_req;         offset:24; size:8;  signed:0;
 //   field:size_t bytes_alloc;       offset:32; size:8;  signed:0;
 //   field:unsigned long gfp_flags;  offset:40; size:8;  signed:0;
 //   field:int node;                 offset:48; size:4;  signed:1;
-//   field:bool accounted;           offset:52; size:1;  signed:0;
 struct trace_event_raw_kmalloc {
 	struct trace_event_raw_common __common;
 	unsigned long call_site;
@@ -67,7 +66,6 @@ struct trace_event_raw_kmalloc {
 	unsigned long bytes_alloc;
 	unsigned long gfp_flags;
 	int node;
-	char accounted; // bool
 };
 
 // /sys/kernel/debug/tracing/events/kmem/kfree/format:

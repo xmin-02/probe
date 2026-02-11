@@ -310,7 +310,8 @@ Host (syz-manager)              Guest VM
 - Runs loader via shell command chain before executor starts
 - bpffs mount added to VM fstab (`tools/trixie/etc/fstab`)
 - Graceful degradation: if eBPF fails, executor returns zero metrics, fuzzing continues
-- **Bugfix**: All eBPF command output redirected to `/dev/null` to prevent crash reporter interference; `exec` used to replace shell with executor for clean process tree
+- **Bugfix (v1)**: All eBPF command output redirected to `/dev/null` to prevent crash reporter interference
+- **Bugfix (v2)**: Root cause was VM image missing bpffs mountpoint + loader hang potential. Fixed: `mkdir -p /sys/fs/bpf` before mount, `timeout 10` on loader to prevent hang blocking executor, loader output saved to `/tmp/probe-ebpf.log` for debugging. VM image fstab updated with bpffs entry. BPF header `accounted` field removed for kernel 6.1.20 compatibility.
 
 ### 5f. Fuzzer Feedback — **DONE**
 - `processResult()`: tracks `statEbpfReuses` and `statEbpfUafDetected` stats
