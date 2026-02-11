@@ -87,6 +87,7 @@ func (serv *HTTPServer) Serve(ctx context.Context) error {
 	handle("/action", serv.httpAction)
 	handle("/addcandidate", serv.httpAddCandidate)
 	handle("/ai", serv.httpAI)                        // PROBE: AI dashboard
+	handle("/ai/crash", serv.httpAICrash)             // PROBE: AI crash detail
 	handle("/api/ai/analyze", serv.httpAIAnalyze)     // PROBE: manual Step A
 	handle("/api/ai/log", serv.httpAILog)             // PROBE: console log stream
 	handle("/api/ai/strategize", serv.httpAIStrategize) // PROBE: manual Step B
@@ -400,20 +401,31 @@ func aiScoreColor(score int) string {
 	return "#F0F0F0"
 }
 
-// PROBE: aiTriageOnDisk represents the minimal fields we need from ai-triage.json.
+// PROBE: aiTriageOnDisk represents the full ai-triage.json on disk.
 type aiTriageOnDisk struct {
 	Score        int    `json:"score"`
+	Confidence   string `json:"confidence"`
 	ExploitClass string `json:"exploit_class"`
 	Summary      string `json:"summary"`
-	Confidence   string `json:"confidence"`
+	BestVariant  string `json:"best_variant"`
+	FocusHints   []string `json:"focus_hints"`
+	Model        string `json:"model"`
+	Provider     string `json:"provider"`
 	VulnType     string `json:"-"`
 	Reasoning    struct {
-		VulnType     string `json:"vuln_type"`
-		SlabCache    string `json:"slab_cache"`
-		Primitive    string `json:"primitive"`
-		TimingWindow string `json:"timing_window"`
+		VulnType      string `json:"vuln_type"`
+		SlabCache     string `json:"slab_cache"`
+		ObjectSize    int    `json:"object_size"`
+		Primitive     string `json:"primitive"`
+		TimingWindow  string `json:"timing_window"`
+		SprayFeasible string `json:"spray_feasible"`
+		SprayObjects  string `json:"spray_objects"`
+		CrossCache    bool   `json:"cross_cache"`
+		Controllable  string `json:"controllable"`
 	} `json:"reasoning"`
-	Timestamp time.Time `json:"timestamp"`
+	Timestamp    time.Time `json:"timestamp"`
+	InputTokens  int       `json:"input_tokens"`
+	OutputTokens int       `json:"output_tokens"`
 }
 
 func loadAITriageResult(workdir, crashID string) *aiTriageOnDisk {
@@ -1568,6 +1580,57 @@ func (serv *HTTPServer) httpAIStrategize(w http.ResponseWriter, r *http.Request)
 	http.Redirect(w, r, "/ai", http.StatusFound)
 }
 
+func (serv *HTTPServer) httpAICrash(w http.ResponseWriter, r *http.Request) {
+	crashID := r.FormValue("id")
+	if crashID == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+
+	tr := loadAITriageResult(serv.Cfg.Workdir, crashID)
+	if tr == nil {
+		http.Error(w, "no AI analysis found for this crash", http.StatusNotFound)
+		return
+	}
+
+	// Get crash title from CrashStore.
+	title := crashID
+	if serv.CrashStore != nil {
+		if info, err := serv.CrashStore.BugInfo(crashID, false); err == nil {
+			title = info.Title
+		}
+	}
+
+	data := UIAICrashPage{
+		UIPageHeader:  serv.pageHeader(r, "AI"),
+		CrashID:       crashID,
+		Title:         title,
+		Score:         tr.Score,
+		ScoreColor:    aiScoreColor(tr.Score),
+		Confidence:    tr.Confidence,
+		ExploitClass:  tr.ExploitClass,
+		Summary:       tr.Summary,
+		BestVariant:   tr.BestVariant,
+		FocusHints:    tr.FocusHints,
+		Model:         tr.Model,
+		Provider:      tr.Provider,
+		VulnType:      tr.Reasoning.VulnType,
+		SlabCache:     tr.Reasoning.SlabCache,
+		ObjectSize:    tr.Reasoning.ObjectSize,
+		Primitive:     tr.Reasoning.Primitive,
+		TimingWindow:  tr.Reasoning.TimingWindow,
+		SprayFeasible: tr.Reasoning.SprayFeasible,
+		SprayObjects:  tr.Reasoning.SprayObjects,
+		CrossCache:    tr.Reasoning.CrossCache,
+		Controllable:  tr.Reasoning.Controllable,
+		AnalyzedAt:    tr.Timestamp,
+		InputTokens:   tr.InputTokens,
+		OutputTokens:  tr.OutputTokens,
+	}
+
+	executeTemplate(w, aiCrashTemplate, &data)
+}
+
 // httpAILog returns console log entries as JSON for AJAX polling.
 func (serv *HTTPServer) httpAILog(w http.ResponseWriter, r *http.Request) {
 	type logGetter interface {
@@ -1705,6 +1768,33 @@ type UIAPICall struct {
 	Error         string
 }
 
+type UIAICrashPage struct {
+	UIPageHeader
+	CrashID       string
+	Title         string
+	Score         int
+	ScoreColor    string
+	Confidence    string
+	ExploitClass  string
+	Summary       string
+	BestVariant   string
+	FocusHints    []string
+	Model         string
+	Provider      string
+	VulnType      string
+	SlabCache     string
+	ObjectSize    int
+	Primitive     string
+	TimingWindow  string
+	SprayFeasible string
+	SprayObjects  string
+	CrossCache    bool
+	Controllable  string
+	AnalyzedAt    time.Time
+	InputTokens   int
+	OutputTokens  int
+}
+
 var (
 	mainTemplate          = createPage("main", UISummaryData{})
 	syscallsTemplate      = createPage("syscalls", UISyscallsData{})
@@ -1716,7 +1806,8 @@ var (
 	rawCoverTemplate      = createPage("raw_cover", UIRawCoverPage{})
 	jobListTemplate       = createPage("job_list", UIJobList{})
 	textTemplate          = createPage("text", UITextPage{})
-	aiTemplate            = createPage("ai", UIAIPageData{}) // PROBE: AI dashboard
+	aiTemplate            = createPage("ai", UIAIPageData{})      // PROBE: AI dashboard
+	aiCrashTemplate       = createPage("aicrash", UIAICrashPage{}) // PROBE: AI crash detail
 )
 
 //go:embed html/*.html

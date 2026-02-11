@@ -38,7 +38,7 @@ PROBE: AI-guided fuzzing dashboard page (Phase 3).
 </div>
 
 {{if .Crashes}}
-<table class="list_table" style="table-layout:fixed; width:100%">
+<table class="list_table">
 <caption>Crash Exploitability ({{.AnalyzedCount}} analyzed, {{.PendingCount}} pending):</caption>
 <thead><tr>
 	<th><a onclick="return sortTable(this, 'Title', textSort)" href="#">Title</a></th>
@@ -48,29 +48,14 @@ PROBE: AI-guided fuzzing dashboard page (Phase 3).
 	<th><a onclick="return sortTable(this, 'Time', textSort)" href="#">Time</a></th>
 </tr></thead>
 <tbody>
-{{range $i, $c := .Crashes}}
-<tr {{if $c.HasScore}}onclick="toggleDetail('detail-{{$i}}')" style="cursor:pointer"{{end}}>
+{{range $c := .Crashes}}
+<tr>
 	<td class="title"><a href="/crash?id={{$c.ID}}">{{$c.Title}}</a></td>
-	<td class="stat" {{if $c.ScoreColor}}style="background:{{$c.ScoreColor}}"{{end}}>{{if $c.HasScore}}{{$c.Score}}{{else}}-{{end}}</td>
+	<td class="stat" {{if $c.ScoreColor}}style="background:{{$c.ScoreColor}}"{{end}}>{{if $c.HasScore}}<a href="/ai/crash?id={{$c.ID}}" style="font-weight:bold; color:inherit; text-decoration:none">{{$c.Score}}</a>{{else}}-{{end}}</td>
 	<td>{{$c.ExploitClass}}</td>
 	<td>{{$c.VulnType}}</td>
 	<td class="time">{{if $c.HasScore}}{{formatTime $c.AnalyzedAt}}{{else}}<span style="color:#999">pending</span>{{end}}</td>
 </tr>
-{{if $c.HasScore}}
-<tr id="detail-{{$i}}" style="display:none">
-	<td colspan="5" style="padding:0">
-		<div style="background:#f8f8f0; padding:10px 16px; font-size:12px; border-left:4px solid {{$c.ScoreColor}}; word-wrap:break-word; overflow-wrap:break-word; max-width:100%">
-			<div style="margin-bottom:6px">{{$c.Summary}}</div>
-			<div style="color:#555">
-				<span style="margin-right:16px"><b>Confidence:</b> {{$c.Confidence}}</span>
-				<span style="margin-right:16px"><b>Primitive:</b> {{$c.Primitive}}</span>
-				<span style="margin-right:16px"><b>Slab:</b> {{$c.SlabCache}}</span>
-				<span><b>Timing:</b> {{$c.TimingWindow}}</span>
-			</div>
-		</div>
-	</td>
-</tr>
-{{end}}
 {{end}}
 </tbody>
 </table>
@@ -130,12 +115,6 @@ setInterval(function() {
 	if (el) el.textContent = m + 'm ' + (s < 10 ? '0' : '') + s + 's';
 })();
 {{end}}
-
-// Toggle crash detail row.
-function toggleDetail(id) {
-	var el = document.getElementById(id);
-	if (el) el.style.display = el.style.display === 'none' ? '' : 'none';
-}
 
 // Trigger AI analysis/strategy via AJAX.
 function triggerAI(action) {
