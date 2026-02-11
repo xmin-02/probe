@@ -71,7 +71,8 @@ private:
 		size_ = size;
 		mem_ = mmap(preferred, size, PROT_READ | (write ? PROT_WRITE : 0), MAP_SHARED, fd, 0);
 		if (mem_ == MAP_FAILED)
-			failmsg("shmem mmap failed", "pref=%p size=%zu fd=%d write=%d errno=%d", preferred, size, fd, write, errno);
+			failmsg("shmem mmap failed", "pref=%p size=%zu fd=%d write=%d errno=%d",
+				preferred, size, fd, write, errno);
 	}
 
 	ShmemFile(const ShmemFile&) = delete;

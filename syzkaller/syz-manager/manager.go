@@ -797,7 +797,6 @@ func (mgr *Manager) saveCrash(crash *manager.Crash) bool {
 		if err := mgr.crashStore.SaveTier3Stat(crash.Title, crash.Type); err != nil {
 			log.Logf(0, "failed to save tier3 stat: %v", err)
 		}
-		log.Logf(1, "VM %v: crash tier 3 (stats only): %v", crash.InstanceIndex, crash.Title)
 		return false
 	}
 

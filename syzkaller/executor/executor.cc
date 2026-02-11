@@ -607,9 +607,6 @@ int main(int argc, char** argv)
 	start_time_ms = current_time_ms();
 
 	os_init(argc, argv, (char*)SYZ_DATA_OFFSET, SYZ_NUM_PAGES * SYZ_PAGE_SIZE);
-#if GOOS_linux
-	ebpf_init(); // PROBE: open pinned eBPF metrics map
-#endif
 	use_temporary_dir();
 	install_segv_handler();
 	current_thread = &threads[0];
@@ -639,6 +636,16 @@ int main(int argc, char** argv)
 			cover_filter.emplace(kCoverFilterFd, reinterpret_cast<void*>(0x110f230000ull));
 			close(kCoverFilterFd);
 		}
+
+#if GOOS_linux
+		// PROBE: open pinned eBPF metrics map.
+		// Must be called AFTER shmem fd operations above: ebpf_init() uses BPF_OBJ_GET
+		// which returns the lowest available fd. If called before the shmem setup,
+		// it can steal fd 5/6 (kMaxSignalFd/kCoverFilterFd) when those are closed
+		// by the runner (no coverage filter), causing fcntl() checks above to
+		// misidentify the BPF map fd as a shmem fd and fail on mmap.
+		ebpf_init();
+#endif
 
 		setup_control_pipes();
 		receive_handshake();

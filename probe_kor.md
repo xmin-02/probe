@@ -311,6 +311,7 @@
 - 그레이스풀 디그레이데이션: eBPF 실패 시 executor는 0 메트릭 반환, 퍼징 계속
 - **버그 수정 (v1)**: 모든 eBPF 명령 출력을 `/dev/null`로 리다이렉트하여 crash reporter 간섭 방지
 - **버그 수정 (v2)**: 근본 원인은 VM 이미지에 bpffs 마운트포인트 부재 + 로더 행(hang) 가능성. 수정: mount 전 `mkdir -p /sys/fs/bpf`, 로더에 `timeout 10`으로 행 방지, 로더 출력을 `/tmp/probe-ebpf.log`에 저장하여 디버깅 가능. VM 이미지 fstab에 bpffs 항목 추가. BPF 헤더에서 커널 6.1.20 호환성을 위해 `accounted` 필드 제거.
+- **버그 수정 (v3)**: `executor.cc`에서 `ebpf_init()`이 shmem fd 연산보다 먼저 호출되어, runner가 coverage filter를 제공하지 않을 때 `BPF_OBJ_GET`이 fd 5/6 (`kMaxSignalFd`/`kCoverFilterFd`)을 가로챔. `fcntl()` 검사가 BPF map fd를 shmem fd로 오인하여 모든 VM에서 `mmap` 실패 유발. 수정: executor.cc exec 모드에서 `ebpf_init()` 호출을 모든 shmem fd 연산(`mmap_input`, `mmap_output`, CoverFilter 설정) 이후로 이동. 진단 코드 정리: `shmem.h`에서 `/tmp/shmem-diag.txt` 파일 쓰기 제거, `manager.go`에서 tier3 원시 출력 로깅 제거. `shmem.h`의 개선된 에러 메시지(errno, fd, size 정보 포함)는 유지.
 
 ### 5f. 퍼저 피드백 — **완료**
 - `processResult()`: `statEbpfReuses`와 `statEbpfUafDetected` 통계 추적
