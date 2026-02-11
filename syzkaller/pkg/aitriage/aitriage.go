@@ -233,14 +233,15 @@ type LogEntry struct {
 
 // Triager is the main AI triage orchestrator.
 type Triager struct {
-	cfg      mgrconfig.AITriageConfig
-	client   LLMClient
-	workdir  string
-	cost     *CostTracker
-	mu       sync.Mutex
-	running  bool
-	lastRun  time.Time
-	strategy *StrategyResult
+	cfg       mgrconfig.AITriageConfig
+	client    LLMClient
+	workdir   string
+	cost      *CostTracker
+	mu        sync.Mutex
+	running   bool
+	lastRun   time.Time
+	nextBatch time.Time // when the next automatic batch will run
+	strategy  *StrategyResult
 
 	// Console log buffer for the /ai dashboard.
 	logMu  sync.Mutex
@@ -278,6 +279,11 @@ func NewTriager(cfg mgrconfig.AITriageConfig, workdir string) (*Triager, error) 
 	}
 	// Load existing cost tracker from disk.
 	t.cost = loadCostTracker(workdir)
+	// Recover costs from ai-triage.json files if cost tracker has no history
+	// (e.g., previous runs didn't save cost due to bugs).
+	if t.cost.TotalCalls == 0 {
+		t.recoverCostFromTriageResults()
+	}
 	return t, nil
 }
 
@@ -355,13 +361,33 @@ func (t *Triager) CostJSON() []byte {
 	return data
 }
 
+// NextBatchSec returns seconds until the next automatic batch.
+func (t *Triager) NextBatchSec() int {
+	t.mu.Lock()
+	nb := t.nextBatch
+	t.mu.Unlock()
+	if nb.IsZero() {
+		return 0
+	}
+	sec := int(time.Until(nb).Seconds())
+	if sec < 0 {
+		return 0
+	}
+	return sec
+}
+
 // Run starts the 1-hour batch loop. Call from a goroutine.
 func (t *Triager) Run(ctx context.Context) {
 	t.logf("Triage started (model=%v, provider=%v)", t.cfg.Model, detectProvider(t.cfg))
 
 	// Run first batch after 2 minutes (let fuzzer warm up).
-	timer := time.NewTimer(2 * time.Minute)
+	firstDelay := 2 * time.Minute
+	timer := time.NewTimer(firstDelay)
 	defer timer.Stop()
+
+	t.mu.Lock()
+	t.nextBatch = time.Now().Add(firstDelay)
+	t.mu.Unlock()
 
 	for {
 		select {
@@ -369,7 +395,11 @@ func (t *Triager) Run(ctx context.Context) {
 			return
 		case <-timer.C:
 			t.runBatch(ctx)
-			timer.Reset(1 * time.Hour)
+			nextDelay := 1 * time.Hour
+			timer.Reset(nextDelay)
+			t.mu.Lock()
+			t.nextBatch = time.Now().Add(nextDelay)
+			t.mu.Unlock()
 		}
 	}
 }
@@ -686,4 +716,39 @@ func saveCostTracker(workdir string, ct *CostTracker) {
 	}
 	path := filepath.Join(workdir, "ai-cost.json")
 	os.WriteFile(path, data, 0644)
+}
+
+// recoverCostFromTriageResults scans existing ai-triage.json files and
+// reconstructs the cost tracker from their token counts. This handles
+// the case where previous runs analyzed crashes but didn't save cost data.
+func (t *Triager) recoverCostFromTriageResults() {
+	crashDir := filepath.Join(t.workdir, "crashes")
+	entries, err := os.ReadDir(crashDir)
+	if err != nil {
+		return
+	}
+	recovered := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		tr := loadTriageResult(t.workdir, entry.Name())
+		if tr == nil || tr.InputTokens == 0 {
+			continue
+		}
+		call := APICall{
+			Time:          tr.Timestamp,
+			Type:          "crash",
+			InputTokens:   tr.InputTokens,
+			OutputTokens:  tr.OutputTokens,
+			Success:       true,
+			ResultSummary: fmt.Sprintf("score=%d (recovered)", tr.Score),
+		}
+		t.cost.Record(call, tr.Model)
+		recovered++
+	}
+	if recovered > 0 {
+		saveCostTracker(t.workdir, t.cost)
+		log.Logf(0, "PROBE: AI cost recovered from %d existing triage results", recovered)
+	}
 }

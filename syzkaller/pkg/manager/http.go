@@ -1356,16 +1356,22 @@ func (serv *HTTPServer) httpAI(w http.ResponseWriter, r *http.Request) {
 	// For now, just show basic info from the Triager's exported methods via interface.
 	// The concrete type will be *aitriage.Triager, so we pull data via its methods
 	// which are called from the manager's ai_triage.go integration file.
-	// Check if triager is currently running.
-	type runningChecker interface {
+	// Check if triager is currently running + next batch countdown.
+	type triagerStatus interface {
 		IsRunning() bool
+		NextBatchSec() int
 	}
-	if t, ok := serv.Triager.(runningChecker); ok && t.IsRunning() {
-		data.Status = "Running..."
+	if t, ok := serv.Triager.(triagerStatus); ok {
+		if t.IsRunning() {
+			data.Status = "Running..."
+		} else {
+			data.Status = "Active"
+		}
+		data.NextBatchSec = t.NextBatchSec()
 	} else {
 		data.Status = "Active"
+		data.NextBatchSec = 0
 	}
-	data.NextBatchSec = 3600
 
 	// Load crash analyses from disk.
 	if serv.CrashStore != nil {
