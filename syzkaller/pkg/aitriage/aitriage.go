@@ -33,6 +33,7 @@ type TriageResult struct {
 	Timestamp    time.Time       `json:"timestamp"`
 	InputTokens  int             `json:"input_tokens"`
 	OutputTokens int             `json:"output_tokens"`
+	NumVariants  int             `json:"num_variants,omitempty"` // variant count at analysis time
 }
 
 type TriageReasoning struct {
@@ -588,8 +589,11 @@ func (t *Triager) stepA(ctx context.Context) {
 		}
 		existing := loadTriageResult(t.workdir, c.ID)
 		if existing != nil {
-			// Skip unless variants have tripled since last analysis.
-			continue
+			// Re-analyze if variants have tripled since last analysis.
+			if existing.NumVariants == 0 || c.NumVariants < existing.NumVariants*3 {
+				continue
+			}
+			t.logf("[Step A] Re-analyzing %s (variants: %d → %d)", c.Title, existing.NumVariants, c.NumVariants)
 		}
 		if c.Report == "" {
 			continue
@@ -718,6 +722,7 @@ func (t *Triager) analyzeCrash(ctx context.Context, c CrashForAnalysis) (*Triage
 	result.Model = t.cfg.Model
 	result.Provider = detectProvider(t.cfg)
 	result.Timestamp = time.Now()
+	result.NumVariants = c.NumVariants
 	result.InputTokens = resp.InputTokens
 	result.OutputTokens = resp.OutputTokens
 	return result, nil
@@ -854,6 +859,14 @@ func (t *Triager) recoverCostFromTriageResults() {
 	if err != nil {
 		return
 	}
+
+	// Build set of already-recorded timestamps to avoid double-counting.
+	existing := make(map[int64]bool)
+	snap := t.cost.Snapshot()
+	for _, h := range snap.History {
+		existing[h.Time.Unix()] = true
+	}
+
 	recovered := 0
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -861,6 +874,10 @@ func (t *Triager) recoverCostFromTriageResults() {
 		}
 		tr := loadTriageResult(t.workdir, entry.Name())
 		if tr == nil || tr.InputTokens == 0 {
+			continue
+		}
+		// Skip if already in history (avoid double-counting on restart).
+		if existing[tr.Timestamp.Unix()] {
 			continue
 		}
 		call := APICall{

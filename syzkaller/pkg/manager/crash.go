@@ -195,7 +195,7 @@ func (cs *CrashStore) SaveVariant(title string, crashType crash.Type, progData [
 	return !isKnown, nil
 }
 
-// PROBE: VariantPrograms returns all saved variant programs for a crash.
+// PROBE: VariantPrograms returns saved variant programs for a crash (capped at MaxVariants).
 func (cs *CrashStore) VariantPrograms(title string) ([][]byte, error) {
 	dir := filepath.Join(cs.path(title), "variants")
 	files, err := osutil.ListDir(dir)
@@ -211,6 +211,9 @@ func (cs *CrashStore) VariantPrograms(title string) ([][]byte, error) {
 			data, err := os.ReadFile(filepath.Join(dir, f))
 			if err == nil {
 				progs = append(progs, data)
+			}
+			if len(progs) >= MaxVariants {
+				break
 			}
 		}
 	}

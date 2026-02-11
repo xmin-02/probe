@@ -494,6 +494,8 @@ func (job *focusJob) run(fuzzer *Fuzzer) {
 		fuzzer.focusActive = false
 		fuzzer.focusTarget = ""
 		fuzzer.focusMu.Unlock()
+		// Launch next queued focus candidate if any.
+		fuzzer.drainFocusPending()
 	}()
 
 	start := time.Now()

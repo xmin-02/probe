@@ -45,6 +45,7 @@ type Fuzzer struct {
 	focusTitles  map[string]bool // titles that have been focused (prevents re-focus)
 	focusActive  bool            // true while a focus job is running
 	focusTarget  string          // title of the current focus target
+	focusPending []focusCandidate // queued candidates waiting for current focus to finish
 
 	// PROBE: AI mutation hints for focus jobs.
 	aiMutHintsMu sync.Mutex
@@ -415,16 +416,54 @@ func (fuzzer *Fuzzer) FocusStatus() (active bool, title string) {
 	return fuzzer.focusActive, fuzzer.focusTarget
 }
 
+// focusCandidate holds a queued focus target awaiting execution.
+type focusCandidate struct {
+	prog  *prog.Prog
+	title string
+	tier  int
+}
+
 // PROBE: AddFocusCandidate queues a high-severity crash program for intensive mutation.
-// Returns false if the title is already being focused, was already focused, or another focus job is active.
+// If another focus job is active, the candidate is queued (up to 8 pending).
+// Returns false only if the title was already focused.
 func (fuzzer *Fuzzer) AddFocusCandidate(p *prog.Prog, title string, tier int) bool {
 	fuzzer.focusMu.Lock()
 	defer fuzzer.focusMu.Unlock()
 
-	if fuzzer.focusTitles[title] || fuzzer.focusActive {
+	if fuzzer.focusTitles[title] {
 		return false
 	}
 
+	// If a focus job is already running, queue this candidate.
+	if fuzzer.focusActive {
+		if len(fuzzer.focusPending) < 8 {
+			fuzzer.focusPending = append(fuzzer.focusPending, focusCandidate{
+				prog: p.Clone(), title: title, tier: tier,
+			})
+			fuzzer.Logf(0, "PROBE: focus queued '%v' (pending: %d)", title, len(fuzzer.focusPending))
+		}
+		return false
+	}
+
+	fuzzer.launchFocusJob(p, title, tier)
+
+	// PROBE: Also run fault injection on crash program's calls.
+	// Error paths are a major source of UAFs (incomplete cleanup).
+	if fuzzer.Config.FaultInjection {
+		for i := range p.Calls {
+			fuzzer.startJob(fuzzer.statJobsFaultInjection, &faultInjectionJob{
+				exec: fuzzer.focusQueue,
+				p:    p.Clone(),
+				call: i,
+			})
+		}
+		fuzzer.Logf(0, "PROBE: fault injection queued for '%v' (%d calls)", title, len(p.Calls))
+	}
+	return true
+}
+
+// launchFocusJob starts a focus job (caller must hold focusMu).
+func (fuzzer *Fuzzer) launchFocusJob(p *prog.Prog, title string, tier int) {
 	fuzzer.focusTitles[title] = true
 	fuzzer.focusActive = true
 	fuzzer.focusTarget = title
@@ -445,20 +484,24 @@ func (fuzzer *Fuzzer) AddFocusCandidate(p *prog.Prog, title string, tier int) bo
 			Calls: calls,
 		},
 	})
+}
 
-	// PROBE: Also run fault injection on crash program's calls.
-	// Error paths are a major source of UAFs (incomplete cleanup).
-	if fuzzer.Config.FaultInjection {
-		for i := range p.Calls {
-			fuzzer.startJob(fuzzer.statJobsFaultInjection, &faultInjectionJob{
-				exec: fuzzer.focusQueue,
-				p:    p.Clone(),
-				call: i,
-			})
+// drainFocusPending launches the next queued focus candidate if any.
+// Called when a focus job completes.
+func (fuzzer *Fuzzer) drainFocusPending() {
+	fuzzer.focusMu.Lock()
+	defer fuzzer.focusMu.Unlock()
+
+	for len(fuzzer.focusPending) > 0 {
+		c := fuzzer.focusPending[0]
+		fuzzer.focusPending = fuzzer.focusPending[1:]
+		if fuzzer.focusTitles[c.title] {
+			continue // already focused
 		}
-		fuzzer.Logf(0, "PROBE: fault injection queued for '%v' (%d calls)", title, len(p.Calls))
+		fuzzer.launchFocusJob(c.prog, c.title, c.tier)
+		fuzzer.Logf(0, "PROBE: focus dequeued '%v' (remaining: %d)", c.title, len(fuzzer.focusPending))
+		return
 	}
-	return true
 }
 
 func (fuzzer *Fuzzer) rand() *rand.Rand {
