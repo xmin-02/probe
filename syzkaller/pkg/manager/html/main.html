@@ -39,7 +39,7 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 	{{range $c := $.Crashes}}
 	<tr>
 		<td class="title"><a href="/crash?id={{$c.ID}}">{{$c.Title}}</a></td>
-		<td class="stat" {{if $c.AIScoreColor}}style="background:{{$c.AIScoreColor}}"{{end}}>{{if $c.AIScore}}{{$c.AIScore}}{{else}}-{{end}}</td>
+		<td class="stat" {{if $c.AIScoreColor}}style="background:{{$c.AIScoreColor}}"{{end}}>{{if $c.AIScore}}<a href="/ai/crash?id={{$c.ID}}" style="color:inherit; text-decoration:none; font-weight:bold">{{$c.AIScore}}</a>{{else}}-{{end}}</td>
 		<td class="rank {{if not $c.Active}}inactive{{end}}">
 			{{if $c.RankTooltip}}
 				<b>{{$c.Rank}}</b>
