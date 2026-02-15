@@ -392,6 +392,8 @@ struct probe_metrics {
 	uint64 commit_creds_count;   // 7d
 	uint64 priv_esc_count;       // 7d
 	uint64 cross_cache_count;    // 7c
+	// Phase 8a:
+	uint64 write_to_freed_count; // 8a
 };
 
 static int ebpf_metrics_fd = -1;

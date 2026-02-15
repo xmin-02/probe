@@ -2353,6 +2353,7 @@ struct ProgInfoRawT : public ::flatbuffers::NativeTable {
   uint32_t ebpf_commit_creds_count = 0;
   uint32_t ebpf_priv_esc_count = 0;
   uint32_t ebpf_cross_cache_count = 0;
+  uint32_t ebpf_write_to_freed_count = 0;
   ProgInfoRawT() = default;
   ProgInfoRawT(const ProgInfoRawT &o);
   ProgInfoRawT(ProgInfoRawT&&) FLATBUFFERS_NOEXCEPT = default;
@@ -2378,7 +2379,8 @@ struct ProgInfoRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
     VT_EBPF_SIZE_MISMATCH_COUNT = 28,
     VT_EBPF_COMMIT_CREDS_COUNT = 30,
     VT_EBPF_PRIV_ESC_COUNT = 32,
-    VT_EBPF_CROSS_CACHE_COUNT = 34
+    VT_EBPF_CROSS_CACHE_COUNT = 34,
+    VT_EBPF_WRITE_TO_FREED_COUNT = 36
   };
   const ::flatbuffers::Vector<::flatbuffers::Offset<rpc::CallInfoRaw>> *calls() const {
     return GetPointer<const ::flatbuffers::Vector<::flatbuffers::Offset<rpc::CallInfoRaw>> *>(VT_CALLS);
@@ -2428,6 +2430,9 @@ struct ProgInfoRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   uint32_t ebpf_cross_cache_count() const {
     return GetField<uint32_t>(VT_EBPF_CROSS_CACHE_COUNT, 0);
   }
+  uint32_t ebpf_write_to_freed_count() const {
+    return GetField<uint32_t>(VT_EBPF_WRITE_TO_FREED_COUNT, 0);
+  }
   bool Verify(::flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyOffset(verifier, VT_CALLS) &&
@@ -2451,6 +2456,7 @@ struct ProgInfoRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            VerifyField<uint32_t>(verifier, VT_EBPF_COMMIT_CREDS_COUNT, 4) &&
            VerifyField<uint32_t>(verifier, VT_EBPF_PRIV_ESC_COUNT, 4) &&
            VerifyField<uint32_t>(verifier, VT_EBPF_CROSS_CACHE_COUNT, 4) &&
+           VerifyField<uint32_t>(verifier, VT_EBPF_WRITE_TO_FREED_COUNT, 4) &&
            verifier.EndTable();
   }
   ProgInfoRawT *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
@@ -2510,6 +2516,9 @@ struct ProgInfoRawBuilder {
   void add_ebpf_cross_cache_count(uint32_t ebpf_cross_cache_count) {
     fbb_.AddElement<uint32_t>(ProgInfoRaw::VT_EBPF_CROSS_CACHE_COUNT, ebpf_cross_cache_count, 0);
   }
+  void add_ebpf_write_to_freed_count(uint32_t ebpf_write_to_freed_count) {
+    fbb_.AddElement<uint32_t>(ProgInfoRaw::VT_EBPF_WRITE_TO_FREED_COUNT, ebpf_write_to_freed_count, 0);
+  }
   explicit ProgInfoRawBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -2538,11 +2547,13 @@ inline ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRaw(
     uint32_t ebpf_size_mismatch_count = 0,
     uint32_t ebpf_commit_creds_count = 0,
     uint32_t ebpf_priv_esc_count = 0,
-    uint32_t ebpf_cross_cache_count = 0) {
+    uint32_t ebpf_cross_cache_count = 0,
+    uint32_t ebpf_write_to_freed_count = 0) {
   ProgInfoRawBuilder builder_(_fbb);
   builder_.add_ebpf_min_reuse_ns(ebpf_min_reuse_ns);
   builder_.add_freshness(freshness);
   builder_.add_elapsed(elapsed);
+  builder_.add_ebpf_write_to_freed_count(ebpf_write_to_freed_count);
   builder_.add_ebpf_cross_cache_count(ebpf_cross_cache_count);
   builder_.add_ebpf_priv_esc_count(ebpf_priv_esc_count);
   builder_.add_ebpf_commit_creds_count(ebpf_commit_creds_count);
@@ -2576,7 +2587,8 @@ inline ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRawDirect(
     uint32_t ebpf_size_mismatch_count = 0,
     uint32_t ebpf_commit_creds_count = 0,
     uint32_t ebpf_priv_esc_count = 0,
-    uint32_t ebpf_cross_cache_count = 0) {
+    uint32_t ebpf_cross_cache_count = 0,
+    uint32_t ebpf_write_to_freed_count = 0) {
   auto calls__ = calls ? _fbb.CreateVector<::flatbuffers::Offset<rpc::CallInfoRaw>>(*calls) : 0;
   auto extra_raw__ = extra_raw ? _fbb.CreateVector<::flatbuffers::Offset<rpc::CallInfoRaw>>(*extra_raw) : 0;
   return rpc::CreateProgInfoRaw(
@@ -2596,7 +2608,8 @@ inline ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRawDirect(
       ebpf_size_mismatch_count,
       ebpf_commit_creds_count,
       ebpf_priv_esc_count,
-      ebpf_cross_cache_count);
+      ebpf_cross_cache_count,
+      ebpf_write_to_freed_count);
 }
 
 ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRaw(::flatbuffers::FlatBufferBuilder &_fbb, const ProgInfoRawT *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
@@ -3688,7 +3701,8 @@ inline ProgInfoRawT::ProgInfoRawT(const ProgInfoRawT &o)
         ebpf_size_mismatch_count(o.ebpf_size_mismatch_count),
         ebpf_commit_creds_count(o.ebpf_commit_creds_count),
         ebpf_priv_esc_count(o.ebpf_priv_esc_count),
-        ebpf_cross_cache_count(o.ebpf_cross_cache_count) {
+        ebpf_cross_cache_count(o.ebpf_cross_cache_count),
+        ebpf_write_to_freed_count(o.ebpf_write_to_freed_count) {
   calls.reserve(o.calls.size());
   for (const auto &calls_ : o.calls) { calls.emplace_back((calls_) ? new rpc::CallInfoRawT(*calls_) : nullptr); }
   extra_raw.reserve(o.extra_raw.size());
@@ -3712,6 +3726,7 @@ inline ProgInfoRawT &ProgInfoRawT::operator=(ProgInfoRawT o) FLATBUFFERS_NOEXCEP
   std::swap(ebpf_commit_creds_count, o.ebpf_commit_creds_count);
   std::swap(ebpf_priv_esc_count, o.ebpf_priv_esc_count);
   std::swap(ebpf_cross_cache_count, o.ebpf_cross_cache_count);
+  std::swap(ebpf_write_to_freed_count, o.ebpf_write_to_freed_count);
   return *this;
 }
 
@@ -3740,6 +3755,7 @@ inline void ProgInfoRaw::UnPackTo(ProgInfoRawT *_o, const ::flatbuffers::resolve
   { auto _e = ebpf_commit_creds_count(); _o->ebpf_commit_creds_count = _e; }
   { auto _e = ebpf_priv_esc_count(); _o->ebpf_priv_esc_count = _e; }
   { auto _e = ebpf_cross_cache_count(); _o->ebpf_cross_cache_count = _e; }
+  { auto _e = ebpf_write_to_freed_count(); _o->ebpf_write_to_freed_count = _e; }
 }
 
 inline ::flatbuffers::Offset<ProgInfoRaw> ProgInfoRaw::Pack(::flatbuffers::FlatBufferBuilder &_fbb, const ProgInfoRawT* _o, const ::flatbuffers::rehasher_function_t *_rehasher) {
@@ -3766,6 +3782,7 @@ inline ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRaw(::flatbuffers::FlatB
   auto _ebpf_commit_creds_count = _o->ebpf_commit_creds_count;
   auto _ebpf_priv_esc_count = _o->ebpf_priv_esc_count;
   auto _ebpf_cross_cache_count = _o->ebpf_cross_cache_count;
+  auto _ebpf_write_to_freed_count = _o->ebpf_write_to_freed_count;
   return rpc::CreateProgInfoRaw(
       _fbb,
       _calls,
@@ -3783,7 +3800,8 @@ inline ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRaw(::flatbuffers::FlatB
       _ebpf_size_mismatch_count,
       _ebpf_commit_creds_count,
       _ebpf_priv_esc_count,
-      _ebpf_cross_cache_count);
+      _ebpf_cross_cache_count,
+      _ebpf_write_to_freed_count);
 }
 
 inline ExecResultRawT::ExecResultRawT(const ExecResultRawT &o)

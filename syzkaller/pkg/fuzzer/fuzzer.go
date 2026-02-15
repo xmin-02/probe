@@ -254,6 +254,10 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 		if res.Info.EbpfCrossCacheCount > 0 {
 			fuzzer.statEbpfCrossCache.Add(int(res.Info.EbpfCrossCacheCount))
 		}
+		// Phase 8a: Write-to-freed detection.
+		if res.Info.EbpfWriteToFreedCount > 0 {
+			fuzzer.statEbpfWriteToFreed.Add(int(res.Info.EbpfWriteToFreedCount))
+		}
 
 		// Cooldown check shared by double-free and UAF focus triggers.
 		fuzzer.focusMu.Lock()
@@ -287,6 +291,13 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 				res.Info.EbpfCrossCacheCount, req.Prog)
 			fuzzer.AddFocusCandidate(req.Prog,
 				fmt.Sprintf("PROBE:ebpf-cross-cache:%s", req.Prog.String()), 1)
+		}
+		// Phase 8a: Write to freed object — strong exploitability signal.
+		if res.Info.EbpfWriteToFreedCount > 0 && res.Status != queue.Hanged && ebpfCooldownOk {
+			fuzzer.Logf(0, "PROBE: eBPF detected WRITE-TO-FREED (count=%d, score=%d) in %s",
+				res.Info.EbpfWriteToFreedCount, res.Info.EbpfUafScore, req.Prog)
+			fuzzer.AddFocusCandidate(req.Prog,
+				fmt.Sprintf("PROBE:ebpf-write-to-freed:%s", req.Prog.String()), 1)
 		}
 	}
 

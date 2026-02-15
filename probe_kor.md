@@ -532,23 +532,25 @@ clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
 cd syzkaller && make host
 ```
 
-## Phase 8: 뮤테이션 & 커버리지 혁신 — 계획됨
+## Phase 8: 뮤테이션 & 커버리지 혁신 — 진행 중 (8a 완료)
 
 **목표**: 스마트 뮤테이션 전략, 다목적 최적화, 향상된 exploit 탐지. 총 오버헤드 < 3.5%, 추가 AI API 비용 없음.
 
 **분석 기반**: `prog/mutation.go`, `pkg/fuzzer/dezzer.go`, `pkg/fuzzer/job.go` 코드 수준 심층 리뷰 + 15+ 논문 (NDSS/CCS/ICSE/ISSTA 2022-2025). 각 기술을 런타임 성능 영향, 현실적 효과 (논문 최대치 아닌 기대치), 기존 PROBE 아키텍처와의 시너지 기준으로 평가.
 
-### 8a. Write-to-freed eBPF 탐지
+### 8a. Write-to-freed eBPF 탐지 — 완료
 
 **목표**: `copy_from_user` kprobe로 freed slab 객체에 대한 write 탐지 — 거의 확실한 exploit 가능성 신호.
 
-**설계**: `_copy_from_user`에 kprobe, 대상 주소를 `cache_freed` LRU 맵 (Phase 7c)과 교차 확인. 2단계 필터링: (1) 주소 범위 사전 필터 (slab 힙만, 90%+ 조기 탈출), (2) 50ms 시간 창 + 3회 통계적 확인.
+**설계**: `_copy_from_user`에 kprobe, 대상 주소를 `freed_objects` LRU 맵 (Phase 5)과 교차 확인. Slab 정렬 매칭 (64/128/256 바이트)으로 freed 객체 내 오프셋 write도 탐지. Epoch 필터 + 50ms 시간 창으로 stale false positive 방지.
 
 **오버헤드**: < 1.5%. **기대 효과**: Focus Mode 우선순위 결정을 위한 강력한 exploit 신호.
 
-**리스크 대응**: `kmem_cache_alloc` 추가 kprobe 없음 (오버헤드 과다). 대신: 시간 창 (50ms) + 통계적 dedup (3회 연속 트리거 = 확정, 1회 = 후보).
+**UAF 스코어 기여**: +30 (1회 이상), +50 (3회 초과). write-to-freed 감지 시 Focus 모드 트리거.
 
-**파일**: `executor/ebpf/write_to_freed.bpf.c` (신규), `executor/ebpf/ebpf_monitor.go`, `pkg/flatrpc/flatrpc.fbs` (+1 필드), `pkg/fuzzer/fuzzer.go` (processResult)
+**구현**: 기존 `probe_ebpf.bpf.c`에 추가 (freed_objects 맵과 metrics 구조체 공유, 별도 BPF 파일 불필요). FlatBuffers 필드 `ebpf_write_to_freed_count` (VT=36, slot 16). 대시보드 통계: "ebpf write-to-freed".
+
+**수정 파일**: `executor/ebpf/probe_ebpf.bpf.h`, `executor/ebpf/probe_ebpf.bpf.c`, `executor/executor_linux.h`, `executor/executor.cc`, `pkg/flatrpc/flatrpc.fbs`, `pkg/flatrpc/flatrpc.h`, `pkg/flatrpc/flatrpc.go`, `pkg/fuzzer/stats.go`, `pkg/fuzzer/fuzzer.go`, `tools/syz-ebpf-loader/main.go`
 
 ### 8b. 연산자-쌍 Thompson Sampling (MuoFuzz)
 
@@ -720,7 +722,7 @@ cd syzkaller && make host
 | `sys/linux/*.txt` | Syscall 기술 (syzlang) |
 | `executor/executor.cc` | VM 내 syscall 실행기 (C++) |
 | `executor/ebpf/probe_ebpf.bpf.c` | eBPF 힙 모니터 (BPF C) |
-| `executor/ebpf/write_to_freed.bpf.c` | Write-to-freed 탐지기 (BPF C) — Phase 8a |
+| `executor/ebpf/probe_ebpf.bpf.c` | eBPF 힙 모니터 + write-to-freed (Phase 5/7/8a, 통합) |
 | `pkg/fuzzer/dezzer.go` | DEzzer TS+DE 옵티마이저 (쌍/클러스터/메타-밴딧) |
 | `tools/mock_model/` | MOCK BiGRU 모델 서비스 (Python) — Phase 8d |
 | `tools/syz-ebpf-loader/main.go` | BPF 로더 바이너리 (Go) |

@@ -14,7 +14,7 @@
 #include <bpf/bpf_core_read.h>
 
 // Shared metrics structure (read by executor).
-// Phase 5 fields (8) + Phase 7 fields (3).
+// Phase 5 fields (8) + Phase 7 fields (3) + Phase 8a fields (1).
 struct probe_metrics {
 	__u64 alloc_count;
 	__u64 free_count;
@@ -28,6 +28,8 @@ struct probe_metrics {
 	__u64 commit_creds_count;     // 7d: commit_creds() calls
 	__u64 priv_esc_count;         // 7d: uid!=0 → uid==0 transitions
 	__u64 cross_cache_count;      // 7c: precise cross-cache (different kmem_cache)
+	// Phase 8a:
+	__u64 write_to_freed_count;   // 8a: writes to freed slab objects via copy_from_user
 };
 
 // 7b': Per-call-site alloc/free statistics for AI strategy.

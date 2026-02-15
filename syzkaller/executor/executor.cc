@@ -168,6 +168,8 @@ struct alignas(8) OutputData {
 	std::atomic<uint32> ebpf_commit_creds;
 	std::atomic<uint32> ebpf_priv_esc;
 	std::atomic<uint32> ebpf_cross_cache;
+	// Phase 8a:
+	std::atomic<uint32> ebpf_write_to_freed;
 
 	void Reset()
 	{
@@ -186,6 +188,7 @@ struct alignas(8) OutputData {
 		ebpf_commit_creds.store(0, std::memory_order_relaxed);
 		ebpf_priv_esc.store(0, std::memory_order_relaxed);
 		ebpf_cross_cache.store(0, std::memory_order_relaxed);
+		ebpf_write_to_freed.store(0, std::memory_order_relaxed);
 	}
 };
 
@@ -1213,6 +1216,7 @@ void execute_one()
 		output_data->ebpf_commit_creds.store((uint32)metrics.commit_creds_count, std::memory_order_relaxed);
 		output_data->ebpf_priv_esc.store((uint32)metrics.priv_esc_count, std::memory_order_relaxed);
 		output_data->ebpf_cross_cache.store((uint32)metrics.cross_cache_count, std::memory_order_relaxed);
+		output_data->ebpf_write_to_freed.store((uint32)metrics.write_to_freed_count, std::memory_order_relaxed);
 	}
 #endif
 
@@ -1542,7 +1546,7 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
 	// PROBE: Read eBPF heap metrics from shared memory (written by exec child in execute_one).
 	uint32 ebpf_alloc = 0, ebpf_free = 0, ebpf_reuse = 0, ebpf_rapid = 0, ebpf_uaf_score = 0;
 	uint32 ebpf_double_free = 0, ebpf_size_mismatch = 0;
-	uint32 ebpf_commit_creds = 0, ebpf_priv_esc = 0, ebpf_cross_cache = 0;
+	uint32 ebpf_commit_creds = 0, ebpf_priv_esc = 0, ebpf_cross_cache = 0, ebpf_write_to_freed = 0;
 	uint64 ebpf_min_ns = 0;
 #if GOOS_linux
 	{
@@ -1556,6 +1560,7 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
 		ebpf_commit_creds = output->ebpf_commit_creds.load(std::memory_order_relaxed);
 		ebpf_priv_esc = output->ebpf_priv_esc.load(std::memory_order_relaxed);
 		ebpf_cross_cache = output->ebpf_cross_cache.load(std::memory_order_relaxed);
+		ebpf_write_to_freed = output->ebpf_write_to_freed.load(std::memory_order_relaxed);
 		// Compute UAF exploitability score (0-100)
 		// Note: cross-program contamination is prevented by epoch-based filtering
 		// in the BPF program (execution_start_ns), so no saturation guard needed.
@@ -1576,6 +1581,11 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
 			ebpf_uaf_score += 20;
 		if (ebpf_cross_cache > 3)
 			ebpf_uaf_score += 20; // total +40 for heavy cross-cache
+		// Phase 8a: Write to freed object = strong exploitability signal
+		if (ebpf_write_to_freed > 0)
+			ebpf_uaf_score += 30;
+		if (ebpf_write_to_freed > 3)
+			ebpf_uaf_score += 20; // total +50 for repeated writes
 		// Phase 7d: Privilege escalation = max priority
 		if (ebpf_priv_esc > 0)
 			ebpf_uaf_score = 100;
@@ -1590,7 +1600,8 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
 							  ebpf_alloc, ebpf_free, ebpf_reuse, ebpf_rapid,
 							  ebpf_min_ns, ebpf_uaf_score,
 							  ebpf_double_free, ebpf_size_mismatch,
-							  ebpf_commit_creds, ebpf_priv_esc, ebpf_cross_cache);
+							  ebpf_commit_creds, ebpf_priv_esc, ebpf_cross_cache,
+							  ebpf_write_to_freed);
 	flatbuffers::Offset<flatbuffers::String> error_off = 0;
 	if (status == kFailStatus)
 		error_off = fbb.CreateString("process failed");

@@ -45,6 +45,7 @@ type Stats struct {
 	statEbpfPrivEsc         *stat.Val // PROBE: Phase 7d
 	statEbpfCommitCreds     *stat.Val // PROBE: Phase 7d
 	statEbpfCrossCache      *stat.Val // PROBE: Phase 7c
+	statEbpfWriteToFreed    *stat.Val // PROBE: Phase 8a
 	statFocusCovGain        *stat.Val // PROBE: Phase 6 — per-source coverage metrics
 	statSmashCovGain        *stat.Val // PROBE: Phase 6
 	statFuzzCovGain         *stat.Val // PROBE: Phase 6
@@ -126,6 +127,8 @@ func newStats(target *prog.Target) Stats {
 		statEbpfCommitCreds: stat.New("ebpf commit-creds", "commit_creds() calls observed",
 			stat.Rate{}, stat.Graph("ebpf")),
 		statEbpfCrossCache: stat.New("ebpf cross-cache", "Precise cross-cache reallocation events",
+			stat.Graph("ebpf")),
+		statEbpfWriteToFreed: stat.New("ebpf write-to-freed", "Writes to freed slab objects via copy_from_user",
 			stat.Graph("ebpf")),
 		statFocusCovGain: stat.New("focus cov gain", "Coverage gains from focus mode executions",
 			stat.Rate{}, stat.StackedGraph("source cov")),

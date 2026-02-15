@@ -172,6 +172,21 @@ func run(bpfObj string) error {
 		}
 	}
 
+	// Phase 8a: Attach kprobe/_copy_from_user (graceful skip on failure)
+	if prog := coll.Programs["kprobe_copy_from_user"]; prog != nil {
+		kp, err := link.Kprobe("_copy_from_user", prog, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "PROBE: warning: kprobe _copy_from_user failed: %v (write-to-freed detection disabled)\n", err)
+		} else {
+			pin := filepath.Join(pinDir, "link_copy_from_user")
+			os.Remove(pin)
+			if err := kp.Pin(pin); err != nil {
+				fmt.Fprintf(os.Stderr, "PROBE: warning: pin copy_from_user link: %v\n", err)
+			}
+			fmt.Fprintf(os.Stderr, "PROBE: kprobe/_copy_from_user attached (write-to-freed detection enabled)\n")
+		}
+	}
+
 	// Success — BPF programs are attached and pinned, loader can exit
 	return nil
 }

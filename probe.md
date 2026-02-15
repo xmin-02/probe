@@ -574,23 +574,25 @@ clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
 cd syzkaller && make host  # Builds all host tools including syz-manager
 ```
 
-## Phase 8: Mutation & Coverage Innovation — PLANNED
+## Phase 8: Mutation & Coverage Innovation — IN PROGRESS (8a DONE)
 
 **Goal**: Smarter mutation strategies, multi-objective optimization, and enhanced exploit detection. Total overhead < 3.5%, no additional AI API cost.
 
 **Analysis basis**: Deep code-level review of `prog/mutation.go`, `pkg/fuzzer/dezzer.go`, `pkg/fuzzer/job.go`, and 15+ papers (NDSS/CCS/ICSE/ISSTA 2022-2025). Each technique evaluated for runtime performance impact, realistic effectiveness (not paper maximums), and synergy with existing PROBE architecture.
 
-### 8a. Write-to-freed eBPF Detection
+### 8a. Write-to-freed eBPF Detection — DONE
 
 **Goal**: Detect writes to freed slab objects via `copy_from_user` kprobe — near-certain exploitability signal.
 
-**Design**: kprobe on `_copy_from_user`, cross-reference destination address with `cache_freed` LRU map (Phase 7c). Two-stage filtering: (1) address range pre-filter (slab heap only, 90%+ early exit), (2) 50ms time window + 3-execution statistical confirmation.
+**Design**: kprobe on `_copy_from_user`, cross-reference destination address with `freed_objects` LRU map (Phase 5). Slab-alignment matching (64/128/256 bytes) to handle writes to offsets within freed objects. Epoch filter + 50ms time window to prevent stale false positives.
 
 **Overhead**: < 1.5%. **Expected impact**: Strong exploitability signal for Focus Mode prioritization.
 
-**Risk mitigation**: No additional kprobe on `kmem_cache_alloc` (overhead too high). Instead: time window (50ms) + statistical dedup (3 consecutive triggers = confirmed, 1 trigger = candidate).
+**UAF score contribution**: +30 (1+ writes), +50 (3+ writes). Focus mode triggered on any write-to-freed detection.
 
-**Files**: `executor/ebpf/write_to_freed.bpf.c` (new), `executor/ebpf/ebpf_monitor.go`, `pkg/flatrpc/flatrpc.fbs` (+1 field), `pkg/fuzzer/fuzzer.go` (processResult)
+**Implementation**: Added to existing `probe_ebpf.bpf.c` (shares `freed_objects` map and `metrics` struct, separate BPF file unnecessary). FlatBuffers field `ebpf_write_to_freed_count` (VT=36, slot 16). Dashboard stat: "ebpf write-to-freed".
+
+**Files modified**: `executor/ebpf/probe_ebpf.bpf.h`, `executor/ebpf/probe_ebpf.bpf.c`, `executor/executor_linux.h`, `executor/executor.cc`, `pkg/flatrpc/flatrpc.fbs`, `pkg/flatrpc/flatrpc.h`, `pkg/flatrpc/flatrpc.go`, `pkg/fuzzer/stats.go`, `pkg/fuzzer/fuzzer.go`, `tools/syz-ebpf-loader/main.go`
 
 ### 8b. Operator-Pair Thompson Sampling (MuoFuzz)
 
@@ -762,7 +764,7 @@ Based on a survey of 30+ papers (CCS/NDSS/ASPLOS/USENIX 2022-2026), 39 applicabl
 | `sys/linux/*.txt` | Syscall descriptions (syzlang) |
 | `executor/executor.cc` | In-VM syscall executor (C++) |
 | `executor/ebpf/probe_ebpf.bpf.c` | eBPF heap monitor (BPF C) |
-| `executor/ebpf/write_to_freed.bpf.c` | Write-to-freed detector (BPF C) — Phase 8a |
+| `executor/ebpf/probe_ebpf.bpf.c` | eBPF heap monitor + write-to-freed (Phase 5/7/8a, unified) |
 | `pkg/fuzzer/dezzer.go` | DEzzer TS+DE optimizer (pair/cluster/meta-bandit) |
 | `tools/mock_model/` | MOCK BiGRU model service (Python) — Phase 8d |
 | `tools/syz-ebpf-loader/main.go` | BPF loader binary (Go) |

@@ -256,4 +256,57 @@ int trace_cache_alloc(struct trace_event_raw_kmem_cache_alloc *ctx)
 	return 0;
 }
 
+// ============================================================
+// Phase 8a: Write-to-freed Detection (CO-RE kprobe)
+// ============================================================
+
+// Detect copy_from_user() writes to recently freed slab objects.
+// This is a strong UAF exploitability signal: userspace-controlled data
+// is being written to a freed kernel object.
+//
+// Strategy: cross-reference destination address with freed_objects LRU map.
+// Check exact address + common slab-aligned addresses (64, 128, 256 bytes)
+// to handle writes to offsets within freed objects.
+// Time window: 50ms to prevent stale false positives.
+SEC("kprobe/_copy_from_user")
+int BPF_KPROBE(kprobe_copy_from_user, void *to, const void *from, unsigned long n)
+{
+	__u32 key = 0;
+	struct probe_metrics *m = bpf_map_lookup_elem(&metrics, &key);
+	if (!m || m->execution_start_ns == 0)
+		return 0;
+
+	__u64 dst = (__u64)to;
+
+	// Check if destination matches a recently freed object.
+	// Try exact address, then common slab-aligned addresses.
+	__u64 *free_ts = bpf_map_lookup_elem(&freed_objects, &dst);
+	if (!free_ts) {
+		__u64 aligned = dst & ~63ULL;  // 64-byte slab alignment
+		free_ts = bpf_map_lookup_elem(&freed_objects, &aligned);
+	}
+	if (!free_ts) {
+		__u64 aligned = dst & ~127ULL; // 128-byte slab alignment
+		free_ts = bpf_map_lookup_elem(&freed_objects, &aligned);
+	}
+	if (!free_ts) {
+		__u64 aligned = dst & ~255ULL; // 256-byte slab alignment
+		free_ts = bpf_map_lookup_elem(&freed_objects, &aligned);
+	}
+	if (!free_ts)
+		return 0;
+
+	// Epoch filter: ignore freed objects from previous executions
+	if (*free_ts < m->execution_start_ns)
+		return 0;
+
+	// Time window: 50ms (50,000,000 ns) — filter stale entries
+	__u64 now = bpf_ktime_get_ns();
+	if (now - *free_ts > 50000000ULL)
+		return 0;
+
+	__sync_fetch_and_add(&m->write_to_freed_count, 1);
+	return 0;
+}
+
 char _license[] SEC("license") = "GPL";

@@ -3038,6 +3038,7 @@ type ProgInfoRawT struct {
 	EbpfCommitCredsCount     uint32          `json:"ebpf_commit_creds_count"`
 	EbpfPrivEscCount         uint32          `json:"ebpf_priv_esc_count"`
 	EbpfCrossCacheCount      uint32          `json:"ebpf_cross_cache_count"`
+	EbpfWriteToFreedCount    uint32          `json:"ebpf_write_to_freed_count"`
 }
 
 func (t *ProgInfoRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
@@ -3088,6 +3089,7 @@ func (t *ProgInfoRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	ProgInfoRawAddEbpfCommitCredsCount(builder, t.EbpfCommitCredsCount)
 	ProgInfoRawAddEbpfPrivEscCount(builder, t.EbpfPrivEscCount)
 	ProgInfoRawAddEbpfCrossCacheCount(builder, t.EbpfCrossCacheCount)
+	ProgInfoRawAddEbpfWriteToFreedCount(builder, t.EbpfWriteToFreedCount)
 	return ProgInfoRawEnd(builder)
 }
 
@@ -3120,6 +3122,7 @@ func (rcv *ProgInfoRaw) UnPackTo(t *ProgInfoRawT) {
 	t.EbpfCommitCredsCount = rcv.EbpfCommitCredsCount()
 	t.EbpfPrivEscCount = rcv.EbpfPrivEscCount()
 	t.EbpfCrossCacheCount = rcv.EbpfCrossCacheCount()
+	t.EbpfWriteToFreedCount = rcv.EbpfWriteToFreedCount()
 }
 
 func (rcv *ProgInfoRaw) UnPack() *ProgInfoRawT {
@@ -3375,8 +3378,20 @@ func (rcv *ProgInfoRaw) MutateEbpfCrossCacheCount(n uint32) bool {
 	return rcv._tab.MutateUint32Slot(34, n)
 }
 
+func (rcv *ProgInfoRaw) EbpfWriteToFreedCount() uint32 {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(36))
+	if o != 0 {
+		return rcv._tab.GetUint32(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *ProgInfoRaw) MutateEbpfWriteToFreedCount(n uint32) bool {
+	return rcv._tab.MutateUint32Slot(36, n)
+}
+
 func ProgInfoRawStart(builder *flatbuffers.Builder) {
-	builder.StartObject(16)
+	builder.StartObject(17)
 }
 func ProgInfoRawAddCalls(builder *flatbuffers.Builder, calls flatbuffers.UOffsetT) {
 	builder.PrependUOffsetTSlot(0, flatbuffers.UOffsetT(calls), 0)
@@ -3431,6 +3446,9 @@ func ProgInfoRawAddEbpfPrivEscCount(builder *flatbuffers.Builder, ebpfPrivEscCou
 }
 func ProgInfoRawAddEbpfCrossCacheCount(builder *flatbuffers.Builder, ebpfCrossCacheCount uint32) {
 	builder.PrependUint32Slot(15, ebpfCrossCacheCount, 0)
+}
+func ProgInfoRawAddEbpfWriteToFreedCount(builder *flatbuffers.Builder, ebpfWriteToFreedCount uint32) {
+	builder.PrependUint32Slot(16, ebpfWriteToFreedCount, 0)
 }
 func ProgInfoRawEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	return builder.EndObject()
