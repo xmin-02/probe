@@ -24,6 +24,8 @@ const (
 	dezzerF             = 0.5  // DE mutation factor
 	dezzerCR            = 0.7  // DE crossover rate
 	dezzerNumOps        = 5    // squash, splice, insert, mutate_arg, remove
+	dezzerStagnantLimit = 50   // partial restart after N generations with no delta change
+	dezzerKeepBest      = 3    // keep top N individuals during partial restart
 )
 
 // opNames maps operator index to name.
@@ -57,6 +59,10 @@ type DEzzer struct {
 
 	// Execution counter for lazy evolution.
 	totalRecords int64
+
+	// Stagnation detection for population diversity.
+	stagnantGens  int
+	lastBestDelta WeightVector
 
 	// Logging function.
 	logf func(level int, msg string, args ...any)
@@ -163,6 +169,8 @@ func (d *DEzzer) SetAIBaseWeights(opts prog.MutateOpts) {
 	}
 	d.bestIdx = 0
 	d.generation = 0
+	d.stagnantGens = 0
+	d.lastBestDelta = WeightVector{}
 
 	if d.logf != nil {
 		d.logf(0, "PROBE: DEzzer AI base reset — Sq:%.2f Sp:%.2f In:%.2f MA:%.2f Rm:%.2f",
@@ -332,11 +340,84 @@ func (d *DEzzer) evolveOneGeneration() {
 	}
 
 	d.generation++
+
+	// Stagnation detection: if best delta unchanged for N generations, partial restart.
+	best := d.population[d.bestIdx]
+	if best == d.lastBestDelta {
+		d.stagnantGens++
+	} else {
+		d.stagnantGens = 0
+		d.lastBestDelta = best
+	}
+	if d.stagnantGens >= dezzerStagnantLimit {
+		d.partialRestart()
+	}
+
 	if d.logf != nil && d.generation%10 == 0 {
-		best := d.population[d.bestIdx]
+		best = d.population[d.bestIdx]
 		d.logf(0, "PROBE: DEzzer gen=%d best_fitness=%.3f delta={Sq:%.2f Sp:%.2f In:%.2f MA:%.2f Rm:%.2f}",
 			d.generation, d.fitness[d.bestIdx],
 			best.Squash, best.Splice, best.Insert, best.MutateArg, best.Remove)
+	}
+}
+
+// partialRestart keeps the top dezzerKeepBest individuals and randomizes the rest.
+// This restores population diversity when DE converges prematurely.
+func (d *DEzzer) partialRestart() {
+	// Sort population indices by fitness (descending).
+	type idxFit struct {
+		idx int
+		fit float64
+	}
+	sorted := make([]idxFit, dezzerPopSize)
+	for i := range d.population {
+		sorted[i] = idxFit{i, d.fitness[i]}
+	}
+	for i := 0; i < len(sorted); i++ {
+		for j := i + 1; j < len(sorted); j++ {
+			if sorted[j].fit > sorted[i].fit {
+				sorted[i], sorted[j] = sorted[j], sorted[i]
+			}
+		}
+	}
+
+	// Mark which indices to keep.
+	keep := make(map[int]bool)
+	for i := 0; i < dezzerKeepBest && i < len(sorted); i++ {
+		keep[sorted[i].idx] = true
+	}
+
+	// Randomize non-kept individuals.
+	rnd := rand.New(rand.NewSource(d.totalRecords + int64(d.generation)*7))
+	for i := range d.population {
+		if keep[i] {
+			continue
+		}
+		d.population[i] = WeightVector{
+			Squash:    1.0 + (rnd.Float64()-0.5)*2*dezzerDeltaLimit,
+			Splice:    1.0 + (rnd.Float64()-0.5)*2*dezzerDeltaLimit,
+			Insert:    1.0 + (rnd.Float64()-0.5)*2*dezzerDeltaLimit,
+			MutateArg: 1.0 + (rnd.Float64()-0.5)*2*dezzerDeltaLimit,
+			Remove:    1.0 + (rnd.Float64()-0.5)*2*dezzerDeltaLimit,
+		}
+		d.fitness[i] = d.evalVector(d.population[i])
+	}
+
+	// Update bestIdx.
+	d.bestIdx = 0
+	for i := 1; i < dezzerPopSize; i++ {
+		if d.fitness[i] > d.fitness[d.bestIdx] {
+			d.bestIdx = i
+		}
+	}
+
+	d.stagnantGens = 0
+	d.lastBestDelta = d.population[d.bestIdx]
+
+	if d.logf != nil {
+		best := d.population[d.bestIdx]
+		d.logf(0, "PROBE: DEzzer partial restart (kept top %d) — gen=%d new_best={Sq:%.2f Sp:%.2f In:%.2f MA:%.2f Rm:%.2f}",
+			dezzerKeepBest, d.generation, best.Squash, best.Splice, best.Insert, best.MutateArg, best.Remove)
 	}
 }
 
