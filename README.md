@@ -1,8 +1,8 @@
 # PROBE
 
-**Exploit-oriented kernel fuzzer** built on top of Google's [syzkaller](https://github.com/google/syzkaller).
+**Exploit-guided kernel fuzzer** built on top of Google's [syzkaller](https://github.com/google/syzkaller).
 
-PROBE transforms syzkaller from a general-purpose coverage-guided fuzzer into one that actively hunts for **exploitable** vulnerabilities (UAF, OOB, double-free, privilege escalation) using eBPF runtime monitoring, AI-guided analysis, and adaptive mutation scheduling.
+While traditional kernel fuzzers are coverage-guided (maximizing code coverage), PROBE is **exploit-guided** -- it uses eBPF runtime monitoring, AI analysis, and adaptive mutation scheduling to prioritize the discovery of **actually exploitable** vulnerabilities (UAF, OOB, double-free, privilege escalation). Coverage is used as an exploration mechanism, but the ultimate optimization target is exploit feasibility.
 
 ## Key Features
 
@@ -262,9 +262,9 @@ Based on [syzkaller](https://github.com/google/syzkaller) (Apache 2.0).
 
 # PROBE (한국어)
 
-Google [syzkaller](https://github.com/google/syzkaller) 기반의 **익스플로잇 지향 커널 퍼저**.
+Google [syzkaller](https://github.com/google/syzkaller) 기반의 **익스플로잇 가이드 커널 퍼저**.
 
-PROBE는 syzkaller를 범용 커버리지 기반 퍼저에서, eBPF 런타임 모니터링과 AI 분석, 적응형 뮤테이션 스케줄링을 활용하여 **실제 익스플로잇 가능한** 취약점(UAF, OOB, double-free, 권한 상승)을 적극적으로 탐지하는 퍼저로 확장합니다.
+기존 커널 퍼저들이 코드 커버리지 극대화를 목표로 하는 커버리지 가이드(coverage-guided) 방식인 반면, PROBE는 **익스플로잇 가이드(exploit-guided)** 방식입니다. eBPF 런타임 모니터링, AI 분석, 적응형 뮤테이션 스케줄링을 활용하여 **실제 익스플로잇 가능한** 취약점(UAF, OOB, double-free, 권한 상승) 발견을 우선시합니다. 커버리지는 탐색 수단으로 사용하되, 최종 최적화 목표는 익스플로잇 가능성입니다.
 
 ## 주요 기능
 
