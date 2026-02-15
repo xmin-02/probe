@@ -388,18 +388,55 @@ make probe_ebpf   # Builds BPF object + loader to bin/linux_amd64/
 **Critical path**: Phase 1 → Phase 2 → Phase 3 (sequential dependency)
 **Parallel track**: Phase 4 can start any time independently
 
+## Phase 6+: Advanced Improvements Roadmap
+
+**Full roadmap**: See `syzkaller/probe_log/improvement_roadmap.md` for detailed descriptions, paper references, and cost projections.
+
+Based on a survey of 30+ papers (CCS/NDSS/ASPLOS/USENIX 2024-2026), 39 applicable techniques were identified and prioritized into 7 phases:
+
+| Phase | Focus | Timeline | Key Techniques | Expected Impact |
+|-------|-------|----------|----------------|-----------------|
+| 6 | AI Cost Optimization + Scheduling | Week 1 | Batch API, Prompt Caching, Tiered Routing, T-Scheduler, SyzMini, DEzzer | **-80% API cost**, better scheduling |
+| 7 | Core Detection Enhancement | Week 2-3 | SyzGPT (DRAG), CountDown (refcount), Cross-cache, Privilege escalation, GPTrace | **+323% vuln detection**, +66% UAF |
+| 8 | Mutation & Coverage Innovation | Week 3-4 | MOCK, SeqFuzz, MobFuzz, Coverage feedback, Write-to-freed | **+32% coverage**, 3-4.5x bugs |
+| 9 | Advanced Coverage & Detection | Month 2 | KBinCov, Page-level UAF, Context-sensitive, FD lifecycle, Anamnesis | **+87% binary coverage** |
+| 10 | Spec Auto-Generation | Month 2-3 | KernelGPT, SyzForge, SyzSpec | **+13-18% coverage**, new syscalls |
+| 11 | Concurrency Bugs | Month 3 | LACE, ACTOR, OZZ | **+38% coverage**, race conditions |
+| 12 | Advanced Monitoring & Research | Month 3+ | KASLR leak, Quarantine bypass, Snowplow, Big Sleep | Experimental |
+
+### Cost-incurring techniques (require API budget)
+- SyzGPT seed generation (+$0.10-0.50/day)
+- GPTrace embedding dedup (+$0.01-0.05/day)
+- Anamnesis exploit assessment (+$0.50-3.00/day)
+- KernelGPT/SyzForge spec generation (+$0.50-2.00/run)
+
+### Non-cost techniques (pure code changes)
+- All scheduling improvements (T-Scheduler, DEzzer, MobFuzz)
+- All eBPF extensions (refcount, cross-cache, page-level, FD, privilege escalation)
+- Mutation improvements (MOCK, SeqFuzz, SyzMini)
+- Coverage extensions (KBinCov, context-sensitive)
+- Concurrency testing (LACE, ACTOR)
+
 ## Related Research
 
 | Paper | Venue | Relevance |
 |-------|-------|-----------|
-| CountDown | CCS 2024 | UAF-specific fuzzing (refcount-based), 66.1% more UAFs — Phase 4 reference |
-| FUZE | USENIX Sec 2018 | Kernel UAF exploit generation automation — Phase 5 exploitability criteria |
-| ACTOR | USENIX Sec 2023 | Action-based fuzzing (alloc/free actions), 41 unknown bugs — Phase 4 reference |
-| SyzScope | USENIX Sec 2022 | 15% of "low-risk" bugs are actually high-risk — Phase 1+2 motivation |
-| GREBE | IEEE S&P 2022 | Turned 6 "unexploitable" bugs into arbitrary code execution — Phase 2 variant discovery |
-| SYZVEGAS | USENIX Sec 2021 | RL-based seed scheduling, 38.7% coverage improvement — Phase 2 scheduling reference |
-| HEALER | SOSP 2021 | Syscall relation learning, 28% coverage improvement — Phase 4 dependency mutations |
-| KernelGPT | ASPLOS 2025 | LLM for syscall description generation, 24 new bugs, 11 CVEs — Phase 3+4 LLM usage |
+| SyzGPT | ISSTA 2025 | Dependency-based RAG, +323% vuln detection — Phase 7 |
+| CountDown | CCS 2024 | Refcount-guided UAF, +66.1% UAFs — Phase 7 |
+| MOCK | NDSS 2024 | Context-aware mutation, +32% coverage — Phase 8 |
+| Snowplow | ASPLOS 2025 | ML-guided mutation (Google DeepMind), 4.8x speedup — Phase 12 |
+| KernelGPT | ASPLOS 2025 | LLM spec generation, 24 bugs, 11 CVEs — Phase 10 |
+| GPTrace | ICSE 2026 | LLM embedding crash dedup — Phase 7 |
+| KBinCov | CCS 2024 | Binary coverage, +87% — Phase 9 |
+| SyzMini | ATC 2025 | Minimization optimization, -60.7% cost — Phase 6 |
+| LACE | 2025 | eBPF sched_ext concurrency, +38% coverage — Phase 11 |
+| Anamnesis | 2026 | LLM exploit generation, ~$30/exploit — Phase 9 |
+| MobFuzz | NDSS 2024 | Multi-objective MAB, 3x bugs — Phase 8 |
+| SeqFuzz | Inscrypt 2025 | Effective component inference, 4.5x bugs — Phase 8 |
+| SLUBStick | USENIX Sec 2024 | Cross-cache attacks, 99% success — Phase 12 |
+| ACTOR | USENIX Sec 2023 | Concurrency testing — Phase 11 |
+| SyzScope | USENIX Sec 2022 | 15% of "low-risk" bugs are high-risk — Phase 1+2 motivation |
+| GREBE | IEEE S&P 2022 | 6 "unexploitable" → arbitrary code exec — Phase 2 motivation |
 
 ## Key Files Reference
 

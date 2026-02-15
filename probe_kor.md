@@ -387,18 +387,55 @@ make probe_ebpf   # BPF 오브젝트 + 로더를 bin/linux_amd64/에 빌드
 **크리티컬 패스**: Phase 1 → Phase 2 → Phase 3 (순차 의존성)
 **병렬 트랙**: Phase 4는 독립적으로 언제든 시작 가능
 
+## Phase 6+: 고급 개선 로드맵
+
+**상세 로드맵**: `syzkaller/probe_log/improvement_roadmap.md` 참조 (기술 상세, 논문 레퍼런스, 비용 예측 포함).
+
+30+ 논문 (CCS/NDSS/ASPLOS/USENIX 2024-2026) 서베이 결과 39개 적용 가능 기술을 식별하고 7개 Phase로 우선순위화:
+
+| Phase | 초점 | 일정 | 핵심 기술 | 예상 효과 |
+|-------|------|------|----------|----------|
+| 6 | AI 비용 최적화 + 스케줄링 | 1주차 | Batch API, Prompt Caching, Tiered Routing, T-Scheduler, SyzMini, DEzzer | **API 비용 -80%**, 스케줄링 개선 |
+| 7 | 핵심 탐지력 강화 | 2-3주차 | SyzGPT (DRAG), CountDown (refcount), Cross-cache, 권한상승, GPTrace | **취약점 탐지 +323%**, UAF +66% |
+| 8 | 뮤테이션 & 커버리지 혁신 | 3-4주차 | MOCK, SeqFuzz, MobFuzz, 커버리지 피드백, Write-to-freed | **커버리지 +32%**, 버그 3-4.5x |
+| 9 | 고급 커버리지 & 탐지 | 2개월 | KBinCov, Page-level UAF, Context-sensitive, FD, Anamnesis | **바이너리 커버리지 +87%** |
+| 10 | 스펙 자동 생성 | 2-3개월 | KernelGPT, SyzForge, SyzSpec | **커버리지 +13-18%**, 새 syscall |
+| 11 | 동시성 버그 | 3개월 | LACE, ACTOR, OZZ | **커버리지 +38%**, 레이스 컨디션 |
+| 12 | 고급 모니터링 & 연구 | 3개월+ | KASLR leak, Quarantine bypass, Snowplow, Big Sleep | 실험적 |
+
+### 비용 발생 기술 (API 예산 필요)
+- SyzGPT 시드 생성 (+$0.10-0.50/일)
+- GPTrace 임베딩 디덥 (+$0.01-0.05/일)
+- Anamnesis 익스플로잇 평가 (+$0.50-3.00/일)
+- KernelGPT/SyzForge 스펙 생성 (+$0.50-2.00/회)
+
+### 무비용 기술 (순수 코드 변경)
+- 모든 스케줄링 개선 (T-Scheduler, DEzzer, MobFuzz)
+- 모든 eBPF 확장 (refcount, cross-cache, page-level, FD, 권한상승)
+- 뮤테이션 개선 (MOCK, SeqFuzz, SyzMini)
+- 커버리지 확장 (KBinCov, context-sensitive)
+- 동시성 테스팅 (LACE, ACTOR)
+
 ## 관련 연구
 
 | 논문 | 학회 | PROBE 관련성 |
 |------|------|-------------|
-| CountDown | CCS 2024 | UAF 특화 퍼징 (refcount 기반), 66.1% 더 많은 UAF — Phase 4 참고 |
-| FUZE | USENIX Sec 2018 | 커널 UAF 익스플로잇 생성 자동화 — Phase 5 익스플로잇 가능성 기준 |
-| ACTOR | USENIX Sec 2023 | 액션 기반 퍼징 (alloc/free 액션), 41개 미발견 버그 — Phase 4 참고 |
+| SyzGPT | ISSTA 2025 | 의존성 기반 RAG, 취약점 탐지 +323% — Phase 7 |
+| CountDown | CCS 2024 | Refcount 기반 UAF, +66.1% UAF — Phase 7 |
+| MOCK | NDSS 2024 | 컨텍스트 인식 뮤테이션, 커버리지 +32% — Phase 8 |
+| Snowplow | ASPLOS 2025 | ML 뮤테이션 (Google DeepMind), 4.8x 가속 — Phase 12 |
+| KernelGPT | ASPLOS 2025 | LLM 스펙 생성, 24 버그, 11 CVE — Phase 10 |
+| GPTrace | ICSE 2026 | LLM 임베딩 크래시 디덥 — Phase 7 |
+| KBinCov | CCS 2024 | 바이너리 커버리지, +87% — Phase 9 |
+| SyzMini | ATC 2025 | 최소화 최적화, 비용 -60.7% — Phase 6 |
+| LACE | 2025 | eBPF sched_ext 동시성, 커버리지 +38% — Phase 11 |
+| Anamnesis | 2026 | LLM 익스플로잇 생성, ~$30/exploit — Phase 9 |
+| MobFuzz | NDSS 2024 | 다목적 MAB, 버그 3x — Phase 8 |
+| SeqFuzz | Inscrypt 2025 | 유효 컴포넌트 추론, 버그 4.5x — Phase 8 |
+| SLUBStick | USENIX Sec 2024 | Cross-cache 공격, 99% 성공률 — Phase 12 |
+| ACTOR | USENIX Sec 2023 | 동시성 테스팅 — Phase 11 |
 | SyzScope | USENIX Sec 2022 | "저위험" 버그의 15%가 실제 고위험 — Phase 1+2 동기 |
-| GREBE | IEEE S&P 2022 | "익스플로잇 불가" 6개 버그를 임의 코드 실행으로 전환 — Phase 2 변종 탐색 근거 |
-| SYZVEGAS | USENIX Sec 2021 | RL 기반 시드 스케줄링, 38.7% 커버리지 향상 — Phase 2 스케줄링 참고 |
-| HEALER | SOSP 2021 | syscall 관계 학습, 28% 커버리지 향상 — Phase 4 의존성 뮤테이션 |
-| KernelGPT | ASPLOS 2025 | LLM으로 시즈콜 자동 생성, 24개 신규 버그, 11 CVE — Phase 3+4 LLM 활용 |
+| GREBE | IEEE S&P 2022 | "익스플로잇 불가" 6개를 코드 실행으로 — Phase 2 동기 |
 
 ## 주요 파일 참조
 
