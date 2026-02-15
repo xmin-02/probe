@@ -1913,7 +1913,9 @@ func matchLogFilter(msg, filter string) bool {
 			strings.Contains(msg, "Triage started") ||
 			strings.Contains(msg, "batch cycle")
 	case "embeddings":
-		return strings.Contains(msg, "[Embeddings]")
+		return strings.Contains(msg, "[Embeddings]") ||
+			strings.Contains(msg, "Batch cycle") ||
+			strings.Contains(msg, "batch cycle")
 	default:
 		return true
 	}

@@ -399,7 +399,12 @@ func NewTriager(cfg mgrconfig.AITriageConfig, workdir string) (*Triager, error) 
 	if t.embeddingClient != nil {
 		t.clusters = NewClusterState(workdir)
 		// Load embedding cost from disk (separate from LLM cost).
-		t.embeddingClient.cost = loadCostTrackerFile(filepath.Join(workdir, "ai-emb-cost.json"))
+		embCostPath := filepath.Join(workdir, "ai-emb-cost.json")
+		t.embeddingClient.cost = loadCostTrackerFile(embCostPath)
+		// If cost file didn't exist, recover from cluster data.
+		if t.embeddingClient.cost.TotalCalls == 0 {
+			t.recoverEmbeddingCost(embCostPath)
+		}
 	}
 	// Load existing cost tracker from disk.
 	t.cost = loadCostTracker(workdir)
@@ -1277,7 +1282,9 @@ func (t *Triager) stepEmbeddings(ctx context.Context) {
 		}
 	}
 	pending := t.clusters.PendingCrashes(filtered)
+	embs, clusters := t.clusters.Snapshot()
 	if len(pending) == 0 {
+		t.logf("[Embeddings] No pending crashes (%d embedded, %d clusters)", len(embs), len(clusters))
 		return
 	}
 
@@ -1311,8 +1318,8 @@ func (t *Triager) stepEmbeddings(ctx context.Context) {
 		t.logf("[Embeddings] Embedded '%s' (%d tokens)", c.Title, tokens)
 	}
 
-	_, clusters := t.clusters.Snapshot()
-	t.logf("[Embeddings] Done: %d total embeddings, %d clusters", len(t.clusters.Embeddings), len(clusters))
+	embs, clusters = t.clusters.Snapshot()
+	t.logf("[Embeddings] Done: %d total embeddings, %d clusters", len(embs), len(clusters))
 
 	// Persist embedding cost to disk.
 	saveCostTrackerFile(filepath.Join(t.workdir, "ai-emb-cost.json"), t.embeddingClient.cost)
@@ -1539,6 +1546,36 @@ func saveCostTrackerFile(path string, ct *CostTracker) {
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		log.Logf(0, "PROBE: failed to save %s: %v", filepath.Base(path), err)
 	}
+}
+
+// recoverEmbeddingCost reconstructs embedding cost from existing cluster data
+// when ai-emb-cost.json doesn't exist (e.g., persistence was added after embeddings ran).
+func (t *Triager) recoverEmbeddingCost(savePath string) {
+	if t.clusters == nil {
+		return
+	}
+	embs, _ := t.clusters.Snapshot()
+	if len(embs) == 0 {
+		return
+	}
+	model := t.embeddingClient.model
+	pricing, ok := embeddingPricing[model]
+	if !ok {
+		pricing = 0.02 // default to text-embedding-3-small
+	}
+	ct := t.embeddingClient.cost
+	for _, e := range embs {
+		call := APICall{
+			Time:        e.Timestamp,
+			Type:        "embedding",
+			InputTokens: e.Tokens,
+			Success:     true,
+			CostUSD:     float64(e.Tokens) * pricing / 1e6,
+		}
+		ct.Record(call, model)
+	}
+	log.Logf(0, "PROBE: recovered embedding cost from %d existing embeddings ($%.6f)", len(embs), ct.TotalCostUSD)
+	saveCostTrackerFile(savePath, ct)
 }
 
 // isSyzkallerInternalCrash returns true for crash titles that represent
