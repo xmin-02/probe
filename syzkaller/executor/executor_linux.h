@@ -385,6 +385,8 @@ struct probe_metrics {
 	uint64 reuse_count;
 	uint64 rapid_reuse_count;
 	uint64 min_reuse_delay_ns;
+	uint64 double_free_count;
+	uint64 size_mismatch_count;
 };
 
 static int ebpf_metrics_fd = -1;

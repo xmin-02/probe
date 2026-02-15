@@ -257,6 +257,8 @@ table ProgInfoRaw {
 	ebpf_rapid_reuse_count	:uint32;
 	ebpf_min_reuse_ns	:uint64;
 	ebpf_uaf_score		:uint32;
+	ebpf_double_free_count	:uint32;
+	ebpf_size_mismatch_count:uint32;
 }
 
 // Result of executing a test program.

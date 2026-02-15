@@ -162,6 +162,8 @@ struct alignas(8) OutputData {
 	std::atomic<uint32> ebpf_reuse;
 	std::atomic<uint32> ebpf_rapid;
 	std::atomic<uint64> ebpf_min_ns;
+	std::atomic<uint32> ebpf_double_free;
+	std::atomic<uint32> ebpf_size_mismatch;
 
 	void Reset()
 	{
@@ -175,6 +177,8 @@ struct alignas(8) OutputData {
 		ebpf_reuse.store(0, std::memory_order_relaxed);
 		ebpf_rapid.store(0, std::memory_order_relaxed);
 		ebpf_min_ns.store(0, std::memory_order_relaxed);
+		ebpf_double_free.store(0, std::memory_order_relaxed);
+		ebpf_size_mismatch.store(0, std::memory_order_relaxed);
 	}
 };
 
@@ -1197,6 +1201,8 @@ void execute_one()
 		output_data->ebpf_reuse.store((uint32)metrics.reuse_count, std::memory_order_relaxed);
 		output_data->ebpf_rapid.store((uint32)metrics.rapid_reuse_count, std::memory_order_relaxed);
 		output_data->ebpf_min_ns.store(metrics.min_reuse_delay_ns, std::memory_order_relaxed);
+		output_data->ebpf_double_free.store((uint32)metrics.double_free_count, std::memory_order_relaxed);
+		output_data->ebpf_size_mismatch.store((uint32)metrics.size_mismatch_count, std::memory_order_relaxed);
 	}
 #endif
 
@@ -1525,6 +1531,7 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
 	}
 	// PROBE: Read eBPF heap metrics from shared memory (written by exec child in execute_one).
 	uint32 ebpf_alloc = 0, ebpf_free = 0, ebpf_reuse = 0, ebpf_rapid = 0, ebpf_uaf_score = 0;
+	uint32 ebpf_double_free = 0, ebpf_size_mismatch = 0;
 	uint64 ebpf_min_ns = 0;
 #if GOOS_linux
 	{
@@ -1533,6 +1540,8 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
 		ebpf_reuse = output->ebpf_reuse.load(std::memory_order_relaxed);
 		ebpf_rapid = output->ebpf_rapid.load(std::memory_order_relaxed);
 		ebpf_min_ns = output->ebpf_min_ns.load(std::memory_order_relaxed);
+		ebpf_double_free = output->ebpf_double_free.load(std::memory_order_relaxed);
+		ebpf_size_mismatch = output->ebpf_size_mismatch.load(std::memory_order_relaxed);
 		// Compute UAF exploitability score (0-100)
 		if (ebpf_rapid > 0)
 			ebpf_uaf_score += 50;
@@ -1540,11 +1549,20 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
 			ebpf_uaf_score += 30;
 		if (ebpf_reuse > 5)
 			ebpf_uaf_score += 20;
+		// Double-free = ALWAYS critical
+		if (ebpf_double_free > 0)
+			ebpf_uaf_score = 100;
+		// Size mismatch = cross-cache potential bonus
+		if (ebpf_size_mismatch > 3)
+			ebpf_uaf_score += 10;
+		if (ebpf_uaf_score > 100)
+			ebpf_uaf_score = 100;
 	}
 #endif
 	auto prog_info_off = rpc::CreateProgInfoRawDirect(fbb, &calls, &extra, 0, elapsed, freshness,
 							  ebpf_alloc, ebpf_free, ebpf_reuse, ebpf_rapid,
-							  ebpf_min_ns, ebpf_uaf_score);
+							  ebpf_min_ns, ebpf_uaf_score,
+							  ebpf_double_free, ebpf_size_mismatch);
 	flatbuffers::Offset<flatbuffers::String> error_off = 0;
 	if (status == kFailStatus)
 		error_off = fbb.CreateString("process failed");

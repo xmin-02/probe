@@ -2348,6 +2348,8 @@ struct ProgInfoRawT : public ::flatbuffers::NativeTable {
   uint32_t ebpf_rapid_reuse_count = 0;
   uint64_t ebpf_min_reuse_ns = 0;
   uint32_t ebpf_uaf_score = 0;
+  uint32_t ebpf_double_free_count = 0;
+  uint32_t ebpf_size_mismatch_count = 0;
   ProgInfoRawT() = default;
   ProgInfoRawT(const ProgInfoRawT &o);
   ProgInfoRawT(ProgInfoRawT&&) FLATBUFFERS_NOEXCEPT = default;
@@ -2368,7 +2370,9 @@ struct ProgInfoRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
     VT_EBPF_REUSE_COUNT = 18,
     VT_EBPF_RAPID_REUSE_COUNT = 20,
     VT_EBPF_MIN_REUSE_NS = 22,
-    VT_EBPF_UAF_SCORE = 24
+    VT_EBPF_UAF_SCORE = 24,
+    VT_EBPF_DOUBLE_FREE_COUNT = 26,
+    VT_EBPF_SIZE_MISMATCH_COUNT = 28
   };
   const ::flatbuffers::Vector<::flatbuffers::Offset<rpc::CallInfoRaw>> *calls() const {
     return GetPointer<const ::flatbuffers::Vector<::flatbuffers::Offset<rpc::CallInfoRaw>> *>(VT_CALLS);
@@ -2403,6 +2407,12 @@ struct ProgInfoRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   uint32_t ebpf_uaf_score() const {
     return GetField<uint32_t>(VT_EBPF_UAF_SCORE, 0);
   }
+  uint32_t ebpf_double_free_count() const {
+    return GetField<uint32_t>(VT_EBPF_DOUBLE_FREE_COUNT, 0);
+  }
+  uint32_t ebpf_size_mismatch_count() const {
+    return GetField<uint32_t>(VT_EBPF_SIZE_MISMATCH_COUNT, 0);
+  }
   bool Verify(::flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyOffset(verifier, VT_CALLS) &&
@@ -2421,6 +2431,8 @@ struct ProgInfoRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            VerifyField<uint32_t>(verifier, VT_EBPF_RAPID_REUSE_COUNT, 4) &&
            VerifyField<uint64_t>(verifier, VT_EBPF_MIN_REUSE_NS, 8) &&
            VerifyField<uint32_t>(verifier, VT_EBPF_UAF_SCORE, 4) &&
+           VerifyField<uint32_t>(verifier, VT_EBPF_DOUBLE_FREE_COUNT, 4) &&
+           VerifyField<uint32_t>(verifier, VT_EBPF_SIZE_MISMATCH_COUNT, 4) &&
            verifier.EndTable();
   }
   ProgInfoRawT *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
@@ -2465,6 +2477,12 @@ struct ProgInfoRawBuilder {
   void add_ebpf_uaf_score(uint32_t ebpf_uaf_score) {
     fbb_.AddElement<uint32_t>(ProgInfoRaw::VT_EBPF_UAF_SCORE, ebpf_uaf_score, 0);
   }
+  void add_ebpf_double_free_count(uint32_t ebpf_double_free_count) {
+    fbb_.AddElement<uint32_t>(ProgInfoRaw::VT_EBPF_DOUBLE_FREE_COUNT, ebpf_double_free_count, 0);
+  }
+  void add_ebpf_size_mismatch_count(uint32_t ebpf_size_mismatch_count) {
+    fbb_.AddElement<uint32_t>(ProgInfoRaw::VT_EBPF_SIZE_MISMATCH_COUNT, ebpf_size_mismatch_count, 0);
+  }
   explicit ProgInfoRawBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -2488,11 +2506,15 @@ inline ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRaw(
     uint32_t ebpf_reuse_count = 0,
     uint32_t ebpf_rapid_reuse_count = 0,
     uint64_t ebpf_min_reuse_ns = 0,
-    uint32_t ebpf_uaf_score = 0) {
+    uint32_t ebpf_uaf_score = 0,
+    uint32_t ebpf_double_free_count = 0,
+    uint32_t ebpf_size_mismatch_count = 0) {
   ProgInfoRawBuilder builder_(_fbb);
   builder_.add_ebpf_min_reuse_ns(ebpf_min_reuse_ns);
   builder_.add_freshness(freshness);
   builder_.add_elapsed(elapsed);
+  builder_.add_ebpf_size_mismatch_count(ebpf_size_mismatch_count);
+  builder_.add_ebpf_double_free_count(ebpf_double_free_count);
   builder_.add_ebpf_uaf_score(ebpf_uaf_score);
   builder_.add_ebpf_rapid_reuse_count(ebpf_rapid_reuse_count);
   builder_.add_ebpf_reuse_count(ebpf_reuse_count);
@@ -2516,7 +2538,9 @@ inline ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRawDirect(
     uint32_t ebpf_reuse_count = 0,
     uint32_t ebpf_rapid_reuse_count = 0,
     uint64_t ebpf_min_reuse_ns = 0,
-    uint32_t ebpf_uaf_score = 0) {
+    uint32_t ebpf_uaf_score = 0,
+    uint32_t ebpf_double_free_count = 0,
+    uint32_t ebpf_size_mismatch_count = 0) {
   auto calls__ = calls ? _fbb.CreateVector<::flatbuffers::Offset<rpc::CallInfoRaw>>(*calls) : 0;
   auto extra_raw__ = extra_raw ? _fbb.CreateVector<::flatbuffers::Offset<rpc::CallInfoRaw>>(*extra_raw) : 0;
   return rpc::CreateProgInfoRaw(
@@ -2531,7 +2555,9 @@ inline ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRawDirect(
       ebpf_reuse_count,
       ebpf_rapid_reuse_count,
       ebpf_min_reuse_ns,
-      ebpf_uaf_score);
+      ebpf_uaf_score,
+      ebpf_double_free_count,
+      ebpf_size_mismatch_count);
 }
 
 ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRaw(::flatbuffers::FlatBufferBuilder &_fbb, const ProgInfoRawT *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
@@ -3618,7 +3644,9 @@ inline ProgInfoRawT::ProgInfoRawT(const ProgInfoRawT &o)
         ebpf_reuse_count(o.ebpf_reuse_count),
         ebpf_rapid_reuse_count(o.ebpf_rapid_reuse_count),
         ebpf_min_reuse_ns(o.ebpf_min_reuse_ns),
-        ebpf_uaf_score(o.ebpf_uaf_score) {
+        ebpf_uaf_score(o.ebpf_uaf_score),
+        ebpf_double_free_count(o.ebpf_double_free_count),
+        ebpf_size_mismatch_count(o.ebpf_size_mismatch_count) {
   calls.reserve(o.calls.size());
   for (const auto &calls_ : o.calls) { calls.emplace_back((calls_) ? new rpc::CallInfoRawT(*calls_) : nullptr); }
   extra_raw.reserve(o.extra_raw.size());
@@ -3637,6 +3665,8 @@ inline ProgInfoRawT &ProgInfoRawT::operator=(ProgInfoRawT o) FLATBUFFERS_NOEXCEP
   std::swap(ebpf_rapid_reuse_count, o.ebpf_rapid_reuse_count);
   std::swap(ebpf_min_reuse_ns, o.ebpf_min_reuse_ns);
   std::swap(ebpf_uaf_score, o.ebpf_uaf_score);
+  std::swap(ebpf_double_free_count, o.ebpf_double_free_count);
+  std::swap(ebpf_size_mismatch_count, o.ebpf_size_mismatch_count);
   return *this;
 }
 
@@ -3660,6 +3690,8 @@ inline void ProgInfoRaw::UnPackTo(ProgInfoRawT *_o, const ::flatbuffers::resolve
   { auto _e = ebpf_rapid_reuse_count(); _o->ebpf_rapid_reuse_count = _e; }
   { auto _e = ebpf_min_reuse_ns(); _o->ebpf_min_reuse_ns = _e; }
   { auto _e = ebpf_uaf_score(); _o->ebpf_uaf_score = _e; }
+  { auto _e = ebpf_double_free_count(); _o->ebpf_double_free_count = _e; }
+  { auto _e = ebpf_size_mismatch_count(); _o->ebpf_size_mismatch_count = _e; }
 }
 
 inline ::flatbuffers::Offset<ProgInfoRaw> ProgInfoRaw::Pack(::flatbuffers::FlatBufferBuilder &_fbb, const ProgInfoRawT* _o, const ::flatbuffers::rehasher_function_t *_rehasher) {
@@ -3681,6 +3713,8 @@ inline ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRaw(::flatbuffers::FlatB
   auto _ebpf_rapid_reuse_count = _o->ebpf_rapid_reuse_count;
   auto _ebpf_min_reuse_ns = _o->ebpf_min_reuse_ns;
   auto _ebpf_uaf_score = _o->ebpf_uaf_score;
+  auto _ebpf_double_free_count = _o->ebpf_double_free_count;
+  auto _ebpf_size_mismatch_count = _o->ebpf_size_mismatch_count;
   return rpc::CreateProgInfoRaw(
       _fbb,
       _calls,
@@ -3693,7 +3727,9 @@ inline ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRaw(::flatbuffers::FlatB
       _ebpf_reuse_count,
       _ebpf_rapid_reuse_count,
       _ebpf_min_reuse_ns,
-      _ebpf_uaf_score);
+      _ebpf_uaf_score,
+      _ebpf_double_free_count,
+      _ebpf_size_mismatch_count);
 }
 
 inline ExecResultRawT::ExecResultRawT(const ExecResultRawT &o)

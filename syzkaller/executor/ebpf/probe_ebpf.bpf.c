@@ -29,7 +29,7 @@ struct {
 } metrics SEC(".maps");
 
 // Hook: tracepoint/kmem/kfree
-// Record freed object pointer with timestamp.
+// Record freed object pointer with timestamp. Detect double-free.
 SEC("tracepoint/kmem/kfree")
 int trace_kfree(struct trace_event_raw_kfree *ctx)
 {
@@ -37,14 +37,20 @@ int trace_kfree(struct trace_event_raw_kfree *ctx)
 	if (ptr == 0)
 		return 0;
 
+	__u32 key = 0;
+	struct probe_metrics *m = bpf_map_lookup_elem(&metrics, &key);
+
+	// Double-free: ptr already in freed_objects (freed without intervening alloc)
+	__u64 *existing = bpf_map_lookup_elem(&freed_objects, &ptr);
+	if (existing && m)
+		__sync_fetch_and_add(&m->double_free_count, 1);
+
 	__u64 ts = bpf_ktime_get_ns();
 
 	// Record this freed pointer with its timestamp
 	bpf_map_update_elem(&freed_objects, &ptr, &ts, BPF_ANY);
 
 	// Update free count in metrics
-	__u32 key = 0;
-	struct probe_metrics *m = bpf_map_lookup_elem(&metrics, &key);
 	if (m)
 		__sync_fetch_and_add(&m->free_count, 1);
 
@@ -53,6 +59,7 @@ int trace_kfree(struct trace_event_raw_kfree *ctx)
 
 // Hook: tracepoint/kmem/kmalloc
 // Check if the returned pointer was recently freed → slab reuse detected.
+// Also detect size mismatch (cross-cache potential).
 SEC("tracepoint/kmem/kmalloc")
 int trace_kmalloc(struct trace_event_raw_kmalloc *ctx)
 {
@@ -67,6 +74,12 @@ int trace_kmalloc(struct trace_event_raw_kmalloc *ctx)
 
 	// Increment alloc count
 	__sync_fetch_and_add(&m->alloc_count, 1);
+
+	// Size mismatch: alloc >> req suggests cross-cache or slab waste
+	__u64 req = (__u64)ctx->bytes_req;
+	__u64 alloc = (__u64)ctx->bytes_alloc;
+	if (req > 0 && alloc > 2 * req && alloc >= 128)
+		__sync_fetch_and_add(&m->size_mismatch_count, 1);
 
 	// Check if this pointer was recently freed (slab reuse)
 	__u64 *free_ts = bpf_map_lookup_elem(&freed_objects, &ptr);

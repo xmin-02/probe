@@ -40,6 +40,8 @@ type Stats struct {
 	statEbpfAllocs          *stat.Val // PROBE: Phase 5
 	statEbpfReuses          *stat.Val // PROBE: Phase 5
 	statEbpfUafDetected     *stat.Val // PROBE: Phase 5
+	statEbpfDoubleFree      *stat.Val // PROBE: Phase 5
+	statEbpfSizeMismatch    *stat.Val // PROBE: Phase 5
 }
 
 type SyscallStats struct {
@@ -101,5 +103,9 @@ func newStats(target *prog.Target) Stats {
 			stat.Rate{}, stat.Graph("ebpf")),
 		statEbpfUafDetected: stat.New("ebpf uaf", "Non-crashing UAF patterns detected by eBPF",
 			stat.Graph("ebpf")),
+		statEbpfDoubleFree: stat.New("ebpf double-free", "Double-free events detected by eBPF",
+			stat.Graph("ebpf")),
+		statEbpfSizeMismatch: stat.New("ebpf size-mismatch", "Cross-cache size mismatches detected by eBPF",
+			stat.Rate{}, stat.Graph("ebpf")),
 	}
 }

@@ -211,6 +211,19 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 		if res.Info.EbpfReuseCount > 0 {
 			fuzzer.statEbpfReuses.Add(int(res.Info.EbpfReuseCount))
 		}
+		if res.Info.EbpfDoubleFreeCount > 0 {
+			fuzzer.statEbpfDoubleFree.Add(int(res.Info.EbpfDoubleFreeCount))
+		}
+		if res.Info.EbpfSizeMismatchCount > 0 {
+			fuzzer.statEbpfSizeMismatch.Add(int(res.Info.EbpfSizeMismatchCount))
+		}
+		// Double-free: always trigger Focus (cooldown via title dedup)
+		if res.Info.EbpfDoubleFreeCount > 0 && res.Status != queue.Hanged {
+			fuzzer.Logf(0, "PROBE: eBPF detected DOUBLE-FREE (count=%d) in %s",
+				res.Info.EbpfDoubleFreeCount, req.Prog)
+			fuzzer.AddFocusCandidate(req.Prog,
+				fmt.Sprintf("PROBE:ebpf-double-free:%s", req.Prog.String()), 1)
+		}
 		// Non-crashing UAF detection: high UAF score without crash → UAF-favorable pattern.
 		if res.Info.EbpfUafScore >= 70 && res.Status != queue.Hanged {
 			fuzzer.statEbpfUafDetected.Add(1)

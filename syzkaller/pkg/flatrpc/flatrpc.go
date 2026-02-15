@@ -3032,7 +3032,9 @@ type ProgInfoRawT struct {
 	EbpfReuseCount      uint32          `json:"ebpf_reuse_count"`
 	EbpfRapidReuseCount uint32          `json:"ebpf_rapid_reuse_count"`
 	EbpfMinReuseNs      uint64          `json:"ebpf_min_reuse_ns"`
-	EbpfUafScore        uint32          `json:"ebpf_uaf_score"`
+	EbpfUafScore             uint32          `json:"ebpf_uaf_score"`
+	EbpfDoubleFreeCount      uint32          `json:"ebpf_double_free_count"`
+	EbpfSizeMismatchCount    uint32          `json:"ebpf_size_mismatch_count"`
 }
 
 func (t *ProgInfoRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
@@ -3078,6 +3080,8 @@ func (t *ProgInfoRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	ProgInfoRawAddEbpfRapidReuseCount(builder, t.EbpfRapidReuseCount)
 	ProgInfoRawAddEbpfMinReuseNs(builder, t.EbpfMinReuseNs)
 	ProgInfoRawAddEbpfUafScore(builder, t.EbpfUafScore)
+	ProgInfoRawAddEbpfDoubleFreeCount(builder, t.EbpfDoubleFreeCount)
+	ProgInfoRawAddEbpfSizeMismatchCount(builder, t.EbpfSizeMismatchCount)
 	return ProgInfoRawEnd(builder)
 }
 
@@ -3105,6 +3109,8 @@ func (rcv *ProgInfoRaw) UnPackTo(t *ProgInfoRawT) {
 	t.EbpfRapidReuseCount = rcv.EbpfRapidReuseCount()
 	t.EbpfMinReuseNs = rcv.EbpfMinReuseNs()
 	t.EbpfUafScore = rcv.EbpfUafScore()
+	t.EbpfDoubleFreeCount = rcv.EbpfDoubleFreeCount()
+	t.EbpfSizeMismatchCount = rcv.EbpfSizeMismatchCount()
 }
 
 func (rcv *ProgInfoRaw) UnPack() *ProgInfoRawT {
@@ -3300,8 +3306,32 @@ func (rcv *ProgInfoRaw) MutateEbpfUafScore(n uint32) bool {
 	return rcv._tab.MutateUint32Slot(24, n)
 }
 
+func (rcv *ProgInfoRaw) EbpfDoubleFreeCount() uint32 {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(26))
+	if o != 0 {
+		return rcv._tab.GetUint32(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *ProgInfoRaw) MutateEbpfDoubleFreeCount(n uint32) bool {
+	return rcv._tab.MutateUint32Slot(26, n)
+}
+
+func (rcv *ProgInfoRaw) EbpfSizeMismatchCount() uint32 {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(28))
+	if o != 0 {
+		return rcv._tab.GetUint32(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *ProgInfoRaw) MutateEbpfSizeMismatchCount(n uint32) bool {
+	return rcv._tab.MutateUint32Slot(28, n)
+}
+
 func ProgInfoRawStart(builder *flatbuffers.Builder) {
-	builder.StartObject(11)
+	builder.StartObject(13)
 }
 func ProgInfoRawAddCalls(builder *flatbuffers.Builder, calls flatbuffers.UOffsetT) {
 	builder.PrependUOffsetTSlot(0, flatbuffers.UOffsetT(calls), 0)
@@ -3341,6 +3371,12 @@ func ProgInfoRawAddEbpfMinReuseNs(builder *flatbuffers.Builder, ebpfMinReuseNs u
 }
 func ProgInfoRawAddEbpfUafScore(builder *flatbuffers.Builder, ebpfUafScore uint32) {
 	builder.PrependUint32Slot(10, ebpfUafScore, 0)
+}
+func ProgInfoRawAddEbpfDoubleFreeCount(builder *flatbuffers.Builder, ebpfDoubleFreeCount uint32) {
+	builder.PrependUint32Slot(11, ebpfDoubleFreeCount, 0)
+}
+func ProgInfoRawAddEbpfSizeMismatchCount(builder *flatbuffers.Builder, ebpfSizeMismatchCount uint32) {
+	builder.PrependUint32Slot(12, ebpfSizeMismatchCount, 0)
 }
 func ProgInfoRawEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	return builder.EndObject()

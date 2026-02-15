@@ -96,6 +96,8 @@ struct probe_metrics {
 	__u64 reuse_count;       // slab reuses detected
 	__u64 rapid_reuse_count; // reuses < 100us
 	__u64 min_reuse_delay_ns; // fastest reuse (lower = more exploitable)
+	__u64 double_free_count;      // double-free detected (ptr freed twice without alloc)
+	__u64 size_mismatch_count;    // cross-cache: bytes_alloc > 2 * bytes_req
 };
 
 // License string
