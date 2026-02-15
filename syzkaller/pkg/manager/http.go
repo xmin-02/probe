@@ -1701,6 +1701,9 @@ func (serv *HTTPServer) httpAITriage(w http.ResponseWriter, r *http.Request) {
 
 				for i := len(cost.History) - 1; i >= 0; i-- {
 					h := cost.History[i]
+					if h.Type != "crash" && h.Type != "strategy" {
+						continue
+					}
 					data.History = append(data.History, UIAPICall{
 						Time:          h.Time,
 						Type:          h.Type,

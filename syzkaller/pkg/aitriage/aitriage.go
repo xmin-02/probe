@@ -398,6 +398,8 @@ func NewTriager(cfg mgrconfig.AITriageConfig, workdir string) (*Triager, error) 
 	// Phase 7e: Initialize cluster state if embedding is configured.
 	if t.embeddingClient != nil {
 		t.clusters = NewClusterState(workdir)
+		// Load embedding cost from disk (separate from LLM cost).
+		t.embeddingClient.cost = loadCostTrackerFile(filepath.Join(workdir, "ai-emb-cost.json"))
 	}
 	// Load existing cost tracker from disk.
 	t.cost = loadCostTracker(workdir)
@@ -406,6 +408,8 @@ func NewTriager(cfg mgrconfig.AITriageConfig, workdir string) (*Triager, error) 
 	if t.cost.TotalCalls == 0 {
 		t.recoverCostFromTriageResults()
 	}
+	// Restore console log buffer from disk.
+	t.loadLogBuffer()
 	return t, nil
 }
 
@@ -439,6 +443,39 @@ func (t *Triager) logf(format string, args ...interface{}) {
 	log.Logf(0, "PROBE: AI: %s", msg)
 	t.logMu.Lock()
 	t.logBuf = append(t.logBuf, LogEntry{Time: time.Now(), Message: msg})
+	if len(t.logBuf) > maxLogLines {
+		t.logBuf = t.logBuf[len(t.logBuf)-maxLogLines:]
+	}
+	t.logMu.Unlock()
+	// Persist log buffer to disk (async, best-effort).
+	go t.saveLogBuffer()
+}
+
+func (t *Triager) saveLogBuffer() {
+	t.logMu.Lock()
+	buf := make([]LogEntry, len(t.logBuf))
+	copy(buf, t.logBuf)
+	t.logMu.Unlock()
+	data, err := json.Marshal(buf)
+	if err != nil {
+		return
+	}
+	path := filepath.Join(t.workdir, "ai-log.json")
+	os.WriteFile(path, data, 0644)
+}
+
+func (t *Triager) loadLogBuffer() {
+	path := filepath.Join(t.workdir, "ai-log.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var entries []LogEntry
+	if json.Unmarshal(data, &entries) != nil {
+		return
+	}
+	t.logMu.Lock()
+	t.logBuf = entries
 	if len(t.logBuf) > maxLogLines {
 		t.logBuf = t.logBuf[len(t.logBuf)-maxLogLines:]
 	}
@@ -1232,7 +1269,14 @@ func (t *Triager) stepEmbeddings(ctx context.Context) {
 	}
 
 	crashes := t.GetCrashes()
-	pending := t.clusters.PendingCrashes(crashes)
+	// Filter out syzkaller-internal crashes (suppressed reports, executor failures, etc).
+	var filtered []CrashForAnalysis
+	for _, c := range crashes {
+		if !isSyzkallerInternalCrash(c.Title) {
+			filtered = append(filtered, c)
+		}
+	}
+	pending := t.clusters.PendingCrashes(filtered)
 	if len(pending) == 0 {
 		return
 	}
@@ -1269,6 +1313,9 @@ func (t *Triager) stepEmbeddings(ctx context.Context) {
 
 	_, clusters := t.clusters.Snapshot()
 	t.logf("[Embeddings] Done: %d total embeddings, %d clusters", len(t.clusters.Embeddings), len(clusters))
+
+	// Persist embedding cost to disk.
+	saveCostTrackerFile(filepath.Join(t.workdir, "ai-emb-cost.json"), t.embeddingClient.cost)
 }
 
 // EmbeddingCost returns embedding-specific cost snapshot (separate from LLM costs).
@@ -1466,6 +1513,31 @@ func saveCostTracker(workdir string, ct *CostTracker) {
 	path := filepath.Join(workdir, "ai-cost.json")
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		log.Logf(0, "PROBE: failed to save ai-cost.json: %v", err)
+	}
+}
+
+func loadCostTrackerFile(path string) *CostTracker {
+	ct := &CostTracker{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ct
+	}
+	if err := json.Unmarshal(data, ct); err != nil {
+		log.Logf(0, "PROBE: failed to parse %s: %v", filepath.Base(path), err)
+	}
+	return ct
+}
+
+func saveCostTrackerFile(path string, ct *CostTracker) {
+	ct.mu.Lock()
+	data, err := json.MarshalIndent(ct, "", "  ")
+	ct.mu.Unlock()
+	if err != nil {
+		log.Logf(0, "PROBE: failed to marshal cost tracker: %v", err)
+		return
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		log.Logf(0, "PROBE: failed to save %s: %v", filepath.Base(path), err)
 	}
 }
 
