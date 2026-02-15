@@ -337,13 +337,24 @@ Host (syz-manager)              Guest VM
 - **Bugfix (v2)**: Root cause was VM image missing bpffs mountpoint + loader hang potential. Fixed: `mkdir -p /sys/fs/bpf` before mount, `timeout 10` on loader to prevent hang blocking executor, loader output saved to `/tmp/probe-ebpf.log` for debugging. VM image fstab updated with bpffs entry. BPF header `accounted` field removed for kernel 6.1.20 compatibility.
 - **Bugfix (v3)**: `ebpf_init()` was called too early in `executor.cc` (before shmem fd operations), so `BPF_OBJ_GET` would steal fd 5/6 (`kMaxSignalFd`/`kCoverFilterFd`) when the runner didn't provide coverage filter. The `fcntl()` check then misidentified the BPF map fd as a shmem fd, causing `mmap` to fail on all VMs. Fixed: moved `ebpf_init()` to after all shmem fd operations (`mmap_input`, `mmap_output`, CoverFilter setup) in executor.cc exec mode. Also cleaned up diagnostic code: removed `/tmp/shmem-diag.txt` file writing from `shmem.h`, removed tier3 raw output logging from `manager.go`. Kept improved error message in `shmem.h` (with errno, fd, size info).
 - **Bugfix (v4)**: eBPF metrics were always 0 on the Go (manager) side despite BPF programs collecting data. Root cause: `close_fds()` in `common_linux.h` calls `close_range(3, MAX_FDS, 0)` which closes ALL fds >= 3 including the BPF map fd. The eBPF read in `finish_output()` happened AFTER `close_fds()` in a different process (runner), so `BPF_MAP_LOOKUP_ELEM` failed on the already-closed fd. Fixed: (1) exec child reads eBPF metrics BEFORE `close_fds()` and writes them to `OutputData` shared memory via atomic fields, (2) runner's `finish_output()` reads from shared memory instead of calling `ebpf_read_and_reset()` directly, (3) added `ebpf_init()` retry in `execute_one()` for late BPF deployment, (4) added `access()` check in `ebpf_init()` before `BPF_OBJ_GET`. Verified: alloc/free counts non-zero from first execution.
-- **Bugfix (v5)**: eBPF UAF score saturated to 100 for ALL programs over time (~5000+ executions). Root cause: `freed_objects` LRU map was never cleared between program executions, so freed pointers from program N appeared as "reuse" in program N+1, causing unbounded accumulation. Fixed: `ebpf_read_and_reset()` now iterates `freed_objects` map with `BPF_MAP_GET_NEXT_KEY` + `BPF_MAP_DELETE_ELEM` loop (up to 512 entries per reset) to clear stale entries. Opened pinned freed_objects map via `ebpf_open_pinned()` helper alongside metrics map.
+- **Bugfix (v5)**: eBPF UAF score saturated to 100 for ALL programs over time (~5000+ executions). Root cause: `freed_objects` LRU map was never cleared between program executions, so freed pointers from program N appeared as "reuse" in program N+1, causing unbounded accumulation. Fixed: `ebpf_read_and_reset()` now iterates `freed_objects` map with `BPF_MAP_GET_NEXT_KEY` + `BPF_MAP_DELETE_ELEM` loop (all 8192 entries per reset) to clear stale entries. Opened pinned freed_objects map via `ebpf_open_pinned()` helper alongside metrics map.
+- **Bugfix (v6)**: Saturation guard in `finish_output()` — if `reuse > 500` (physically impossible per single program execution), suppress scoring entirely. Prevents residual saturation from overwhelming Focus Mode.
 
 ### 5f. Fuzzer Feedback — **DONE**
 - `processResult()`: tracks `statEbpfAllocs`, `statEbpfReuses`, `statEbpfUafDetected`, `statEbpfDoubleFree`, `statEbpfSizeMismatch` stats
-- Non-crashing UAF detection: UAF score ≥ 70 triggers `AddFocusCandidate()` → Focus Mode (5-min cooldown)
-- **Double-free Focus**: Any double-free detection always triggers Focus Mode immediately (cooldown via title dedup)
+- Non-crashing UAF detection: UAF score ≥ 70 triggers `AddFocusCandidate()` → Focus Mode
+- **Double-free Focus**: Any double-free detection triggers Focus Mode
+- **Unified eBPF cooldown**: Both UAF and double-free Focus triggers share a single 5-min cooldown (`lastEbpfFocus` timestamp) to prevent Focus over-triggering
 - Stats visible in web dashboard: `ebpf reuses` (rate), `ebpf uaf` (count), `ebpf double-free` (count), `ebpf size-mismatch` (rate) — all on `ebpf` graph
+
+### 5g. Stability Hardening — **DONE**
+Five production stability fixes applied to fuzzer core:
+
+1. **eBPF saturation guard** (`executor.cc`): `reuse > 500` suppresses UAF scoring. Prevents residual freed_objects accumulation from causing all programs to score 100.
+2. **Candidates counter fix** (`fuzzer.go`): `InjectSeed()` and `InjectProgram()` no longer use `progCandidate` flag or increment `statCandidates`. AI-injected seeds are not corpus triage candidates — mixing them caused the counter to go negative over time.
+3. **Focus job cooldown** (`fuzzer.go`): `drainFocusPending()` enforces 2-min minimum between consecutive Focus jobs. Stale pending entries cleared on cooldown miss to prevent unbounded growth of the pending queue.
+4. **ChoiceTable RWMutex** (`fuzzer.go`): `ctMu` changed from `sync.Mutex` to `sync.RWMutex`. `ChoiceTable()` (read-only, called on every mutation) uses `RLock()` for better concurrency. Writes (`updateChoiceTable`) continue using exclusive `Lock()`.
+5. **focusTitles memory cap** (`fuzzer.go`): `focusTitles` dedup map capped at 10,000 entries. When exceeded, map is cleared and refilled from active Focus jobs only, preventing unbounded memory growth in long runs.
 
 ### Key Design Decisions
 - **Separate loader + executor reads**: Loader handles complex BPF loading (cilium/ebpf), executor does simple map reads (raw bpf() syscall). Clean separation.

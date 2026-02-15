@@ -336,13 +336,24 @@
 - **버그 수정 (v2)**: 근본 원인은 VM 이미지에 bpffs 마운트포인트 부재 + 로더 행(hang) 가능성. 수정: mount 전 `mkdir -p /sys/fs/bpf`, 로더에 `timeout 10`으로 행 방지, 로더 출력을 `/tmp/probe-ebpf.log`에 저장하여 디버깅 가능. VM 이미지 fstab에 bpffs 항목 추가. BPF 헤더에서 커널 6.1.20 호환성을 위해 `accounted` 필드 제거.
 - **버그 수정 (v3)**: `executor.cc`에서 `ebpf_init()`이 shmem fd 연산보다 먼저 호출되어, runner가 coverage filter를 제공하지 않을 때 `BPF_OBJ_GET`이 fd 5/6 (`kMaxSignalFd`/`kCoverFilterFd`)을 가로챔. `fcntl()` 검사가 BPF map fd를 shmem fd로 오인하여 모든 VM에서 `mmap` 실패 유발. 수정: executor.cc exec 모드에서 `ebpf_init()` 호출을 모든 shmem fd 연산(`mmap_input`, `mmap_output`, CoverFilter 설정) 이후로 이동. 진단 코드 정리: `shmem.h`에서 `/tmp/shmem-diag.txt` 파일 쓰기 제거, `manager.go`에서 tier3 원시 출력 로깅 제거. `shmem.h`의 개선된 에러 메시지(errno, fd, size 정보 포함)는 유지.
 - **버그 수정 (v4)**: Go(manager) 측에서 eBPF 메트릭이 항상 0으로 표시. BPF 프로그램은 데이터를 수집하고 있었음. 근본 원인: `common_linux.h`의 `close_fds()`가 `close_range(3, MAX_FDS, 0)`을 호출하여 BPF map fd를 포함한 fd >= 3 전부 닫음. `finish_output()`의 eBPF 읽기가 다른 프로세스(runner)에서 `close_fds()` 이후에 실행되어 이미 닫힌 fd에 대해 `BPF_MAP_LOOKUP_ELEM`이 실패. 수정: (1) exec 자식 프로세스가 `close_fds()` 전에 eBPF 메트릭을 읽어 `OutputData` 공유 메모리의 atomic 필드에 기록, (2) runner의 `finish_output()`이 `ebpf_read_and_reset()` 직접 호출 대신 공유 메모리에서 읽기, (3) 늦은 BPF 배포를 위해 `execute_one()`에 `ebpf_init()` 재시도 추가, (4) `ebpf_init()`에서 `BPF_OBJ_GET` 전 `access()` 검사 추가. 검증 완료: 첫 실행부터 alloc/free 카운트 비-0 확인.
-- **버그 수정 (v5)**: eBPF UAF 점수가 시간이 지나면 모든 프로그램에서 100으로 포화 (~5000회 이상 실행 후). 근본 원인: `freed_objects` LRU 맵이 프로그램 실행 간에 초기화되지 않아, 프로그램 N에서 해제된 포인터가 프로그램 N+1에서 "재사용"으로 감지되어 무한 축적. 수정: `ebpf_read_and_reset()`에서 `BPF_MAP_GET_NEXT_KEY` + `BPF_MAP_DELETE_ELEM` 루프 (리셋당 최대 512 엔트리)로 `freed_objects` 맵을 클리어. `ebpf_open_pinned()` 헬퍼로 metrics 맵과 함께 고정된 freed_objects 맵도 열기.
+- **버그 수정 (v5)**: eBPF UAF 점수가 시간이 지나면 모든 프로그램에서 100으로 포화 (~5000회 이상 실행 후). 근본 원인: `freed_objects` LRU 맵이 프로그램 실행 간에 초기화되지 않아, 프로그램 N에서 해제된 포인터가 프로그램 N+1에서 "재사용"으로 감지되어 무한 축적. 수정: `ebpf_read_and_reset()`에서 `BPF_MAP_GET_NEXT_KEY` + `BPF_MAP_DELETE_ELEM` 루프 (리셋당 8192 엔트리 전체)로 `freed_objects` 맵을 클리어. `ebpf_open_pinned()` 헬퍼로 metrics 맵과 함께 고정된 freed_objects 맵도 열기.
+- **버그 수정 (v6)**: `finish_output()`에 포화 방지 가드 추가 — `reuse > 500`이면 (단일 프로그램 실행에서 물리적으로 불가능한 수치) UAF 점수 산출을 억제. 잔여 freed_objects 축적이 Focus 모드를 과도하게 트리거하는 것을 방지.
 
 ### 5f. 퍼저 피드백 — **완료**
 - `processResult()`: `statEbpfAllocs`, `statEbpfReuses`, `statEbpfUafDetected`, `statEbpfDoubleFree`, `statEbpfSizeMismatch` 통계 추적
-- 비크래시 UAF 감지: UAF 점수 ≥ 70이면 `AddFocusCandidate()` → 포커스 모드 트리거 (5분 쿨다운)
-- **Double-free Focus**: double-free 감지 시 항상 즉시 포커스 모드 트리거 (title dedup으로 중복 방지)
+- 비크래시 UAF 감지: UAF 점수 ≥ 70이면 `AddFocusCandidate()` → 포커스 모드 트리거
+- **Double-free Focus**: double-free 감지 시 포커스 모드 트리거
+- **통합 eBPF 쿨다운**: UAF와 double-free Focus 트리거가 단일 5분 쿨다운 (`lastEbpfFocus` 타임스탬프)을 공유하여 Focus 과다 트리거 방지
 - 웹 대시보드에서 통계 확인: `ebpf reuses` (비율), `ebpf uaf` (카운트), `ebpf double-free` (카운트), `ebpf size-mismatch` (비율) — 모두 `ebpf` 그래프
+
+### 5g. 안정성 강화 — **완료**
+프로덕션 안정성을 위한 5가지 수정 사항:
+
+1. **eBPF 포화 가드** (`executor.cc`): `reuse > 500`이면 UAF 점수 산출 억제. 잔여 freed_objects 축적으로 모든 프로그램이 100점으로 평가되는 문제 방지.
+2. **Candidates 카운터 수정** (`fuzzer.go`): `InjectSeed()`와 `InjectProgram()`에서 `progCandidate` 플래그 및 `statCandidates` 증가 제거. AI 주입 시드는 코퍼스 트리아지 후보가 아님 — 혼합 시 시간 경과에 따라 카운터가 음수로 전환되는 버그 유발.
+3. **Focus 작업 쿨다운** (`fuzzer.go`): `drainFocusPending()`에 연속 Focus 작업 간 최소 2분 간격 적용. 쿨다운 미충족 시 오래된 pending 엔트리를 제거하여 pending 큐의 무한 성장 방지.
+4. **ChoiceTable RWMutex** (`fuzzer.go`): `ctMu`를 `sync.Mutex`에서 `sync.RWMutex`로 변경. `ChoiceTable()` (읽기 전용, 매 뮤테이션마다 호출)이 `RLock()`을 사용하여 동시성 향상. 쓰기(`updateChoiceTable`)는 배타적 `Lock()` 유지.
+5. **focusTitles 메모리 캡** (`fuzzer.go`): `focusTitles` 중복 제거 맵을 10,000개 항목으로 제한. 초과 시 맵을 초기화하고 활성 Focus 작업에서만 재충전하여 장시간 실행 시 무한 메모리 성장 방지.
 
 ### 주요 설계 결정
 - **로더와 executor 분리**: 로더가 복잡한 BPF 로딩 처리 (cilium/ebpf), executor는 간단한 맵 읽기 (raw bpf() syscall)
