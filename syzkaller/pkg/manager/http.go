@@ -2316,7 +2316,7 @@ func (serv *HTTPServer) httpAIAnalytics(w http.ResponseWriter, r *http.Request) 
 		data.EmbClusters = len(ed.Clusters)
 		totalEmb := len(ed.Embeddings)
 		if totalEmb > 0 && data.EmbClusters > 0 {
-			data.DedupRatio = 1.0 - float64(data.EmbClusters)/float64(totalEmb)
+			data.DedupRatio = (1.0 - float64(data.EmbClusters)/float64(totalEmb)) * 100
 		}
 	}
 	data.CombinedCostUSD = data.TotalCostUSD + data.EmbCostUSD
