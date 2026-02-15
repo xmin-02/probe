@@ -179,6 +179,16 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 		}
 		fuzzer.triageProgCall(req.Prog, res.Info.Extra, -1, &triage)
 
+		// PROBE: Phase 6 — feed DEzzer from async mutateProgRequest results.
+		// Only for statExecFuzz (mutateProgRequest); smashJob/focusJob feed directly.
+		if req.MutOp != "" && fuzzer.dezzer != nil && req.Stat == fuzzer.statExecFuzz {
+			covGain := 0
+			if len(triage) > 0 {
+				covGain = len(triage)
+			}
+			fuzzer.dezzer.RecordResult(req.MutOp, covGain)
+		}
+
 		if len(triage) != 0 {
 			// PROBE: Phase 6 — per-source coverage gain tracking.
 			switch req.Stat {

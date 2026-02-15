@@ -42,6 +42,10 @@ type Request struct {
 	// Important requests will be retried even from crashed VMs.
 	Important bool
 
+	// PROBE: Phase 6 — mutation operator name for DEzzer feedback.
+	// Set by mutateProgRequest, read by processResult to record coverage gain.
+	MutOp string
+
 	// Avoid specifies set of executors that are preferable to avoid when executing this request.
 	// The restriction is soft since there can be only one executor at all or available right now.
 	Avoid []ExecutorID

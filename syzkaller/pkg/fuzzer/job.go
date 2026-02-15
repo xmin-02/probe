@@ -78,14 +78,12 @@ func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 		case "remove":
 			fuzzer.statMutOpRemove.Add(1)
 		}
-		if fuzzer.dezzer != nil {
-			fuzzer.dezzer.RecordResult(op, 0) // covGain updated in processResult
-		}
 	}
 	return &queue.Request{
 		Prog:     newP,
 		ExecOpts: setFlags(flatrpc.ExecFlagCollectSignal),
 		Stat:     fuzzer.statExecFuzz,
+		MutOp:    op, // PROBE: carry operator to processResult for DEzzer feedback
 	}
 }
 
@@ -468,16 +466,13 @@ func (job *smashJob) run(fuzzer *Fuzzer) {
 
 	const iters = 25
 	rnd := fuzzer.rand()
+	lastSignalLen := fuzzer.Cover.MaxSignalLen()
 	for i := 0; i < iters; i++ {
 		p := job.p.Clone()
 		op := p.Mutate(rnd, prog.RecommendedCalls,
 			fuzzer.ChoiceTable(),
 			fuzzer.Config.NoMutateCalls,
 			fuzzer.Config.Corpus.Programs())
-		// PROBE: Phase 6 — track operator in DEzzer.
-		if op != "" && fuzzer.dezzer != nil {
-			fuzzer.dezzer.RecordResult(op, 0)
-		}
 		result := fuzzer.execute(job.exec, &queue.Request{
 			Prog:     p,
 			ExecOpts: setFlags(flatrpc.ExecFlagCollectSignal),
@@ -487,6 +482,16 @@ func (job *smashJob) run(fuzzer *Fuzzer) {
 			return
 		}
 		job.info.Execs.Add(1)
+		// PROBE: Phase 6 — feed actual coverage gain to DEzzer.
+		if op != "" && fuzzer.dezzer != nil {
+			currentSignalLen := fuzzer.Cover.MaxSignalLen()
+			covGain := 0
+			if currentSignalLen > lastSignalLen {
+				covGain = currentSignalLen - lastSignalLen
+				lastSignalLen = currentSignalLen
+			}
+			fuzzer.dezzer.RecordResult(op, covGain)
+		}
 	}
 }
 
