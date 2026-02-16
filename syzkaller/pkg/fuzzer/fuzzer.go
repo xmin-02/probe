@@ -5,13 +5,15 @@ package fuzzer
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"math"
 	"math/rand"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/syzkaller/pkg/corpus"
@@ -43,11 +45,18 @@ type Fuzzer struct {
 
 	// PROBE: Focus Mode state.
 	focusMu        sync.Mutex
-	focusTitles    map[string]bool // titles that have been focused (prevents re-focus)
-	focusActive    bool            // true while a focus job is running
-	focusTarget    string          // title of the current focus target
-	focusPending   []focusCandidate // queued candidates waiting for current focus to finish
-	lastEbpfFocus  time.Time      // cooldown for eBPF-triggered focus (prevent over-triggering)
+	focusDedup     *LRU[uint64, bool] // Phase 14 D21: hash-based dedup (cross-trigger)
+	focusActive    bool               // true while a focus job is running
+	focusTarget    string             // title of the current focus target
+	focusPending   []focusCandidate   // queued candidates waiting for current focus to finish
+	lastEbpfFocus  time.Time          // cooldown for eBPF-triggered focus (prevent over-triggering)
+	focusExecCount atomic.Int64       // total focus executions (for budget cap)
+	totalExecCount atomic.Int64       // total executions (for budget cap)
+
+	// Phase 14 D26: Epoch-based focus budget (5-min reset).
+	epochFocusExecs atomic.Int64 // focus execs in current epoch
+	epochTotalExecs atomic.Int64 // total execs in current epoch
+	epochResetTime  atomic.Value // time.Time of last epoch reset
 
 	// PROBE: AI mutation hints for focus jobs.
 	aiMutHintsMu sync.Mutex
@@ -63,8 +72,32 @@ type Fuzzer struct {
 	anamnesis   *AnamnesisAssessor // Phase 9e: exploit assessment
 
 	// PROBE: Phase 8f — ablation cache for effective component inference.
-	ablationMu    sync.Mutex
-	ablationCache map[string][]bool // crash title → essential mask
+	ablationCache *LRU[string, []bool] // LRU cache: crash title → essential mask (Phase 11g)
+
+	// PROBE: Phase 11i — LACE race detection Focus queue (independent from memory focus).
+	lastRaceFocus      time.Time    // 3-minute cooldown, separate from memory 5-min cooldown
+	raceThreshold      uint32       // starts at 0, auto-set to P90 after 24h
+	raceSchedThreshold uint32       // sched_switch threshold
+	raceFocusPending   []focusCandidate // independent race Focus queue (max 2)
+	raceStartTime      time.Time    // when LACE started (for 24h threshold logic)
+
+	// PROBE: Phase 11j — LinUCB delay pattern bandit (separate from DEzzer).
+	linucb       *LinUCB
+	delayedExecs atomic.Int64 // total executions with delay applied
+	delayTotal   atomic.Int64 // total executions considered for delay
+
+	// PROBE: Phase 11k — Global Thompson Sampling for schedule strategy.
+	schedTS *SchedTS
+
+	// PROBE: Phase 11l — Bayesian Optimization for hyperparameter tuning.
+	bayesOpt *BayesOpt
+
+	// PROBE: Phase 12 A2 — last mutation operator for pair TS conditioning.
+	lastMutOp atomic.Value // stores string; ~15ns per Load/Store
+
+	// PROBE: Phase 11b — Shannon entropy for coverage plateau detection.
+	coverageEntropy     atomic.Int64 // fixed-point x1000
+	entropyCheckCounter atomic.Int64
 
 	execQueues
 }
@@ -90,14 +123,36 @@ func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
 		// regenerating the table, we don't want to repeat it right away.
 		ctRegenerate: make(chan struct{}),
 
-		focusTitles: map[string]bool{},
+		focusDedup:    NewLRU[uint64, bool](10000),
+		ablationCache: NewLRU[string, []bool](2000),
+		raceStartTime: time.Now(),
 	}
+	f.epochResetTime.Store(time.Now()) // Phase 14 D26: Initialize epoch timer
 	f.dezzer = NewDEzzer(f.Logf)
-	f.ngramClient = NewNgramClient("", f.Logf) // Phase 8d: MOCK BiGRU client
+	f.dezzer.entropyRef = &f.coverageEntropy  // Phase 12 B1: lock-free entropy access
+	f.dezzer.configVersion = 2                 // Phase 14 W1-D4: v2 = 10 clusters (was 6)
+	f.dezzer.statPairTSFallback = f.statPairTSFallback // Phase 12 B4: pair TS fallback counter
+	f.dezzer.StartNormalization(ctx)           // Phase 12 A5: periodic normalization goroutine (60s)
+	f.dezzer.StartAutoExport(ctx, cfg.Workdir) // Phase 12 B2: periodic feature log export (2min)
+	f.linucb = NewLinUCB() // Phase 11j: LinUCB delay pattern bandit
+	f.schedTS = NewSchedTS()       // Phase 11k: Global Thompson Sampling for schedule strategy
+	f.bayesOpt = NewBayesOpt(cfg.Logf) // Phase 11l: Bayesian Optimization for hyperparameter tuning
+	// Phase 12 C3: BO warm-start — load saved params and set save path.
+	if cfg.Workdir != "" {
+		boPath := cfg.Workdir + "/bo-params.json"
+		f.bayesOpt.LoadState(boPath, "", 0) // kernelHash/corpusSize wired later when available
+		f.bayesOpt.SetSavePath(boPath)
+	}
+	// Phase 8d: MOCK BiGRU client (Phase 14 D3: use config addr if provided)
+	f.ngramClient = NewNgramClient(cfg.NgramAddr, f.Logf)
 	f.anamnesis = NewAnamnesisAssessor(f.Logf)  // Phase 9e: exploit assessment
 	go func() {
 		<-ctx.Done()
 		f.ngramClient.Stop()
+		// Phase 12 C3: Save BO state on shutdown.
+		if cfg.Workdir != "" && f.bayesOpt != nil {
+			f.bayesOpt.SaveState(cfg.Workdir + "/bo-params.json")
+		}
 	}()
 	f.execQueues = newExecQueues(f)
 	f.updateChoiceTable(nil)
@@ -145,7 +200,7 @@ func newExecQueues(fuzzer *Fuzzer) execQueues {
 		ret.triageCandidateQueue,
 		ret.candidateQueue,
 		ret.triageQueue,
-		queue.Alternate(ret.focusQueue, 2), // PROBE: focus every 2nd request
+		queue.Alternate(ret.focusQueue, 4), // PROBE: focus every 4th request (Phase 11g: 25% bandwidth)
 		queue.Alternate(ret.smashQueue, skipQueue),
 		queue.Callback(fuzzer.genFuzz),
 	)
@@ -181,6 +236,14 @@ func (fuzzer *Fuzzer) enqueue(executor queue.Executor, req *queue.Request, flags
 }
 
 func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags ProgFlags, attempt int) bool {
+	// Phase 11g: track execution counts for focus budget cap.
+	fuzzer.totalExecCount.Add(1)
+	fuzzer.epochTotalExecs.Add(1) // Phase 14 D26: epoch counter
+	if req.Stat == fuzzer.statExecFocus {
+		fuzzer.focusExecCount.Add(1)
+		fuzzer.epochFocusExecs.Add(1) // Phase 14 D26: epoch counter
+	}
+
 	// If we are already triaging this exact prog, this is flaky coverage.
 	// Hanged programs are harmful as they consume executor procs.
 	dontTriage := flags&progInTriage > 0 || res.Status == queue.Hanged
@@ -201,7 +264,10 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 			if len(triage) > 0 {
 				covGain = len(triage)
 			}
-			fuzzer.dezzer.RecordResult(req.MutOp, "", covGain, SourceMutate, -1)
+			// Phase 12 A2: Pass req.MutOp as prevOp for pair TS conditioning.
+			// Phase 12 B1: Pass actual cluster for FeatureTuple enrichment.
+			cluster := classifyProgram(req.Prog)
+			fuzzer.dezzer.RecordResult(req.MutOp, req.MutOp, req.SubOp, covGain, SourceMutate, cluster)
 		}
 
 		if len(triage) != 0 {
@@ -290,40 +356,68 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 		ebpfCooldownOk := time.Since(fuzzer.lastEbpfFocus) >= 5*time.Minute
 		fuzzer.focusMu.Unlock()
 
+		// PROBE: Best-of-N Focus trigger — only the highest-priority trigger from
+		// a single execution becomes a Focus candidate. Prevents cascading 4x bursts.
+		// Priority: 1=double-free, 2=priv-esc, 3=write-to-freed, 4=UAF, 5=cross-cache,
+		//           6=page-uaf, 7=fd-reuse, 8=anamnesis.
+		bestFocusPriority := 99
+		bestFocusTitle := ""
+		bestFocusTier := 1
+
 		// Double-free: trigger Focus (with cooldown to prevent over-triggering).
 		if res.Info.EbpfDoubleFreeCount > 0 && res.Status != queue.Hanged && ebpfCooldownOk {
 			fuzzer.Logf(0, "PROBE: eBPF detected DOUBLE-FREE (count=%d) in %s",
 				res.Info.EbpfDoubleFreeCount, req.Prog)
-			fuzzer.AddFocusCandidate(req.Prog,
-				fmt.Sprintf("PROBE:ebpf-double-free:%s", req.Prog.String()), 1)
+			if 1 < bestFocusPriority {
+				bestFocusPriority = 1
+				bestFocusTitle = fmt.Sprintf("PROBE:ebpf-double-free:%s", req.Prog.String())
+				bestFocusTier = 1
+			}
 		}
 		// Non-crashing UAF detection: high UAF score without crash → UAF-favorable pattern.
-		if res.Info.EbpfUafScore >= 70 && res.Status != queue.Hanged && ebpfCooldownOk {
+		// P0-2 fix: count UAF detections unconditionally (outside cooldown check).
+		if res.Info.EbpfUafScore >= 70 && res.Status != queue.Hanged {
 			fuzzer.statEbpfUafDetected.Add(1)
+		}
+		if res.Info.EbpfUafScore >= 70 && res.Status != queue.Hanged && ebpfCooldownOk {
 			fuzzer.Logf(0, "PROBE: eBPF detected UAF-favorable pattern (score=%d, reuse=%d, rapid=%d) in %s",
 				res.Info.EbpfUafScore, res.Info.EbpfReuseCount,
 				res.Info.EbpfRapidReuseCount, req.Prog)
-			fuzzer.AddFocusCandidate(req.Prog, fmt.Sprintf("PROBE:ebpf-uaf:%s", req.Prog.String()), 1)
+			if 4 < bestFocusPriority {
+				bestFocusPriority = 4
+				bestFocusTitle = fmt.Sprintf("PROBE:ebpf-uaf:%s", req.Prog.String())
+				bestFocusTier = 1
+			}
 		}
 		// Phase 7d: Privilege escalation — top priority focus trigger.
 		if res.Info.EbpfPrivEscCount > 0 && res.Status != queue.Hanged && ebpfCooldownOk {
 			fuzzer.Logf(0, "PROBE: eBPF detected PRIVILEGE ESCALATION (priv_esc=%d, commit_creds=%d) in %s",
 				res.Info.EbpfPrivEscCount, res.Info.EbpfCommitCredsCount, req.Prog)
-			fuzzer.AddFocusCandidate(req.Prog, "PROBE:priv-esc", 1) // tier 1 = highest priority
+			if 2 < bestFocusPriority {
+				bestFocusPriority = 2
+				bestFocusTitle = "PROBE:priv-esc"
+				bestFocusTier = 1
+			}
 		}
-		// Phase 7c: Precise cross-cache detection — trigger focus.
-		if res.Info.EbpfCrossCacheCount > 0 && res.Status != queue.Hanged && ebpfCooldownOk {
+		// Phase 7c: Precise cross-cache detection — trigger focus (min threshold 50).
+		if res.Info.EbpfCrossCacheCount >= 50 && res.Status != queue.Hanged && ebpfCooldownOk {
 			fuzzer.Logf(0, "PROBE: eBPF detected CROSS-CACHE reallocation (count=%d) in %s",
 				res.Info.EbpfCrossCacheCount, req.Prog)
-			fuzzer.AddFocusCandidate(req.Prog,
-				fmt.Sprintf("PROBE:ebpf-cross-cache:%s", req.Prog.String()), 1)
+			if 5 < bestFocusPriority {
+				bestFocusPriority = 5
+				bestFocusTitle = fmt.Sprintf("PROBE:ebpf-cross-cache:%s", req.Prog.String())
+				bestFocusTier = 1
+			}
 		}
 		// Phase 8a: Write to freed object — strong exploitability signal.
 		if res.Info.EbpfWriteToFreedCount > 0 && res.Status != queue.Hanged && ebpfCooldownOk {
 			fuzzer.Logf(0, "PROBE: eBPF detected WRITE-TO-FREED (count=%d, score=%d) in %s",
 				res.Info.EbpfWriteToFreedCount, res.Info.EbpfUafScore, req.Prog)
-			fuzzer.AddFocusCandidate(req.Prog,
-				fmt.Sprintf("PROBE:ebpf-write-to-freed:%s", req.Prog.String()), 1)
+			if 3 < bestFocusPriority {
+				bestFocusPriority = 3
+				bestFocusTitle = fmt.Sprintf("PROBE:ebpf-write-to-freed:%s", req.Prog.String())
+				bestFocusTier = 1
+			}
 		}
 		// Phase 9b: Page-level UAF / Dirty Pagetable detection.
 		if res.Info.EbpfPageAllocCount > 0 {
@@ -336,12 +430,20 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 		if res.Info.EbpfPageFreeCount > 0 {
 			fuzzer.statEbpfPageFrees.Add(int(res.Info.EbpfPageFreeCount))
 		}
-		if res.Info.EbpfPageUafScore >= 60 && res.Status != queue.Hanged && ebpfCooldownOk {
+		// Phase 14 D7: configurable threshold (default 60).
+		pageUafThreshold := fuzzer.Config.PageUafThreshold
+		if pageUafThreshold == 0 {
+			pageUafThreshold = 60
+		}
+		if res.Info.EbpfPageUafScore >= uint32(pageUafThreshold) && res.Status != queue.Hanged && ebpfCooldownOk {
 			fuzzer.statEbpfPageUaf.Add(1)
 			fuzzer.Logf(0, "PROBE: eBPF detected PAGE-LEVEL UAF pattern (page_score=%d, page_reuse=%d) in %s",
 				res.Info.EbpfPageUafScore, res.Info.EbpfPageReuseCount, req.Prog)
-			fuzzer.AddFocusCandidate(req.Prog,
-				fmt.Sprintf("PROBE:ebpf-page-uaf:%s", req.Prog.String()), 1)
+			if 6 < bestFocusPriority {
+				bestFocusPriority = 6
+				bestFocusTitle = fmt.Sprintf("PROBE:ebpf-page-uaf:%s", req.Prog.String())
+				bestFocusTier = 1
+			}
 		}
 
 		// Phase 9d: FD lifecycle tracking.
@@ -351,17 +453,110 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 		if res.Info.EbpfFdCloseCount > 0 {
 			fuzzer.statEbpfFdCloses.Add(int(res.Info.EbpfFdCloseCount))
 		}
-		if res.Info.EbpfFdReuseScore >= 60 && res.Status != queue.Hanged && ebpfCooldownOk {
+		// Phase 14 D7: configurable threshold (default 60).
+		fdReuseThreshold := fuzzer.Config.FdReuseThreshold
+		if fdReuseThreshold == 0 {
+			fdReuseThreshold = 60
+		}
+		if res.Info.EbpfFdReuseScore >= uint32(fdReuseThreshold) && res.Status != queue.Hanged && ebpfCooldownOk {
 			fuzzer.statEbpfFdReuse.Add(1)
 			fuzzer.Logf(0, "PROBE: eBPF detected FD REUSE pattern (fd_score=%d, fd_reuse=%d) in %s",
 				res.Info.EbpfFdReuseScore, res.Info.EbpfFdReuseCount, req.Prog)
-			fuzzer.AddFocusCandidate(req.Prog,
-				fmt.Sprintf("PROBE:ebpf-fd-reuse:%s", req.Prog.String()), 1)
+			if 7 < bestFocusPriority {
+				bestFocusPriority = 7
+				bestFocusTitle = fmt.Sprintf("PROBE:ebpf-fd-reuse:%s", req.Prog.String())
+				bestFocusTier = 1
+			}
 		}
 
 		// Phase 9c: Context-sensitive coverage diversity.
 		if res.Info.EbpfContextStacks > 0 {
 			fuzzer.statEbpfContextStacks.Add(int(res.Info.EbpfContextStacks))
+		}
+
+		// Phase 11i: LACE race condition detection.
+		if res.Info.EbpfLockContention > 0 {
+			fuzzer.statRaceLockContention.Add(int(res.Info.EbpfLockContention))
+		}
+		if res.Info.EbpfSchedSwitch > 0 {
+			fuzzer.statRaceSchedSwitch.Add(int(res.Info.EbpfSchedSwitch))
+		}
+		if res.Info.EbpfConcurrentAccess > 0 {
+			fuzzer.statRaceConcurrentAccess.Add(int(res.Info.EbpfConcurrentAccess))
+		}
+		// LACE race Focus trigger (independent 3-min cooldown, separate from memory 5-min).
+		// First 24 hours: threshold=0 (log all contention>0), after 24h use raceThreshold (P90).
+		if res.Info.EbpfLockContention > 0 && res.Status != queue.Hanged {
+			fuzzer.focusMu.Lock()
+			raceCooldownOk := time.Since(fuzzer.lastRaceFocus) >= 3*time.Minute
+			raceThresh := fuzzer.raceThreshold
+			fuzzer.focusMu.Unlock()
+
+			if res.Info.EbpfLockContention > raceThresh &&
+				res.Info.EbpfConcurrentAccess > 0 &&
+				raceCooldownOk {
+				fuzzer.statRaceCandidates.Add(1)
+				raceTitle := fmt.Sprintf("PROBE:lace-race:%s", req.Prog.String())
+				fuzzer.Logf(0, "PROBE: LACE race detected (lock_contention=%d, concurrent=%d, sched=%d) in %s",
+					res.Info.EbpfLockContention, res.Info.EbpfConcurrentAccess,
+					res.Info.EbpfSchedSwitch, req.Prog)
+				// Submit to race Focus queue (independent from memory focus).
+				fuzzer.focusMu.Lock()
+				fuzzer.lastRaceFocus = time.Now()
+				if len(fuzzer.raceFocusPending) < 2 {
+					fuzzer.raceFocusPending = append(fuzzer.raceFocusPending, focusCandidate{
+						prog: req.Prog.Clone(), title: raceTitle, tier: 1,
+					})
+				}
+				fuzzer.focusMu.Unlock()
+				// Also submit to the main best-of-N system with priority 9.
+				if 9 < bestFocusPriority {
+					bestFocusPriority = 9
+					bestFocusTitle = raceTitle
+					bestFocusTier = 1
+				}
+			}
+		}
+
+		// PROBE: Phase 11j — LinUCB delay feedback.
+		if fuzzer.linucb != nil && req.DelayPattern >= 0 {
+			features := fuzzer.buildDelayFeatures(req.Prog, req.Stat == fuzzer.statExecFocus)
+			reward := 0.0
+			// Reward: sched_switch activity + coverage gain indicates delay effectiveness.
+			if res.Info.EbpfSchedSwitch > 5 {
+				reward += 0.5
+			}
+			if len(triage) > 0 {
+				reward += 0.5
+			}
+			// Concurrent access is a strong signal of race window creation.
+			if res.Info.EbpfConcurrentAccess > 0 {
+				reward += 0.5
+			}
+			if reward > 1.0 {
+				reward = 1.0
+			}
+			fuzzer.linucb.Update(req.DelayPattern, features, reward)
+		}
+
+		// PROBE: Phase 11k — SchedTS feedback.
+		if fuzzer.schedTS != nil && req.SchedArm >= 0 {
+			reward := 0.0
+			if len(triage) > 0 {
+				reward = math.Min(float64(len(triage))/10.0, 1.0)
+			}
+			fuzzer.schedTS.Update(req.SchedArm, reward)
+		}
+
+		// PROBE: Phase 11l — periodic BO epoch check.
+		if fuzzer.bayesOpt != nil && fuzzer.bayesOpt.IsActive() {
+			covTotal := int64(fuzzer.Cover.MaxSignalLen())
+			if fuzzer.bayesOpt.CheckEpoch(covTotal) {
+				params := fuzzer.bayesOpt.GetCurrentParams()
+				fuzzer.applyBOParams(params)
+				fuzzer.statBOEpoch.Add(1)
+				fuzzer.statBORate.Add(int(fuzzer.bayesOpt.BOBestValue() * 1000))
+			}
 		}
 
 		// Phase 9 diagnostic: log raw page/FD/context metrics when non-trivial.
@@ -391,10 +586,32 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 				fuzzer.statAnamnesisFocused.Add(1)
 				fuzzer.Logf(0, "PROBE: Anamnesis exploit assessment: score=%d class=%d tier=%d [%s] in %s",
 					assessment.Score, assessment.Class, assessment.FocusTier, assessment.Summary, req.Prog)
-				fuzzer.AddFocusCandidate(req.Prog,
-					fmt.Sprintf("PROBE:anamnesis:%s", req.Prog.String()), assessment.FocusTier)
+				if 8 < bestFocusPriority {
+					bestFocusPriority = 8
+					bestFocusTitle = fmt.Sprintf("PROBE:anamnesis:%s", req.Prog.String())
+					bestFocusTier = assessment.FocusTier
+				}
+			}
+
+			// Phase 14 D9: Apply Anamnesis bonus to DEzzer mutation optimizer.
+			if assessment.Score >= 40 && req.MutOp != "" && fuzzer.dezzer != nil {
+				cluster := classifyProgram(req.Prog)
+				mult := 1.2
+				if assessment.ShouldFocus {
+					mult = 1.5
+				}
+				if assessment.FocusTier == 1 {
+					mult = 2.0
+				}
+				fuzzer.dezzer.RecordAnamnesisBonus(req.MutOp, cluster, mult)
 			}
 		}
+
+		// Submit only the single best Focus candidate from this execution.
+		if bestFocusTitle != "" {
+			fuzzer.AddFocusCandidate(req.Prog, bestFocusTitle, bestFocusTier)
+		}
+		_ = bestFocusPriority // used in comparisons above
 	}
 
 	// PROBE: DEzzer crash bonus — reward the operator that led to a crash.
@@ -425,6 +642,7 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 type Config struct {
 	Debug          bool
 	Corpus         *corpus.Corpus
+	Workdir        string // Phase 12 B2: workdir for auto-export feature log
 	Logf           func(level int, msg string, args ...any)
 	Snapshot       bool
 	Coverage       bool
@@ -437,6 +655,12 @@ type Config struct {
 	NewInputFilter func(call string) bool
 	PatchTest      bool
 	ModeKFuzzTest  bool
+
+	// PROBE Phase 14: D3 — ngram server address configuration.
+	NgramAddr string
+	// PROBE Phase 14: D7 — Page-UAF and FD-reuse thresholds.
+	PageUafThreshold int
+	FdReuseThreshold int
 }
 
 func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call int, triage *map[int]*triageCall) {
@@ -604,24 +828,38 @@ type focusCandidate struct {
 	tier  int
 }
 
+// Phase 14 D21+D27: Hash-based focus dedup with cross-trigger deduplication.
+// Hashes the program itself (not the title), so the same program is deduped
+// even if it triggers different exploit patterns (e.g., "double-free" vs "UAF").
+// This prevents redundant focus on semantically identical programs.
+func focusProgHash(p *prog.Prog) uint64 {
+	h := fnv.New64a()
+	data := p.Serialize()
+	h.Write(data)
+	return h.Sum64()
+}
+
 // PROBE: AddFocusCandidate queues a high-severity crash program for intensive mutation.
-// If another focus job is active, the candidate is queued (up to 8 pending).
-// Returns false only if the title was already focused.
+// If another focus job is active, the candidate is queued (up to 4 pending, Phase 11g).
+// Phase 14 D21+D27: Returns false if program hash was already focused (cross-trigger dedup).
 func (fuzzer *Fuzzer) AddFocusCandidate(p *prog.Prog, title string, tier int) bool {
 	fuzzer.focusMu.Lock()
 	defer fuzzer.focusMu.Unlock()
 
-	if fuzzer.focusTitles[title] {
+	hash := focusProgHash(p)
+	if fuzzer.focusDedup.Contains(hash) {
 		return false
 	}
 
 	// If a focus job is already running, queue this candidate.
 	if fuzzer.focusActive {
-		if len(fuzzer.focusPending) < 8 {
+		if len(fuzzer.focusPending) < 4 {
 			fuzzer.focusPending = append(fuzzer.focusPending, focusCandidate{
 				prog: p.Clone(), title: title, tier: tier,
 			})
 			fuzzer.Logf(0, "PROBE: focus queued '%v' (pending: %d)", title, len(fuzzer.focusPending))
+		} else {
+			fuzzer.statFocusDropped.Add(1)
 		}
 		return false
 	}
@@ -646,12 +884,9 @@ func (fuzzer *Fuzzer) AddFocusCandidate(p *prog.Prog, title string, tier int) bo
 
 // launchFocusJob starts a focus job (caller must hold focusMu).
 func (fuzzer *Fuzzer) launchFocusJob(p *prog.Prog, title string, tier int) {
-	// Prevent unbounded memory growth in long runs: if too many titles accumulated,
-	// reset the dedup set (allows re-focusing old titles, which is acceptable).
-	if len(fuzzer.focusTitles) > 10000 {
-		fuzzer.focusTitles = map[string]bool{}
-	}
-	fuzzer.focusTitles[title] = true
+	// Phase 14 D21: Store hash instead of title for cross-trigger dedup.
+	hash := focusProgHash(p)
+	fuzzer.focusDedup.Put(hash, true)
 	fuzzer.focusActive = true
 	fuzzer.focusTarget = title
 
@@ -677,6 +912,38 @@ func (fuzzer *Fuzzer) launchFocusJob(p *prog.Prog, title string, tier int) {
 // Called when a focus job completes. Enforces a 2-minute cooldown between
 // consecutive focus jobs to prevent resource starvation from over-triggering.
 func (fuzzer *Fuzzer) drainFocusPending() {
+	// Phase 14 D26: Epoch-based focus budget (5-min reset).
+	epochReset := fuzzer.epochResetTime.Load().(time.Time)
+	if time.Since(epochReset) > 5*time.Minute {
+		// Reset epoch counters every 5 minutes
+		fuzzer.epochFocusExecs.Store(0)
+		fuzzer.epochTotalExecs.Store(0)
+		fuzzer.epochResetTime.Store(time.Now())
+	}
+
+	// Check epoch budget first (30% cap per 5-min window)
+	epochTotal := fuzzer.epochTotalExecs.Load()
+	epochFocus := fuzzer.epochFocusExecs.Load()
+	if epochTotal > 100 && epochFocus*100/epochTotal > 30 {
+		fuzzer.statFocusBudgetSkip.Add(1)
+		time.AfterFunc(time.Minute, func() {
+			fuzzer.drainFocusPending()
+		})
+		return
+	}
+
+	// Phase 11g: Lifetime budget cap (secondary guardrail) — skip if focus exceeds 30% of total executions.
+	total := fuzzer.totalExecCount.Load()
+	focusExecs := fuzzer.focusExecCount.Load()
+	if total > 1000 && focusExecs*100/total > 30 {
+		fuzzer.statFocusBudgetSkip.Add(1)
+		// Retry after 1 minute.
+		time.AfterFunc(time.Minute, func() {
+			fuzzer.drainFocusPending()
+		})
+		return
+	}
+
 	fuzzer.focusMu.Lock()
 	defer fuzzer.focusMu.Unlock()
 
@@ -696,8 +963,9 @@ func (fuzzer *Fuzzer) drainFocusPending() {
 	for len(fuzzer.focusPending) > 0 {
 		c := fuzzer.focusPending[0]
 		fuzzer.focusPending = fuzzer.focusPending[1:]
-		if fuzzer.focusTitles[c.title] {
-			continue // already focused
+		hash := focusProgHash(c.prog)
+		if fuzzer.focusDedup.Contains(hash) {
+			continue // already focused (D21+D27: cross-trigger dedup)
 		}
 		fuzzer.launchFocusJob(c.prog, c.title, c.tier)
 		fuzzer.lastEbpfFocus = time.Now()
@@ -836,23 +1104,32 @@ func (fuzzer *Fuzzer) InjectSeed(progText string) error {
 // Accepts aitriage.MutationHints via interface{} to avoid import cycle.
 // The hints struct must have SpliceWeight, InsertWeight, MutateArgWeight, RemoveWeight float64 fields.
 func (fuzzer *Fuzzer) SetAIMutationHints(hints interface{}) {
-	// Extract fields via JSON round-trip to avoid import cycle with aitriage.
+	// Extract fields via type assertion to avoid import cycle with aitriage.
 	type mutHints struct {
-		SpliceWeight    float64 `json:"splice_weight"`
-		InsertWeight    float64 `json:"insert_weight"`
-		MutateArgWeight float64 `json:"mutate_arg_weight"`
-		RemoveWeight    float64 `json:"remove_weight"`
-		Reason          string  `json:"reason"`
+		SpliceWeight    float64
+		InsertWeight    float64
+		MutateArgWeight float64
+		RemoveWeight    float64
+		Reason          string
 	}
-	data, err := json.Marshal(hints)
-	if err != nil {
-		fuzzer.Logf(0, "PROBE: AI mutation hints marshal error: %v", err)
+	// Type assert and copy fields directly
+	src, ok := hints.(struct {
+		SpliceWeight    float64
+		InsertWeight    float64
+		MutateArgWeight float64
+		RemoveWeight    float64
+		Reason          string
+	})
+	if !ok {
+		fuzzer.Logf(0, "PROBE: AI mutation hints type assertion failed")
 		return
 	}
-	var mh mutHints
-	if err := json.Unmarshal(data, &mh); err != nil {
-		fuzzer.Logf(0, "PROBE: AI mutation hints unmarshal error: %v", err)
-		return
+	mh := mutHints{
+		SpliceWeight:    src.SpliceWeight,
+		InsertWeight:    src.InsertWeight,
+		MutateArgWeight: src.MutateArgWeight,
+		RemoveWeight:    src.RemoveWeight,
+		Reason:          src.Reason,
 	}
 
 	defaults := prog.DefaultMutateOpts
@@ -958,25 +1235,13 @@ func (fuzzer *Fuzzer) FocusResults() []FocusJobResult {
 // Phase 8f: Ablation cache for effective component inference.
 // Maps crash title → essential syscall mask (true = essential for crash reproduction).
 func (fuzzer *Fuzzer) getOrComputeAblation(exec queue.Executor, p *prog.Prog, title string, rnd *rand.Rand) []bool {
-	fuzzer.ablationMu.Lock()
-	if cached, ok := fuzzer.ablationCache[title]; ok {
-		fuzzer.ablationMu.Unlock()
+	// Phase 11g: Use LRU cache (automatic eviction, no manual reset).
+	if cached, ok := fuzzer.ablationCache.Get(title); ok {
 		return cached
 	}
-	fuzzer.ablationMu.Unlock()
 
 	result := fuzzer.computeAblation(exec, p, rnd)
-
-	fuzzer.ablationMu.Lock()
-	if fuzzer.ablationCache == nil {
-		fuzzer.ablationCache = make(map[string][]bool)
-	}
-	// Limit cache size to prevent unbounded growth.
-	if len(fuzzer.ablationCache) > 1000 {
-		fuzzer.ablationCache = make(map[string][]bool)
-	}
-	fuzzer.ablationCache[title] = result
-	fuzzer.ablationMu.Unlock()
+	fuzzer.ablationCache.Put(title, result)
 
 	essentialCount := 0
 	for _, e := range result {
@@ -1157,12 +1422,16 @@ func (fuzzer *Fuzzer) recordObjectiveReward(info *flatrpc.ProgInfo, covGain int)
 
 // Phase 8e: Kernel subsystem cluster constants.
 const (
-	ClusterFS     = 0
-	ClusterNet    = 1
-	ClusterMM     = 2
-	ClusterIPC    = 3
-	ClusterDevice = 4
-	ClusterOther  = 5
+	ClusterFS      = 0
+	ClusterNet     = 1
+	ClusterMM      = 2
+	ClusterIPC     = 3
+	ClusterDevice  = 4
+	ClusterOther   = 5
+	ClusterIOURING = 6
+	ClusterBPF     = 7
+	ClusterKEYCTL  = 8
+	ClusterOther2  = 9
 )
 
 // classifyProgram determines the dominant kernel subsystem cluster for a program.
@@ -1181,11 +1450,17 @@ func classifyProgram(p *prog.Prog) int {
 			counts[ClusterIPC]++
 		case isDevice(name):
 			counts[ClusterDevice]++
+		case isIOURING(name):
+			counts[ClusterIOURING]++
+		case isBPF(name):
+			counts[ClusterBPF]++
+		case isKEYCTL(name):
+			counts[ClusterKEYCTL]++
 		default:
-			counts[ClusterOther]++
+			counts[ClusterOther2]++
 		}
 	}
-	best := ClusterOther
+	best := ClusterOther2
 	for i, c := range counts {
 		if c > counts[best] {
 			best = i
@@ -1209,7 +1484,7 @@ func isFS(name string) bool {
 		strings.HasPrefix(name, "readlink") || strings.HasPrefix(name, "getdents") ||
 		strings.HasPrefix(name, "pread") || strings.HasPrefix(name, "pwrite") ||
 		strings.HasPrefix(name, "sendfile") || strings.HasPrefix(name, "splice") ||
-		strings.HasPrefix(name, "copy_file_range") || strings.HasPrefix(name, "io_uring")
+		strings.HasPrefix(name, "copy_file_range")
 }
 
 func isNet(name string) bool {
@@ -1244,7 +1519,20 @@ func isIPC(name string) bool {
 }
 
 func isDevice(name string) bool {
-	return strings.HasPrefix(name, "ioctl") || strings.Contains(name, "$dev")
+	// Phase 12 D3: Add "$dev_" for broader device-specific opens (e.g., syz_open_dev$dev_snd).
+	return strings.HasPrefix(name, "ioctl") || strings.Contains(name, "$dev") || strings.Contains(name, "$dev_")
+}
+
+func isIOURING(name string) bool {
+	return strings.HasPrefix(name, "io_uring") || strings.HasPrefix(name, "syz_io_uring")
+}
+
+func isBPF(name string) bool {
+	return strings.HasPrefix(name, "bpf$") || strings.HasPrefix(name, "syz_bpf")
+}
+
+func isKEYCTL(name string) bool {
+	return strings.HasPrefix(name, "keyctl$") || strings.HasPrefix(name, "add_key$") || strings.HasPrefix(name, "request_key$")
 }
 
 // NgramClient returns the MOCK BiGRU client for external use (retrain, etc).
@@ -1259,6 +1547,114 @@ func (fuzzer *Fuzzer) DEzzerSnapshot() *DEzzerSnapshot {
 	}
 	snap := fuzzer.dezzer.Snapshot()
 	return &snap
+}
+
+// Phase 11b: computeCoverageEntropy calculates Shannon entropy of coverage distribution
+// across syscall categories. Low entropy (< 0.3) indicates coverage plateau.
+func (fuzzer *Fuzzer) computeCoverageEntropy() float64 {
+	counts := [numClusters]float64{}
+	total := 0.0
+	for _, p := range fuzzer.Config.Corpus.Programs() {
+		c := classifyProgram(p)
+		counts[c]++
+		total++
+	}
+	if total == 0 {
+		return 0
+	}
+	var entropy float64
+	for _, count := range counts {
+		if count > 0 {
+			p := count / total
+			entropy -= p * math.Log2(p)
+		}
+	}
+	// Store as fixed-point x1000 for atomic access.
+	newVal := int64(entropy * 1000)
+	oldVal := fuzzer.coverageEntropy.Swap(newVal)
+	// Update stat by adding the delta.
+	fuzzer.statCoverageEntropy.Add(int(newVal - oldVal))
+	return entropy
+}
+
+// CoverageEntropy returns the last computed Shannon entropy (fixed-point x1000).
+func (fuzzer *Fuzzer) CoverageEntropy() int64 {
+	return fuzzer.coverageEntropy.Load()
+}
+
+// applyBOParams applies Bayesian Optimization hyperparameters.
+// Phase 12 C1: Extended from 5 to 8 parameters with EMA transition for decay changes.
+func (fuzzer *Fuzzer) applyBOParams(params [boNumParams]float64) {
+	// param[0]: delayInjectionRate — stored for use in mutateProgRequest
+	// param[1]: focusBudgetFrac — not directly settable (TODO: Phase 14)
+	// param[2]: smashExploreProb — not directly settable (TODO: Phase 14)
+	// param[3]: cusumThreshold — apply to DEzzer
+	// param[4]: deflakeMaxRuns — stored for use in triage
+	// param[5]: dezzerDecayFactor — apply to DEzzer (EMA transition)
+	// param[6]: dezzerTSDeltaLimit — apply to DEzzer
+	// param[7]: linucbAlpha — apply to LinUCB
+
+	// Pause CUSUM for 60s during parameter transition.
+	if fuzzer.dezzer != nil {
+		fuzzer.dezzer.PauseCUSUM(60 * time.Second)
+		// Phase 12 C1: Apply decay factor and TS delta limit with EMA transition.
+		fuzzer.dezzer.SetBOOverrides(params[5], params[6])
+	}
+
+	// Phase 12 C1: Apply LinUCB alpha.
+	if fuzzer.linucb != nil {
+		fuzzer.linucb.SetAlpha(params[7])
+	}
+
+	fuzzer.Logf(0, "PROBE: BO params applied: delay=%.2f focus=%.2f smash=%.2f cusum=%.1f deflake=%.0f decay=%.3f tsLimit=%.3f lucbAlpha=%.2f",
+		params[0], params[1], params[2], params[3], params[4],
+		params[5], params[6], params[7])
+}
+
+// PROBE: Phase 11j — buildDelayFeatures constructs the LinUCB feature vector from program + eBPF metrics.
+// Feature vector (d=8): [prog_len, lock_syscall_ratio, ebpf_contention, ebpf_concurrent,
+//   sched_switches, coverage_delta, prog_category, is_focus]
+func (fuzzer *Fuzzer) buildDelayFeatures(p *prog.Prog, isFocus bool) []float64 {
+	features := make([]float64, linucbDim)
+
+	// Feature 0: program length (normalized to ~0-1 range).
+	features[0] = math.Min(float64(len(p.Calls))/float64(prog.RecommendedCalls), 2.0)
+
+	// Feature 1: lock-related syscall ratio.
+	lockCount := 0
+	for _, c := range p.Calls {
+		if isLockSyscall(c.Meta.Name) {
+			lockCount++
+		}
+	}
+	if len(p.Calls) > 0 {
+		features[1] = float64(lockCount) / float64(len(p.Calls))
+	}
+
+	// Features 2-4: eBPF race metrics (from recent stats, normalized).
+	features[2] = math.Min(float64(fuzzer.statRaceLockContention.Val())/100.0, 1.0)
+	features[3] = math.Min(float64(fuzzer.statRaceConcurrentAccess.Val())/100.0, 1.0)
+	features[4] = math.Min(float64(fuzzer.statRaceSchedSwitch.Val())/100.0, 1.0)
+
+	// Feature 5: coverage delta (recent coverage entropy as proxy).
+	features[5] = float64(fuzzer.coverageEntropy.Load()) / 3000.0 // entropy x1000, max ~2.5
+
+	// Feature 6: program category (cluster).
+	features[6] = float64(classifyProgram(p)) / float64(numClusters)
+
+	// Feature 7: is focus execution.
+	if isFocus {
+		features[7] = 1.0
+	}
+
+	return features
+}
+
+// isLockSyscall returns true if the syscall name indicates a lock-related operation.
+func isLockSyscall(name string) bool {
+	return strings.Contains(name, "mutex") || strings.Contains(name, "lock") ||
+		strings.Contains(name, "futex") || strings.Contains(name, "flock") ||
+		strings.Contains(name, "semop") || strings.Contains(name, "semtimedop")
 }
 
 func setFlags(execFlags flatrpc.ExecFlag) flatrpc.ExecOpts {

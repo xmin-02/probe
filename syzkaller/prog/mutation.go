@@ -37,6 +37,7 @@ var DefaultMutateOpts = MutateOpts{
 	InsertWeight:     100,
 	MutateArgWeight:  100,
 	RemoveCallWeight: 10,
+	ReorderWeight:    0, // PROBE: Phase 11j — disabled by default, fuzzer enables via ACTOR
 }
 
 type MutateOpts struct {
@@ -47,14 +48,19 @@ type MutateOpts struct {
 	InsertWeight       int
 	MutateArgWeight    int
 	RemoveCallWeight   int
+	ReorderWeight      int // PROBE: Phase 11j — weight for reorderConcurrent operator
 	// PROBE: Phase 8d — optional BiGRU prediction callback for insertCall().
 	// Takes the current call names context and returns (predicted_syscall_name, confidence).
 	// If nil or returns ("", 0), the default ChoiceTable selection is used.
 	PredictCall func(calls []string) (string, float64)
+	// PROBE: Phase 12 B4 — sub-op selection callback for two-level architecture.
+	// Takes parentOp name, returns sub-op name. If nil, no sub-op selection.
+	// Uses func to avoid circular import (prog/ cannot import pkg/fuzzer/).
+	SubOpSelector func(parentOp string) string
 }
 
 func (o MutateOpts) weight() int {
-	return o.SquashWeight + o.SpliceWeight + o.InsertWeight + o.MutateArgWeight + o.RemoveCallWeight
+	return o.SquashWeight + o.SpliceWeight + o.InsertWeight + o.MutateArgWeight + o.RemoveCallWeight + o.ReorderWeight
 }
 
 func (p *Prog) MutateWithOpts(rs rand.Source, ncalls int, ct *ChoiceTable, noMutate map[int]bool,
@@ -111,9 +117,18 @@ func (p *Prog) MutateWithOpts(rs rand.Source, ncalls int, ct *ChoiceTable, noMut
 			}
 			continue
 		}
-		ok = ctx.removeCall()
+		val -= opts.RemoveCallWeight
+		if val < 0 {
+			ok = ctx.removeCall()
+			if ok {
+				lastOp = "remove"
+			}
+			continue
+		}
+		// PROBE: Phase 11j — reorderConcurrent operator
+		ok = ctx.reorderConcurrent()
 		if ok {
-			lastOp = "remove"
+			lastOp = "reorder"
 		}
 	}
 	p.sanitizeFix()
@@ -1026,5 +1041,255 @@ func storeInt(data []byte, v uint64, size int) {
 		binary.LittleEndian.PutUint64(data, v)
 	default:
 		panic(fmt.Sprintf("storeInt: bad size %v", size))
+	}
+}
+
+// PROBE: Phase 11j — reorderConcurrent swaps two independent calls to explore
+// concurrency-sensitive orderings for race condition detection.
+func (ctx *mutator) reorderConcurrent() bool {
+	p, r := ctx.p, ctx.r
+	n := len(p.Calls)
+	if n < 3 {
+		return false
+	}
+
+	deps := analyzeDependencies(p)
+
+	// For large programs, use spectral partitioning to find independent blocks.
+	if n >= 15 {
+		parts := p.getOrComputePartitions(deps)
+		if len(parts) >= 2 && len(parts[0]) > 0 && len(parts[1]) > 0 {
+			// Pick one call from each partition and swap them.
+			i := parts[0][r.Intn(len(parts[0]))]
+			j := parts[1][r.Intn(len(parts[1]))]
+			if i > j {
+				i, j = j, i
+			}
+			if !deps[i][j] && !deps[j][i] {
+				p.Calls[i], p.Calls[j] = p.Calls[j], p.Calls[i]
+				p.dependencyPartitions = nil
+				p.sanitizeFix()
+				p.debugValidate()
+				return true
+			}
+		}
+	}
+
+	// Brute-force: collect all independent pairs and pick one at random.
+	type pair struct{ i, j int }
+	var indep []pair
+	for i := 0; i < n; i++ {
+		for j := i + 1; j < n; j++ {
+			if !deps[i][j] && !deps[j][i] {
+				indep = append(indep, pair{i, j})
+			}
+		}
+	}
+	if len(indep) == 0 {
+		return false
+	}
+
+	chosen := indep[r.Intn(len(indep))]
+	p.Calls[chosen.i], p.Calls[chosen.j] = p.Calls[chosen.j], p.Calls[chosen.i]
+	p.dependencyPartitions = nil
+	p.sanitizeFix()
+	p.debugValidate()
+	return true
+}
+
+// analyzeDependencies builds an n*n dependency matrix for a program.
+// deps[i][j] == true means call j depends on a resource produced by call i.
+func analyzeDependencies(p *Prog) [][]bool {
+	n := len(p.Calls)
+	deps := make([][]bool, n)
+	for i := range deps {
+		deps[i] = make([]bool, n)
+	}
+
+	// Map every ResultArg (return values AND inner output args) to its call index.
+	// Only tracking c.Ret misses dependencies through struct output fields,
+	// which causes "no copyout index" panics after reorder.
+	argMap := make(map[*ResultArg]int)
+	for i, c := range p.Calls {
+		if c.Ret != nil {
+			argMap[c.Ret] = i
+		}
+		ForeachArg(c, func(arg Arg, _ *ArgCtx) {
+			if a, ok := arg.(*ResultArg); ok {
+				argMap[a] = i
+			}
+		})
+	}
+
+	// For each call j, check if any of its arguments reference a ResultArg from call i.
+	for j, c := range p.Calls {
+		ForeachArg(c, func(arg Arg, _ *ArgCtx) {
+			a, ok := arg.(*ResultArg)
+			if !ok || a.Res == nil {
+				return
+			}
+			if i, found := argMap[a.Res]; found && i != j {
+				deps[i][j] = true
+			}
+		})
+	}
+
+	// Transitive closure: if i->k and k->j, then i->j.
+	for k := 0; k < n; k++ {
+		for i := 0; i < n; i++ {
+			if !deps[i][k] {
+				continue
+			}
+			for j := 0; j < n; j++ {
+				if deps[k][j] {
+					deps[i][j] = true
+				}
+			}
+		}
+	}
+
+	return deps
+}
+
+// getOrComputePartitions returns cached spectral partitions or computes them.
+func (p *Prog) getOrComputePartitions(deps [][]bool) [][]int {
+	if p.dependencyPartitions != nil {
+		return p.dependencyPartitions
+	}
+	p.dependencyPartitions = spectralPartition(deps)
+	return p.dependencyPartitions
+}
+
+// spectralPartition uses the Fiedler vector (2nd smallest eigenvector of the
+// graph Laplacian) to partition calls into two independent groups.
+// Uses power iteration with deflation -- no external libraries.
+func spectralPartition(deps [][]bool) [][]int {
+	n := len(deps)
+	if n < 2 {
+		return [][]int{{0}}
+	}
+
+	// Build symmetric adjacency: A[i][j] = 1 if deps[i][j] || deps[j][i].
+	adj := make([][]float64, n)
+	for i := range adj {
+		adj[i] = make([]float64, n)
+	}
+	for i := 0; i < n; i++ {
+		for j := i + 1; j < n; j++ {
+			if deps[i][j] || deps[j][i] {
+				adj[i][j] = 1
+				adj[j][i] = 1
+			}
+		}
+	}
+
+	// Laplacian L = D - A.
+	lap := make([][]float64, n)
+	for i := range lap {
+		lap[i] = make([]float64, n)
+		deg := 0.0
+		for j := 0; j < n; j++ {
+			deg += adj[i][j]
+			lap[i][j] = -adj[i][j]
+		}
+		lap[i][i] = deg
+	}
+
+	// Power iteration to find the largest eigenvector of (maxEig*I - L),
+	// which corresponds to the smallest eigenvector of L.
+	// First find approximate largest eigenvalue (max degree is an upper bound).
+	maxEig := 0.0
+	for i := 0; i < n; i++ {
+		if lap[i][i] > maxEig {
+			maxEig = lap[i][i]
+		}
+	}
+	maxEig += 1.0 // safety margin
+
+	// Shifted matrix M = maxEig*I - L (largest eigvec of M = smallest of L).
+	m := make([][]float64, n)
+	for i := range m {
+		m[i] = make([]float64, n)
+		for j := 0; j < n; j++ {
+			m[i][j] = -lap[i][j]
+		}
+		m[i][i] += maxEig
+	}
+
+	// Find the top eigenvector (corresponds to constant vector / eigenvalue 0 of L).
+	v1 := powerIteration(m, n, nil)
+
+	// Deflate: M' = M - lambda1 * v1 * v1^T. Since v1 is ~constant,
+	// we just project out the v1 component from subsequent iterations.
+	fiedler := powerIteration(m, n, v1)
+
+	// Partition by sign of Fiedler vector.
+	var part0, part1 []int
+	for i := 0; i < n; i++ {
+		if fiedler[i] >= 0 {
+			part0 = append(part0, i)
+		} else {
+			part1 = append(part1, i)
+		}
+	}
+
+	if len(part0) == 0 || len(part1) == 0 {
+		// Degenerate: all in one partition.
+		return [][]int{part0, part1}
+	}
+
+	return [][]int{part0, part1}
+}
+
+// powerIteration computes the dominant eigenvector of matrix m.
+// If deflateVec is non-nil, the component along deflateVec is removed each iteration.
+func powerIteration(m [][]float64, n int, deflateVec []float64) []float64 {
+	v := make([]float64, n)
+	// Initialize with alternating values to avoid starting in the null space.
+	for i := range v {
+		v[i] = float64(i%3) - 1.0
+	}
+	normalize(v)
+
+	for iter := 0; iter < 100; iter++ {
+		// w = M * v
+		w := make([]float64, n)
+		for i := 0; i < n; i++ {
+			sum := 0.0
+			for j := 0; j < n; j++ {
+				sum += m[i][j] * v[j]
+			}
+			w[i] = sum
+		}
+
+		// Deflate: remove component along deflateVec.
+		if deflateVec != nil {
+			dot := 0.0
+			for i := 0; i < n; i++ {
+				dot += w[i] * deflateVec[i]
+			}
+			for i := 0; i < n; i++ {
+				w[i] -= dot * deflateVec[i]
+			}
+		}
+
+		normalize(w)
+		v = w
+	}
+
+	return v
+}
+
+func normalize(v []float64) {
+	norm := 0.0
+	for _, x := range v {
+		norm += x * x
+	}
+	norm = math.Sqrt(norm)
+	if norm < 1e-15 {
+		return
+	}
+	for i := range v {
+		v[i] /= norm
 	}
 }

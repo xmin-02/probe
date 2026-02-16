@@ -1290,7 +1290,10 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 				defer mgr.mu.Unlock()
 				return !mgr.saturatedCalls[call]
 			},
-			ModeKFuzzTest: mgr.cfg.Experimental.EnableKFuzzTest,
+			ModeKFuzzTest:    mgr.cfg.Experimental.EnableKFuzzTest,
+			NgramAddr:        mgr.cfg.NgramAddr,        // Phase 14 D3
+			PageUafThreshold: mgr.cfg.PageUafThreshold, // Phase 14 D7
+			FdReuseThreshold: mgr.cfg.FdReuseThreshold, // Phase 14 D7
 		}, rnd, mgr.target)
 		fuzzerObj.AddCandidates(candidates)
 		mgr.fuzzer.Store(fuzzerObj)

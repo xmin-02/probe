@@ -283,6 +283,106 @@ func run(bpfObj string) error {
 		}
 	}
 
+	// Phase 11i: Attach LACE race detection probes (graceful skip on failure)
+	// tracepoint/sched/sched_switch
+	if prog := coll.Programs["trace_sched_switch"]; prog != nil {
+		tp, err := link.Tracepoint("sched", "sched_switch", prog, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "PROBE: warning: tracepoint sched_switch failed: %v (LACE sched tracking disabled)\n", err)
+		} else {
+			pin := filepath.Join(pinDir, "link_sched_switch")
+			os.Remove(pin)
+			if err := tp.Pin(pin); err != nil {
+				fmt.Fprintf(os.Stderr, "PROBE: warning: pin sched_switch link: %v\n", err)
+			}
+			fmt.Fprintf(os.Stderr, "PROBE: tracepoint/sched/sched_switch attached (LACE sched tracking enabled)\n")
+		}
+	}
+
+	// kprobe/mutex_lock + kretprobe/mutex_lock
+	if prog := coll.Programs["kprobe_mutex_lock"]; prog != nil {
+		kp, err := link.Kprobe("mutex_lock", prog, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "PROBE: warning: kprobe mutex_lock failed: %v (LACE mutex tracking disabled)\n", err)
+		} else {
+			pin := filepath.Join(pinDir, "link_mutex_lock")
+			os.Remove(pin)
+			if err := kp.Pin(pin); err != nil {
+				fmt.Fprintf(os.Stderr, "PROBE: warning: pin mutex_lock link: %v\n", err)
+			}
+			fmt.Fprintf(os.Stderr, "PROBE: kprobe/mutex_lock attached (LACE mutex tracking enabled)\n")
+		}
+	}
+	if prog := coll.Programs["kretprobe_mutex_lock"]; prog != nil {
+		kp, err := link.Kretprobe("mutex_lock", prog, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "PROBE: warning: kretprobe mutex_lock failed: %v\n", err)
+		} else {
+			pin := filepath.Join(pinDir, "link_mutex_lock_ret")
+			os.Remove(pin)
+			if err := kp.Pin(pin); err != nil {
+				fmt.Fprintf(os.Stderr, "PROBE: warning: pin mutex_lock_ret link: %v\n", err)
+			}
+		}
+	}
+
+	// kprobe/mutex_unlock
+	if prog := coll.Programs["kprobe_mutex_unlock"]; prog != nil {
+		kp, err := link.Kprobe("mutex_unlock", prog, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "PROBE: warning: kprobe mutex_unlock failed: %v\n", err)
+		} else {
+			pin := filepath.Join(pinDir, "link_mutex_unlock")
+			os.Remove(pin)
+			if err := kp.Pin(pin); err != nil {
+				fmt.Fprintf(os.Stderr, "PROBE: warning: pin mutex_unlock link: %v\n", err)
+			}
+		}
+	}
+
+	// kprobe/raw_spin_lock + kprobe/raw_spin_unlock
+	if prog := coll.Programs["kprobe_raw_spin_lock"]; prog != nil {
+		kp, err := link.Kprobe("_raw_spin_lock", prog, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "PROBE: warning: kprobe raw_spin_lock failed: %v (LACE spinlock tracking disabled)\n", err)
+		} else {
+			pin := filepath.Join(pinDir, "link_raw_spin_lock")
+			os.Remove(pin)
+			if err := kp.Pin(pin); err != nil {
+				fmt.Fprintf(os.Stderr, "PROBE: warning: pin raw_spin_lock link: %v\n", err)
+			}
+			fmt.Fprintf(os.Stderr, "PROBE: kprobe/raw_spin_lock attached (LACE spinlock tracking enabled)\n")
+		}
+	}
+	if prog := coll.Programs["kprobe_raw_spin_unlock"]; prog != nil {
+		kp, err := link.Kprobe("_raw_spin_unlock", prog, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "PROBE: warning: kprobe raw_spin_unlock failed: %v\n", err)
+		} else {
+			pin := filepath.Join(pinDir, "link_raw_spin_unlock")
+			os.Remove(pin)
+			if err := kp.Pin(pin); err != nil {
+				fmt.Fprintf(os.Stderr, "PROBE: warning: pin raw_spin_unlock link: %v\n", err)
+			}
+		}
+	}
+
+	// Pin LACE maps (optional, used for internal state)
+	if lockTsMap := coll.Maps["lock_entry_ts"]; lockTsMap != nil {
+		pin := filepath.Join(pinDir, "lock_entry_ts")
+		os.Remove(pin)
+		if err := lockTsMap.Pin(pin); err != nil {
+			fmt.Fprintf(os.Stderr, "PROBE: warning: pin lock_entry_ts map: %v\n", err)
+		}
+	}
+	if lockHeldMap := coll.Maps["lock_held"]; lockHeldMap != nil {
+		pin := filepath.Join(pinDir, "lock_held")
+		os.Remove(pin)
+		if err := lockHeldMap.Pin(pin); err != nil {
+			fmt.Fprintf(os.Stderr, "PROBE: warning: pin lock_held map: %v\n", err)
+		}
+	}
+
 	// Success — BPF programs are attached and pinned, loader can exit
 	return nil
 }

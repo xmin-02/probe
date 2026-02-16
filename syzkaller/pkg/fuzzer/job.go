@@ -60,7 +60,12 @@ func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 	newP := p.Clone()
 	// PROBE: C3 fix — apply DEzzer-optimized mutation weights (Phase 6/8b/8e).
 	// Without this, 95% of mutations use default weights, bypassing DEzzer optimization.
-	mutOpts := fuzzer.getAIMutateOpts("", classifyProgram(newP))
+	// Phase 12 A2: Load prevOp for pair TS conditioning (atomic.Value, ~15ns).
+	prevOp := ""
+	if v := fuzzer.lastMutOp.Load(); v != nil {
+		prevOp = v.(string)
+	}
+	mutOpts := fuzzer.getAIMutateOpts(prevOp, classifyProgram(newP))
 	op := newP.MutateWithOpts(rnd,
 		prog.RecommendedCalls,
 		fuzzer.ChoiceTable(),
@@ -68,6 +73,15 @@ func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 		fuzzer.Config.Corpus.Programs(),
 		mutOpts,
 	)
+	// Phase 12 A2: Store current op for next mutation's pair TS context.
+	if op != "" {
+		fuzzer.lastMutOp.Store(op)
+	}
+	// Phase 12 B4: Two-level action space — select sub-op within parent op.
+	subOp := ""
+	if op != "" && fuzzer.dezzer != nil {
+		subOp = fuzzer.dezzer.SelectSubOp(op)
+	}
 	// PROBE: Phase 6 — track operator usage.
 	if op != "" {
 		switch op {
@@ -81,13 +95,80 @@ func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 			fuzzer.statMutOpMutateArg.Add(1)
 		case "remove":
 			fuzzer.statMutOpRemove.Add(1)
+		case "reorder":
+			fuzzer.statMutOpReorder.Add(1)
 		}
 	}
+
+	// PROBE: Phase 11k — OZZ: 4-arm strategy selection wrapping ACTOR delay.
+	delayPattern := -1
+	schedArm := -1
+	if fuzzer.schedTS != nil && fuzzer.linucb != nil {
+		fuzzer.delayTotal.Add(1)
+		// Adaptive rate control: 10% start, 20% max cap.
+		delayed := fuzzer.delayedExecs.Load()
+		total := fuzzer.delayTotal.Load()
+		if total > 0 && delayed*100/total > 20 {
+			delayPattern = prog.DelayNone
+		} else if rnd.Intn(10) == 0 { // 10% base injection rate
+			schedArm = fuzzer.schedTS.SelectArm(rnd)
+			switch schedArm {
+			case SchedNone:
+				delayPattern = prog.DelayNone
+				fuzzer.statDelayNone.Add(1)
+			case SchedDelayOnly:
+				features := fuzzer.buildDelayFeatures(newP, false)
+				delayPattern = fuzzer.linucb.SelectArm(features)
+				if delayPattern != prog.DelayNone {
+					applyDelayPattern(newP, delayPattern, rnd)
+					fuzzer.delayedExecs.Add(1)
+					switch delayPattern {
+					case prog.DelayRandom:
+						fuzzer.statDelayRandom.Add(1)
+					case prog.DelayBetween:
+						fuzzer.statDelayBetween.Add(1)
+					case prog.DelayAroundLocks:
+						fuzzer.statDelayAroundLocks.Add(1)
+					}
+				} else {
+					fuzzer.statDelayNone.Add(1)
+				}
+			case SchedYieldOnly:
+				// Set sched_yield on ~33% of calls.
+				for i := range newP.Calls {
+					if rnd.Intn(3) == 0 {
+						newP.Calls[i].Props.SchedYield = true
+					}
+				}
+				fuzzer.delayedExecs.Add(1)
+				fuzzer.statSchedYield.Add(1)
+			case SchedBoth:
+				// Combined: delay + yield.
+				features := fuzzer.buildDelayFeatures(newP, false)
+				delayPattern = fuzzer.linucb.SelectArm(features)
+				if delayPattern != prog.DelayNone {
+					applyDelayPattern(newP, delayPattern, rnd)
+				}
+				for i := range newP.Calls {
+					if rnd.Intn(3) == 0 {
+						newP.Calls[i].Props.SchedYield = true
+					}
+				}
+				fuzzer.delayedExecs.Add(1)
+				fuzzer.statSchedBoth.Add(1)
+			}
+			fuzzer.statDelayApplied.Add(1)
+		}
+	}
+
 	return &queue.Request{
-		Prog:     newP,
-		ExecOpts: setFlags(flatrpc.ExecFlagCollectSignal),
-		Stat:     fuzzer.statExecFuzz,
-		MutOp:    op, // PROBE: carry operator to processResult for DEzzer feedback
+		Prog:         newP,
+		ExecOpts:     setFlags(flatrpc.ExecFlagCollectSignal),
+		Stat:         fuzzer.statExecFuzz,
+		MutOp:        op,           // PROBE: carry operator to processResult for DEzzer feedback
+		SubOp:        subOp,        // PROBE: Phase 12 B4 — carry sub-op for two-level feedback
+		DelayPattern: delayPattern, // PROBE: Phase 11j — carry delay pattern for LinUCB feedback
+		SchedArm:     schedArm,     // PROBE: Phase 11k — carry schedTS arm for Global TS feedback
 	}
 }
 
@@ -143,10 +224,12 @@ type triageCall struct {
 const (
 	deflakeNeedRuns         = 3
 	deflakeMaxRuns          = 5
+	deflakeMaxRunsAdaptive  = 4 // Phase 11b: default adaptive (was always 5)
+	deflakeMaxRunsStrict    = 5 // Phase 11b: high-value programs only
 	deflakeNeedCorpusRuns   = 2
 	deflakeMinCorpusRuns    = 4
 	deflakeMaxCorpusRuns    = 6
-	deflakeTotalCorpusRuns  = 20
+	deflakeTotalCorpusRuns  = 12 // Phase 11b: reduced from 20
 	deflakeNeedSnapshotRuns = 2
 )
 
@@ -248,15 +331,42 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 	} else if job.flags&ProgFromCorpus == 0 {
 		needRuns = deflakeNeedRuns
 	}
+
+	// Phase 11b: Determine if this is a high-value program (more deflake runs).
+	highValue := false
+	for _, info := range job.calls {
+		if info.newSignal.Len() >= 10 {
+			highValue = true
+			break
+		}
+	}
+
 	prevTotalNewSignal := 0
 	for run := 1; ; run++ {
+		job.fuzzer.statDeflakeRuns.Add(1)
 		totalNewSignal := 0
 		indices := make([]int, 0, len(job.calls))
 		for call, info := range job.calls {
 			indices = append(indices, call)
 			totalNewSignal += len(info.newSignal)
 		}
-		if job.stopDeflake(run, needRuns, prevTotalNewSignal == totalNewSignal) {
+
+		// Phase 11b: Early exit — after run 2, if all calls have no new signal, stop.
+		if run > 2 && job.flags&ProgFromCorpus == 0 && !job.fuzzer.Config.Snapshot {
+			allEmpty := true
+			for _, info := range job.calls {
+				if info.newSignal.Len() > 0 {
+					allEmpty = false
+					break
+				}
+			}
+			if allEmpty {
+				job.fuzzer.statDeflakeEarlyExit.Add(1)
+				break
+			}
+		}
+
+		if job.stopDeflake(run, needRuns, prevTotalNewSignal == totalNewSignal, highValue) {
 			break
 		}
 		prevTotalNewSignal = totalNewSignal
@@ -320,7 +430,7 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 	return false
 }
 
-func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool) bool {
+func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool, highValue bool) bool {
 	if job.fuzzer.Config.Snapshot {
 		return run >= needRuns+1
 	}
@@ -334,6 +444,11 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool) bool {
 		// For fuzzing programs we stop if we already have the right deflaked signal for all calls,
 		// or there's no chance to get coverage common to needRuns for all calls.
 		if run >= deflakeMaxRuns {
+			return true
+		}
+		// Phase 11b: Adaptive early stop — non-high-value programs stop sooner
+		// once stable signal is already found.
+		if !highValue && run >= deflakeMaxRunsAdaptive && haveSignal {
 			return true
 		}
 		noChance := true
@@ -475,10 +590,20 @@ func (job *smashJob) run(fuzzer *Fuzzer) {
 	cluster := classifyProgram(job.p)     // Phase 8e: classify once per program
 	for i := 0; i < iters; i++ {
 		p := job.p.Clone()
-		op := p.Mutate(rnd, prog.RecommendedCalls,
+		// P0-3/11f: Use DEzzer-optimized weights instead of raw Mutate().
+		// 20% exploration: use default weights to maintain diversity.
+		var mutOpts prog.MutateOpts
+		if rnd.Intn(5) == 0 {
+			mutOpts = prog.DefaultMutateOpts
+			fuzzer.statSmashDiversity.Add(1)
+		} else {
+			mutOpts = fuzzer.getAIMutateOpts(prevOp, cluster)
+		}
+		op := p.MutateWithOpts(rnd, prog.RecommendedCalls,
 			fuzzer.ChoiceTable(),
 			fuzzer.Config.NoMutateCalls,
-			fuzzer.Config.Corpus.Programs())
+			fuzzer.Config.Corpus.Programs(),
+			mutOpts)
 		result := fuzzer.execute(job.exec, &queue.Request{
 			Prog:     p,
 			ExecOpts: setFlags(flatrpc.ExecFlagCollectSignal),
@@ -496,7 +621,7 @@ func (job *smashJob) run(fuzzer *Fuzzer) {
 				covGain = currentSignalLen - lastSignalLen
 				lastSignalLen = currentSignalLen
 			}
-			fuzzer.dezzer.RecordResult(op, prevOp, covGain, SourceSmash, cluster)
+			fuzzer.dezzer.RecordResult(op, prevOp, "", covGain, SourceSmash, cluster)
 			prevOp = op
 		}
 	}
@@ -518,8 +643,8 @@ type focusJob struct {
 }
 
 const (
-	focusMaxIters      = 300
-	focusNoProgressMax = 50
+	focusMaxIters      = 100 // Reduced from 300: prevent Focus monopolization.
+	focusNoProgressMax = 20  // Reduced from 50: faster early exit on diminishing returns.
 )
 
 func (job *focusJob) run(fuzzer *Fuzzer) {
@@ -527,6 +652,7 @@ func (job *focusJob) run(fuzzer *Fuzzer) {
 		fuzzer.focusMu.Lock()
 		fuzzer.focusActive = false
 		fuzzer.focusTarget = ""
+		fuzzer.lastEbpfFocus = time.Now() // Reset cooldown at focus END (not start).
 		fuzzer.focusMu.Unlock()
 		// Launch next queued focus candidate if any.
 		fuzzer.drainFocusPending()
@@ -553,6 +679,10 @@ func (job *focusJob) run(fuzzer *Fuzzer) {
 	if len(job.p.Calls) >= 5 {
 		essential = fuzzer.getOrComputeAblation(job.exec, job.p, job.title, rnd)
 	}
+
+	// Phase 11g: Optimal stopping — first 25% is observation phase.
+	observeIters := focusMaxIters / 4 // 25 iterations
+	var maxObservedGain int
 
 	for i := 0; i < focusMaxIters; i++ {
 		mutOpts := fuzzer.getAIMutateOpts(prevOp, cluster) // Phase 8b: pair-aware weights
@@ -601,7 +731,7 @@ func (job *focusJob) run(fuzzer *Fuzzer) {
 		// PROBE: Phase 6 — feed result to DEzzer.
 		if op != "" {
 			if fuzzer.dezzer != nil {
-				fuzzer.dezzer.RecordResult(op, prevOp, covGain, SourceFocus, cluster)
+				fuzzer.dezzer.RecordResult(op, prevOp, "", covGain, SourceFocus, cluster)
 			}
 			if covGain > 0 {
 				opCovGains[op] += covGain
@@ -614,15 +744,32 @@ func (job *focusJob) run(fuzzer *Fuzzer) {
 			fuzzer.recordObjectiveReward(result.Info, covGain)
 		}
 
+		// Phase 11g: Optimal stopping rule.
+		if i < observeIters {
+			// Observation phase: track max gain.
+			if covGain > maxObservedGain {
+				maxObservedGain = covGain
+			}
+		} else if maxObservedGain > 0 && covGain > maxObservedGain {
+			// Post-observation: found gain exceeding observation max — stop successfully.
+			fuzzer.statFocusOptStop.Add(1)
+			fuzzer.Logf(0, "PROBE: focus optimal stop at iter %d (gain=%d > maxObserved=%d)",
+				i, covGain, maxObservedGain)
+			break
+		}
+
 		if noProgress >= focusNoProgressMax {
 			break
 		}
 	}
 
 	earlyExit := noProgress >= focusNoProgressMax
+	optimalStop := totalIters < focusMaxIters && !earlyExit && totalIters > observeIters
 	exitReason := "completed"
 	if earlyExit {
 		exitReason = fmt.Sprintf("no-progress(%d)", focusNoProgressMax)
+	} else if optimalStop {
+		exitReason = "optimal-stop"
 	}
 	duration := time.Since(start).Round(time.Second)
 	fuzzer.Logf(0, "PROBE: focus mode ended for '%v' — iters: %d/%d, new_coverage: %d, exit_reason: %s, duration: %v",
@@ -648,6 +795,33 @@ func (job *focusJob) run(fuzzer *Fuzzer) {
 
 func (job *focusJob) getInfo() *JobInfo {
 	return job.info
+}
+
+// PROBE: Phase 11j — applyDelayPattern sets DelayUs on program calls based on delay pattern.
+func applyDelayPattern(p *prog.Prog, pattern int, rnd *rand.Rand) {
+	switch pattern {
+	case prog.DelayNone:
+		// No delay.
+	case prog.DelayRandom:
+		// Set random calls' DelayUs to rand(1,100).
+		for i := range p.Calls {
+			if rnd.Intn(3) == 0 { // ~33% of calls
+				p.Calls[i].Props.DelayUs = rnd.Intn(100) + 1
+			}
+		}
+	case prog.DelayBetween:
+		// Set all calls' DelayUs to 50.
+		for i := range p.Calls {
+			p.Calls[i].Props.DelayUs = 50
+		}
+	case prog.DelayAroundLocks:
+		// Set lock-related syscalls' DelayUs to 100.
+		for i := range p.Calls {
+			if isLockSyscall(p.Calls[i].Meta.Name) {
+				p.Calls[i].Props.DelayUs = 100
+			}
+		}
+	}
 }
 
 func randomCollide(origP *prog.Prog, rnd *rand.Rand) *prog.Prog {

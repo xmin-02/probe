@@ -234,6 +234,13 @@ type Config struct {
 	// PROBE: Spec auto-generation LLM configuration (Phase 10).
 	AISpecGen AISpecGenConfig `json:"ai_specgen,omitempty"`
 
+	// PROBE Phase 14: D3 — ngram server address (default: "127.0.0.1:50051").
+	NgramAddr string `json:"ngram_addr,omitempty"`
+	// PROBE Phase 14: D7 — Page-UAF threshold (default: 60).
+	PageUafThreshold int `json:"page_uaf_threshold,omitempty"`
+	// PROBE Phase 14: D7 — FD-reuse threshold (default: 60).
+	FdReuseThreshold int `json:"fd_reuse_threshold,omitempty"`
+
 	// Experimental options.
 	Experimental Experimental
 

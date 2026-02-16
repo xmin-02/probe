@@ -180,6 +180,10 @@ struct alignas(8) OutputData {
 	std::atomic<uint32> ebpf_fd_reuse;
 	// Phase 9c:
 	std::atomic<uint32> ebpf_context_stacks;
+	// Phase 11i: LACE concurrency detection
+	std::atomic<uint32> ebpf_lock_contention;
+	std::atomic<uint32> ebpf_concurrent_access;
+	std::atomic<uint32> ebpf_sched_switch;
 
 	void Reset()
 	{
@@ -206,6 +210,9 @@ struct alignas(8) OutputData {
 		ebpf_fd_close.store(0, std::memory_order_relaxed);
 		ebpf_fd_reuse.store(0, std::memory_order_relaxed);
 		ebpf_context_stacks.store(0, std::memory_order_relaxed);
+		ebpf_lock_contention.store(0, std::memory_order_relaxed);
+		ebpf_concurrent_access.store(0, std::memory_order_relaxed);
+		ebpf_sched_switch.store(0, std::memory_order_relaxed);
 	}
 };
 
@@ -1242,6 +1249,10 @@ void execute_one()
 		output_data->ebpf_fd_close.store((uint32)metrics.fd_close_count, std::memory_order_relaxed);
 		output_data->ebpf_fd_reuse.store((uint32)metrics.fd_reuse_count, std::memory_order_relaxed);
 		output_data->ebpf_context_stacks.store((uint32)metrics.context_unique_stacks, std::memory_order_relaxed);
+		// Phase 11i: LACE concurrency detection
+		output_data->ebpf_lock_contention.store((uint32)metrics.lock_contention_count, std::memory_order_relaxed);
+		output_data->ebpf_concurrent_access.store((uint32)metrics.concurrent_access_count, std::memory_order_relaxed);
+		output_data->ebpf_sched_switch.store((uint32)metrics.sched_switch_count, std::memory_order_relaxed);
 	}
 #endif
 
@@ -1579,6 +1590,7 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
 	uint32 ebpf_page_alloc = 0, ebpf_page_free = 0, ebpf_page_reuse = 0, ebpf_page_uaf_score = 0;
 	uint32 ebpf_fd_install = 0, ebpf_fd_close = 0, ebpf_fd_reuse = 0, ebpf_fd_reuse_score = 0;
 	uint32 ebpf_context_stacks = 0;
+	uint32 ebpf_lock_contention = 0, ebpf_concurrent_access = 0, ebpf_sched_switch = 0;
 	uint64 ebpf_min_ns = 0;
 #if GOOS_linux
 	{
@@ -1601,15 +1613,26 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
 		ebpf_fd_close = output->ebpf_fd_close.load(std::memory_order_relaxed);
 		ebpf_fd_reuse = output->ebpf_fd_reuse.load(std::memory_order_relaxed);
 		ebpf_context_stacks = output->ebpf_context_stacks.load(std::memory_order_relaxed);
+		// Phase 11i: LACE concurrency detection
+		ebpf_lock_contention = output->ebpf_lock_contention.load(std::memory_order_relaxed);
+		ebpf_concurrent_access = output->ebpf_concurrent_access.load(std::memory_order_relaxed);
+		ebpf_sched_switch = output->ebpf_sched_switch.load(std::memory_order_relaxed);
 		// Compute UAF exploitability score (0-100)
-		// Note: cross-program contamination is prevented by epoch-based filtering
-		// in the BPF program (execution_start_ns), so no saturation guard needed.
-		if (ebpf_rapid > 0)
-			ebpf_uaf_score += 50;
+		// Graduated scoring: reuse alone can reach Focus threshold (70)
+		if (ebpf_reuse > 0)
+			ebpf_uaf_score += 25; // any reuse is interesting
+		if (ebpf_reuse > 3)
+			ebpf_uaf_score += 15; // repeated reuse = stronger signal
+		if (ebpf_reuse > 10)
+			ebpf_uaf_score += 10; // heavy reuse pattern
+		// Timing bonuses (relaxed from 10us to 1ms for intermediate tier)
+		if (ebpf_min_ns > 0 && ebpf_min_ns < 1000000)
+			ebpf_uaf_score += 15; // reuse within 1ms
 		if (ebpf_min_ns > 0 && ebpf_min_ns < 10000)
-			ebpf_uaf_score += 30;
-		if (ebpf_reuse > 5)
-			ebpf_uaf_score += 20;
+			ebpf_uaf_score += 10; // very tight timing (extra bonus)
+		// Rapid reuse: still valuable but not dominant
+		if (ebpf_rapid > 0)
+			ebpf_uaf_score += 15;
 		// Double-free = ALWAYS critical
 		if (ebpf_double_free > 0)
 			ebpf_uaf_score = 100;
@@ -1665,7 +1688,9 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
 						  ebpf_page_uaf_score,
 						  ebpf_fd_install, ebpf_fd_close, ebpf_fd_reuse,
 						  ebpf_fd_reuse_score,
-						  ebpf_context_stacks);
+						  ebpf_context_stacks,
+						  ebpf_lock_contention, ebpf_concurrent_access,
+						  ebpf_sched_switch);
 	flatbuffers::Offset<flatbuffers::String> error_off = 0;
 	if (status == kFailStatus)
 		error_off = fbb.CreateString("process failed");
@@ -1751,6 +1776,12 @@ void execute_call(thread_t* th)
 	// Arrange for res = -1 and errno = EFAULT result for such case.
 	th->res = -1;
 	errno = EFAULT;
+	// PROBE: Phase 11j — ACTOR delay injection for concurrency-aware scheduling.
+	if (th->call_props.delay_us > 0)
+		usleep(th->call_props.delay_us);
+	// PROBE: Phase 11k — OZZ sched_yield injection for thread interleaving.
+	if (th->call_props.sched_yield)
+		sched_yield();
 	NONFAILING(th->res = execute_syscall(call, th->args));
 	th->reserrno = errno;
 	// Our pseudo-syscalls may misbehave.

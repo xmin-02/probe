@@ -377,6 +377,8 @@ static const char* setup_kcov_reset_ioctl()
 // BPF command constants
 #define PROBE_BPF_MAP_LOOKUP_ELEM 1
 #define PROBE_BPF_MAP_UPDATE_ELEM 2
+#define PROBE_BPF_MAP_DELETE_ELEM 3
+#define PROBE_BPF_MAP_GET_NEXT_KEY 4
 #define PROBE_BPF_OBJ_GET 7
 
 struct probe_metrics {
@@ -404,10 +406,15 @@ struct probe_metrics {
 	uint64 fd_reuse_count;        // 9d
 	// Phase 9c:
 	uint64 context_unique_stacks; // 9c
+	// Phase 11i: LACE
+	uint64 lock_contention_count;
+	uint64 concurrent_access_count;
+	uint64 sched_switch_count;
 };
 
 static int ebpf_metrics_fd = -1;
 static int ebpf_freed_fd = -1;
+static int ebpf_seen_stacks_fd = -1;
 
 static int ebpf_open_pinned(const char* path)
 {
@@ -428,6 +435,7 @@ static void ebpf_init()
 {
 	const char* metrics_path = "/sys/fs/bpf/probe/metrics";
 	const char* freed_path = "/sys/fs/bpf/probe/freed_objects";
+	const char* seen_stacks_path = "/sys/fs/bpf/probe/seen_stacks";
 
 	if (access(metrics_path, F_OK) != 0)
 		return;
@@ -448,7 +456,19 @@ static void ebpf_init()
 			debug("PROBE: eBPF freed_objects map opened (fd=%d)\n", fd);
 		}
 	}
+
+	// Phase 14 D15: Open seen_stacks map for periodic clearing.
+	if (access(seen_stacks_path, F_OK) == 0) {
+		fd = ebpf_open_pinned(seen_stacks_path);
+		if (fd >= 0) {
+			ebpf_seen_stacks_fd = fd;
+			debug("PROBE: eBPF seen_stacks map opened (fd=%d)\n", fd);
+		}
+	}
 }
+
+static uint64 ebpf_exec_counter = 0;
+static uint64 ebpf_current_epoch = 0;
 
 static struct probe_metrics ebpf_read_and_reset()
 {
@@ -456,7 +476,7 @@ static struct probe_metrics ebpf_read_and_reset()
 	if (ebpf_metrics_fd < 0)
 		return m;
 
-	// BPF_MAP_LOOKUP_ELEM
+	// BPF_MAP_LOOKUP_ELEM — always read metrics every execution.
 	uint32 key = 0;
 	struct {
 		uint64 map_fd;
@@ -476,27 +496,72 @@ static struct probe_metrics ebpf_read_and_reset()
 	}
 
 	// BPF_MAP_UPDATE_ELEM: zero out counters and set execution_start_ns epoch.
+	// Optimization (11h): only issue the UPDATE syscall every 10 executions.
 	// The epoch timestamp lets the BPF program distinguish freed pointers from
 	// the current execution vs. stale entries from previous executions.
-	// This eliminates cross-program contamination without clearing freed_objects.
-	struct probe_metrics next = {};
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	next.execution_start_ns = (uint64)ts.tv_sec * 1000000000ULL + (uint64)ts.tv_nsec;
+	// Between updates the BPF side keeps using the last epoch, which is safe
+	// because the epoch filter is >= (not ==), so events from any execution
+	// after the last epoch reset are still correctly attributed.
+	ebpf_exec_counter++;
+	if (ebpf_exec_counter % 10 == 1) {
+		struct probe_metrics next = {};
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		next.execution_start_ns = (uint64)ts.tv_sec * 1000000000ULL + (uint64)ts.tv_nsec;
+		ebpf_current_epoch = next.execution_start_ns;
 
-	struct {
-		uint64 map_fd;
-		uint64 key;
-		uint64 value;
-		uint64 flags;
-	} update_attr = {};
-	update_attr.map_fd = (uint64)(uint32)ebpf_metrics_fd;
-	update_attr.key = (uint64)(unsigned long)&key;
-	update_attr.value = (uint64)(unsigned long)&next;
-	update_attr.flags = 0; // BPF_ANY
+		struct {
+			uint64 map_fd;
+			uint64 key;
+			uint64 value;
+			uint64 flags;
+		} update_attr = {};
+		update_attr.map_fd = (uint64)(uint32)ebpf_metrics_fd;
+		update_attr.key = (uint64)(unsigned long)&key;
+		update_attr.value = (uint64)(unsigned long)&next;
+		update_attr.flags = 0; // BPF_ANY
 
-	syscall(__NR_bpf, PROBE_BPF_MAP_UPDATE_ELEM,
-		&update_attr, sizeof(update_attr));
+		syscall(__NR_bpf, PROBE_BPF_MAP_UPDATE_ELEM,
+			&update_attr, sizeof(update_attr));
+	}
+
+	// Phase 14 D15: Clear seen_stacks every 10000 executions for epoch freshness.
+	// This prevents unbounded growth of context-sensitive stack traces and ensures
+	// the map only contains recent execution contexts.
+	if (ebpf_exec_counter % 10000 == 0 && ebpf_seen_stacks_fd >= 0) {
+		uint64 key = 0, next_key = 0;
+		struct {
+			uint64 map_fd;
+			uint64 key;
+			uint64 next_key;
+			uint64 flags;
+		} get_next_attr = {};
+		struct {
+			uint64 map_fd;
+			uint64 key;
+			uint64 flags;
+		} delete_attr = {};
+
+		get_next_attr.map_fd = (uint64)(uint32)ebpf_seen_stacks_fd;
+		get_next_attr.flags = 0;
+		delete_attr.map_fd = (uint64)(uint32)ebpf_seen_stacks_fd;
+
+		// Iterate and delete all entries in seen_stacks map.
+		while (1) {
+			get_next_attr.key = (uint64)(unsigned long)&key;
+			get_next_attr.next_key = (uint64)(unsigned long)&next_key;
+			long ret = syscall(__NR_bpf, PROBE_BPF_MAP_GET_NEXT_KEY,
+					   &get_next_attr, sizeof(get_next_attr));
+			if (ret < 0)
+				break; // No more keys
+
+			delete_attr.key = (uint64)(unsigned long)&next_key;
+			syscall(__NR_bpf, PROBE_BPF_MAP_DELETE_ELEM,
+				&delete_attr, sizeof(delete_attr));
+			key = next_key;
+		}
+		debug("PROBE: seen_stacks map cleared at exec=%llu\n", (unsigned long long)ebpf_exec_counter);
+	}
 
 	return m;
 }

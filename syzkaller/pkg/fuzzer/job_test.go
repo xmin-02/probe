@@ -92,6 +92,7 @@ func TestDeflake(t *testing.T) {
 				p:     prog,
 				calls: map[int]*triageCall{0: &info},
 				fuzzer: &Fuzzer{
+					Stats:  newStats(target),
 					Cover:  newCover(),
 					Config: &Config{},
 				},

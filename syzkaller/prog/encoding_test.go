@@ -472,7 +472,7 @@ func TestSerializeCallProps(t *testing.T) {
 		},
 		{
 			"serialize0(0x0) (fail_nth: 5)\n",
-			[]CallProps{{5, false, 0}},
+			[]CallProps{{5, false, 0, 0, false}},
 		},
 		{
 			"serialize0(0x0) (fail_nth)\n",
@@ -484,11 +484,11 @@ func TestSerializeCallProps(t *testing.T) {
 		},
 		{
 			"serialize0(0x0) (async)\n",
-			[]CallProps{{0, true, 0}},
+			[]CallProps{{0, true, 0, 0, false}},
 		},
 		{
 			"serialize0(0x0) (async, rerun: 10)\n",
-			[]CallProps{{0, true, 10}},
+			[]CallProps{{0, true, 10, 0, false}},
 		},
 	}
 

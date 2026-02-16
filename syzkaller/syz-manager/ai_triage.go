@@ -55,6 +55,9 @@ func (mgr *Manager) initAITriage(ctx context.Context) {
 		}
 	}
 
+	// Phase 14 W5a-14b: Wire Focus auto-concentrate callback.
+	triager.TriggerFocusForGap = mgr.aiTriggerFocusForGap
+
 	mgr.triager = triager
 	mgr.http.Triager = triager
 
@@ -366,4 +369,72 @@ func (mgr *Manager) findCorpusForSyscalls(targetSyscalls []string, limit int) []
 		result = append(result, matches[i].prog)
 	}
 	return result
+}
+
+// aiTriggerFocusForGap implements Phase 14 W5a-14b: Focus auto-concentrate.
+// When spec gaps are identified, this finds corpus programs that use the gap syscalls
+// and triggers Focus on them to intensively explore that subsystem.
+// Returns the number of Focus candidates triggered.
+func (mgr *Manager) aiTriggerFocusForGap(syscallFamily string, syscalls []string) int {
+	f := mgr.fuzzer.Load()
+	if f == nil {
+		return 0
+	}
+
+	// Build a set of gap syscalls for quick lookup.
+	gapSet := make(map[string]bool)
+	for _, sc := range syscalls {
+		gapSet[sc] = true
+	}
+
+	// Find corpus programs that contain gap syscalls.
+	programs := mgr.corpus.Programs()
+	type scored struct {
+		prog  *prog.Prog
+		score int
+	}
+	var matches []scored
+	for _, p := range programs {
+		score := 0
+		seen := make(map[string]bool)
+		for i := range p.Calls {
+			name := p.CallName(i)
+			if gapSet[name] && !seen[name] {
+				score++
+				seen[name] = true
+			}
+		}
+		if score > 0 {
+			matches = append(matches, scored{p, score})
+		}
+	}
+
+	if len(matches) == 0 {
+		return 0
+	}
+
+	// Sort by score (most gap syscalls first), take top 3.
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].score > matches[j].score
+	})
+
+	triggered := 0
+	maxTrigger := 3
+	if len(matches) < maxTrigger {
+		maxTrigger = len(matches)
+	}
+
+	for i := 0; i < maxTrigger; i++ {
+		p := matches[i].prog
+		title := fmt.Sprintf("spec-gap:%s", syscallFamily)
+		tier := 2 // Medium priority (spec gaps are less urgent than crashes)
+
+		if f.AddFocusCandidate(p, title, tier) {
+			triggered++
+			log.Logf(0, "PROBE: Focus auto-concentrate: triggered '%s' (%d gap syscalls)",
+				title, matches[i].score)
+		}
+	}
+
+	return triggered
 }

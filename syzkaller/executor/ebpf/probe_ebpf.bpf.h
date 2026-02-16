@@ -20,7 +20,7 @@
 #endif
 
 // Shared metrics structure (read by executor).
-// Phase 5 fields (8) + Phase 7 fields (3) + Phase 8a fields (1) + Phase 9b fields (3) + Phase 9d fields (3) + Phase 9c fields (1).
+// Phase 5 fields (8) + Phase 7 fields (3) + Phase 8a fields (1) + Phase 9b fields (3) + Phase 9d fields (3) + Phase 9c fields (1) + Phase 11i fields (3).
 struct probe_metrics {
 	__u64 alloc_count;
 	__u64 free_count;
@@ -46,6 +46,10 @@ struct probe_metrics {
 	__u64 fd_reuse_count;            // 9d: recently-closed FD number reused
 	// Phase 9c: Context-sensitive coverage
 	__u64 context_unique_stacks;     // 9c: unique (event, stack_id) pairs observed
+	// Phase 11i: LACE concurrency detection
+	__u64 lock_contention_count;     // 11i: mutex/spinlock contention events
+	__u64 concurrent_access_count;   // 11i: sched_switch while lock held
+	__u64 sched_switch_count;        // 11i: context switches during execution
 };
 
 // 7b': Per-call-site alloc/free statistics for AI strategy.

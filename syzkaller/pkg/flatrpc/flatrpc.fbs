@@ -277,6 +277,10 @@ table ProgInfoRaw {
 	ebpf_fd_reuse_score	:uint32;
 	// Phase 9c: Context-sensitive coverage
 	ebpf_context_stacks	:uint32;
+	// Phase 11i: LACE concurrency detection
+	ebpf_lock_contention	:uint32;
+	ebpf_concurrent_access	:uint32;
+	ebpf_sched_switch	:uint32;
 }
 
 // Result of executing a test program.

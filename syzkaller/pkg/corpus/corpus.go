@@ -32,6 +32,7 @@ type Corpus struct {
 	StatCover  *stat.Val
 
 	focusAreas []*focusAreaState
+	miScorer   *MIScorer
 }
 
 type focusAreaState struct {
@@ -59,6 +60,7 @@ func NewFocusedCorpus(ctx context.Context, updates chan<- NewItemEvent, areas []
 		progsMap:     make(map[string]*Item),
 		updates:      updates,
 		ProgramsList: &ProgramsList{},
+		miScorer:     newMIScorer(),
 	}
 	corpus.StatProgs = stat.New("corpus", "Number of test programs in the corpus", stat.Console,
 		stat.Link("/corpus"), stat.Graph("corpus"), stat.LenOf(&corpus.progsMap, &corpus.mu))
@@ -171,7 +173,8 @@ func (corpus *Corpus) Save(inp NewInput) {
 		}
 		corpus.progsMap[sig] = item
 		corpus.applyFocusAreas(item, inp.Cover)
-		corpus.saveProgram(inp.Prog, inp.Signal)
+		miScore := corpus.miScorer.getScore(sig)
+		corpus.saveProgram(inp.Prog, inp.Signal, miScore)
 	}
 	corpus.signal.Merge(inp.Signal)
 	newCover := corpus.cover.MergeDiff(inp.Cover)
@@ -189,6 +192,7 @@ func (corpus *Corpus) Save(inp NewInput) {
 }
 
 func (corpus *Corpus) applyFocusAreas(item *Item, coverDelta []uint64) {
+	miScore := corpus.miScorer.getScore(item.Sig)
 	for _, area := range corpus.focusAreas {
 		matches := false
 		for _, pc := range coverDelta {
@@ -200,7 +204,7 @@ func (corpus *Corpus) applyFocusAreas(item *Item, coverDelta []uint64) {
 		if !matches {
 			continue
 		}
-		area.saveProgram(item.Prog, item.Signal)
+		area.saveProgram(item.Prog, item.Signal, miScore)
 		if item.areas == nil {
 			item.areas = make(map[*focusAreaState]struct{})
 			item.areas[area] = struct{}{}
@@ -263,4 +267,10 @@ func (corpus *Corpus) ProgsPerArea() map[string]int {
 
 func (corpus *Corpus) Cover() []uint64 {
 	return corpus.cover.Serialize()
+}
+
+// RunMIUpdater starts a background goroutine that periodically recalculates
+// MI scores for corpus programs. Call this after corpus construction.
+func (corpus *Corpus) RunMIUpdater() {
+	go corpus.miScorer.runUpdater(corpus.ctx, corpus)
 }

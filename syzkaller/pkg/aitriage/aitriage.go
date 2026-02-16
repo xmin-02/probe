@@ -211,6 +211,14 @@ type CostTracker struct {
 	TodayOutput  int            `json:"today_output_tokens"`
 	History      []APICall      `json:"history"`
 	DailyStats   []DailySummary `json:"daily_stats"`
+
+	// D13: Per-type cost tracking (stepB strategy, stepD spec, LFS seed gen).
+	StepBCalls   int     `json:"stepb_calls"`
+	StepBCostUSD float64 `json:"stepb_cost_usd"`
+	StepDCalls   int     `json:"stepd_calls"`
+	StepDCostUSD float64 `json:"stepd_cost_usd"`
+	LFSCalls     int     `json:"lfs_calls"`
+	LFSCostUSD   float64 `json:"lfs_cost_usd"`
 }
 
 const maxHistorySize = 100
@@ -255,6 +263,19 @@ func (ct *CostTracker) Record(call APICall, model string) {
 	ct.TodayInput += call.InputTokens
 	ct.TodayOutput += call.OutputTokens
 	ct.TodayCostUSD += call.CostUSD
+
+	// D13: Track per-type costs.
+	switch call.Type {
+	case "strategy":
+		ct.StepBCalls++
+		ct.StepBCostUSD += call.CostUSD
+	case "specgen":
+		ct.StepDCalls++
+		ct.StepDCostUSD += call.CostUSD
+	case "lfs":
+		ct.LFSCalls++
+		ct.LFSCostUSD += call.CostUSD
+	}
 
 	ct.History = append(ct.History, call)
 	if len(ct.History) > maxHistorySize {
@@ -388,6 +409,10 @@ type Triager struct {
 	ValidateAndInjectProg  func(progText string) (bool, error)
 	GetAvailableSyscalls   func() []string
 	OnSyzGPTGenerated      func() // H1 fix: called per LLM-generated program for stat tracking
+
+	// Phase 14 W5a-14b: Focus auto-concentrate callback.
+	// Called when spec gaps are identified, passes syscall families for Focus targeting.
+	TriggerFocusForGap func(syscallFamily string, syscalls []string) int
 }
 
 // CrashForAnalysis packages crash data needed for AI analysis.
@@ -1007,11 +1032,15 @@ func (t *Triager) stepABatchProcess(ctx context.Context, state *BatchState, cras
 	t.logf("[Step A] Batch complete: %d succeeded, %d failed", succeeded, failed)
 }
 
-func (t *Triager) crashHash(summaries []CrashSummary) string {
+// D14: crashHash now includes coverage delta to trigger strategy regeneration
+// when coverage landscape changes significantly, even without new crashes.
+func (t *Triager) crashHash(summaries []CrashSummary, totalSignal int) string {
 	h := sha256.New()
 	for _, c := range summaries {
 		fmt.Fprintf(h, "%s:%d:%d;", c.Title, c.Score, c.Variants)
 	}
+	// D14: Include total coverage in hash to detect significant coverage changes.
+	fmt.Fprintf(h, "cov:%d", totalSignal)
 	return fmt.Sprintf("%x", h.Sum(nil))[:16]
 }
 
@@ -1027,7 +1056,8 @@ func (t *Triager) stepB(ctx context.Context) {
 	}
 
 	// Skip strategy call if crash state hasn't changed since last run.
-	hash := t.crashHash(snapshot.CrashSummaries)
+	// D14: Include coverage delta in hash to detect significant coverage changes.
+	hash := t.crashHash(snapshot.CrashSummaries, snapshot.TotalSignal)
 	t.mu.Lock()
 	prevHash := t.lastCrashHash
 	t.mu.Unlock()
@@ -1076,6 +1106,16 @@ func (t *Triager) stepB(ctx context.Context) {
 	nFocus := len(result.FocusTargets)
 	t.logf("[Step B] Strategy applied: %d syscall weights, %d seed hints, %d focus targets",
 		nWeights, nHints, nFocus)
+
+	// D13: Log per-type cost breakdown.
+	t.cost.mu.Lock()
+	stepBCost := t.cost.StepBCostUSD
+	stepDCost := t.cost.StepDCostUSD
+	lfsCost := t.cost.LFSCostUSD
+	t.cost.mu.Unlock()
+	t.logf("[Step B] Cost breakdown: stepB=$%.4f, stepD=$%.4f, LFS=$%.4f",
+		stepBCost, stepDCost, lfsCost)
+
 	saveCostTracker(t.workdir, t.cost)
 }
 
@@ -1192,6 +1232,12 @@ func (t *Triager) stepC(ctx context.Context) {
 
 	t.logf("[Step C] SyzGPT complete: %d generated, %d valid, %d injected (of %d targets)",
 		generated, valid, injected, len(targets))
+
+	// D13: Log per-type cost breakdown.
+	t.cost.mu.Lock()
+	lfsCost := t.cost.LFSCostUSD
+	t.cost.mu.Unlock()
+	t.logf("[Step C] LFS cost: $%.4f (%d calls)", lfsCost, t.cost.LFSCalls)
 }
 
 // filterRelevantSyscalls filters the full syscall list to only include relevant ones

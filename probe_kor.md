@@ -653,21 +653,216 @@ cd syzkaller && make host
 
 각 서브페이즈: `go build` + `go vet` → 1시간 퍼징 (exec/sec 기준선) → 4시간 실행 (크래시 발견 비교).
 
+---
+
+## Phase 9: 고급 커버리지 & 탐지 — 완료
+
+**목표**: 페이지 레벨 UAF, 컨텍스트 민감 신호, FD 생명주기 추적, AI 기반 익스플로잇 평가로 커버리지 메트릭 및 취약점 탐지 확장.
+
+**분석 기반**: KBinCov (CCS 2024), Anamnesis (2026), 페이지/FD 기반 취약점 커스텀 탐지 휴리스틱.
+
+### 9a. 페이지 레벨 UAF 탐지 — 완료
+
+**목표**: eBPF로 페이지 alloc/free 패턴 추적하여 페이지 레벨 UAF 탐지. Phase 5의 slab 레벨 UAF 탐지를 페이지 할당자로 확장.
+
+**설계**: `tracepoint/kmem/mm_page_alloc`, `tracepoint/kmem/mm_page_free` eBPF 후크. 전용 BPF 맵에서 페이지 order 할당 추적. 1ms 이내 페이지 재사용 = 높은 UAF 확률.
+
+**신규 메트릭**: FlatBuffers에 `ebpf_page_alloc_count`, `ebpf_page_free_count`, `ebpf_page_uaf_score` 추가.
+
+### 9b. 컨텍스트 민감 커버리지 — 완료
+
+**목표**: 호출 컨텍스트 민감성으로 edge 커버리지 보강, 더 깊은 신호 차별화.
+
+**설계**: 신호 처리에서 경량 해시 기반 컨텍스트 추적. `pkg/signal/signal.go`에서 call-site 컨텍스트를 신호 해시에 통합, 다른 호출 경로로 도달한 같은 edge에 대한 커버리지 구분 가능.
+
+### 9c. FD 생명주기 추적 — 완료
+
+**목표**: eBPF로 파일 디스크립터 생명주기 (open/close/dup 패턴) 추적, FD 재사용 취약점 탐지.
+
+**설계**: `sys_enter_close`, `sys_exit_openat` eBPF 프로그램으로 FD 할당/해제 패턴 추적. FlatBuffers에 `ebpf_fd_reuse_count` 메트릭 추가. 같은 실행 내 FD 재사용 = 잠재적 경쟁 상태 신호.
+
+### 9d. Anamnesis 익스플로잇 평가 — 완료
+
+**목표**: LLM 기반 크래시 컨텍스트, 메모리 레이아웃, 알려진 공격 패턴 분석으로 AI 익스플로잇 실현 가능성 평가.
+
+**설계**: `pkg/aitriage/aitriage.go`의 `stepD()`에서 크래시 분석 후 실행. DeepSeek API (1차, 비용 효율적) 사용. 0-100 익스플로잇 실현 가능성 점수. 70+ 고점수 → 우선 부스트와 함께 자동 Focus Mode 트리거. 평가는 DEzzer 피드백 루프에 통합 (Phase 14: RecordAnamnesisBonus).
+
+**파일**: `pkg/aitriage/aitriage.go` (stepD, 평가 타입), `pkg/aitriage/specgen.go` (스펙 생성), `pkg/fuzzer/fuzzer.go` (processResult 평가 통합)
+
+### 9e. 대시보드 개선 — 완료
+
+**통계**: `ebpf-uaf`, `ebpf-heap`, `ebpf-race` 그래프 그룹 (Phase 14 D10에서 단일 `ebpf` 그래프에서 분리). AI 대시보드에 Anamnesis 평가 통계.
+
+---
+
+## Phase 10: AI 스펙 자동 생성 — 완료
+
+**목표**: LLM 커널 소스 분석으로 syzlang에 아직 기술되지 않은 syscall에 대한 시즈칼러 syscall 사양 자동 생성.
+
+**설계**: DeepSeek API (1차, 비용 효율적) 스펙 생성. SyzSpec 방식은 분석 후 효과 미미하여 제거.
+
+### 아키텍처
+
+```
+커널 소스 분석 → 갭 식별 → LLM 스펙 생성 → 검증 → 주입
+
+stepD() in aitriage.go:
+1. 낮은/없는 커버리지 syscall 식별 (갭 분석)
+2. 커널 소스에서 인자 타입, 리소스 의존성 분석
+3. LLM으로 syzlang 사양 생성
+4. prog.Deserialize()로 생성된 스펙 검증
+5. 유효 스펙을 시드 프로그램으로 코퍼스에 주입
+```
+
+### 핵심 구성요소
+
+**`pkg/aitriage/specgen.go`**: 스펙 생성 엔진. 갭 분석, LLM 프롬프트 구성, syzlang 출력 파싱 및 검증. 점진적 생성 지원 (시간에 따라 스펙 축적).
+
+**`syz-manager/syzgpt.go`**: 매니저 측 통합. 스펙→시드 파이프라인, 생성 스펙별 커버리지 추적, 품질 게이팅 (3회 시도 후 커버리지 없으면 폐기).
+
+**설정**: `ai_triage` 설정 블록 사용. DeepSeek 모델은 모델명 접두사로 자동 감지. API 불가 시 그레이스풀 디그레이데이션.
+
+**비용**: 생성 회당 ~$0.50-2.00 (DeepSeek 요금). 1시간 배치 사이클의 일부로 실행.
+
+---
+
+## Phase 11: 동시성 & 성능 최적화 — 부분 완료
+
+**목표**: 동시성 버그 탐지 능력 추가 (LACE 레이스 감지, ACTOR 딜레이 주입) 및 성능 최적화 (MI 시드 스케줄링, LinUCB 컨텍스트 밴딧, 베이지안 최적화).
+
+### Wave 1 (11a-11h): P0/P1 수정 + Track A 성능 — 완료
+
+Phase 8-10 통합 중 식별된 중요 버그 수정 및 성능 개선:
+- P0 수정: DEzzer 배열 초기화, CUSUM 회로 차단기 (10분당 3회 리셋 제한), eBPF 메트릭 정렬
+- P1 수정: smashJob DEzzer 가중치 적용, Focus job 피드백 루프 안정성
+- Track A: DEzzer TS 정확도 개선, 탐색/활용 밸런스 튜닝
+
+### Wave 2 (11i, 11m): LACE 레이스 감지 + MI 시드 스케줄링 — 완료
+
+**11i. LACE 레이스 감지**: eBPF 기반 `sched_switch` tracepoint 모니터링으로 잠재적 경쟁 상태 탐지. 동시 실행 패턴 및 컨텍스트 스위치 타이밍 추적. `pkg/fuzzer/schedts.go`에서 스케줄 인식 타이밍 분석 구현.
+
+**11m. MI (상호 정보) 시드 스케줄링**: 프로그램 특성과 커버리지 결과 간 상호 정보를 활용한 정보 이론 기반 시드 우선순위화. `pkg/corpus/mi.go`에서 MI 기반 시드 랭킹으로 코퍼스 스케줄링 최적화.
+
+### Wave 3 (11j): ACTOR + LinUCB + 스펙트럴 그래프 — 미완료
+
+**11j-ACTOR**: syscall 간 딜레이 주입으로 레이스 컨디션 노출 (ACTOR, USENIX Sec 2023). 미구현.
+
+**11j-LinUCB**: 적응형 딜레이 패턴 선택을 위한 컨텍스트 밴딧 (LinUCB 알고리즘). `pkg/fuzzer/linucb.go`에 코드 존재 — 4 arms (딜레이 없음, 랜덤, 호출 간, 락 주변), 8차원 특성 벡터, Sherman-Morrison 증분 역행렬 업데이트, alpha 어닐링. **퍼징 루프에 아직 미연결.**
+
+**11j-스펙트럴**: syscall 의존성 추론을 위한 스펙트럴 그래프 분석. 미구현.
+
+### Wave 4 (11k, 11l): OZZ + 베이지안 최적화 — 미완료
+
+**11k-OZZ**: 체계적 동시성 탐색을 위한 `sched_yield` 주입. 미구현.
+
+**11l-베이지안 최적화**: `pkg/fuzzer/bayesopt.go` — DEzzer 파라미터 (감쇠 인자, 탐색 가중치 등) 자동 튜닝을 위한 베이지안 최적화. 코드 존재하나 완전 통합은 미완료.
+
+### 핵심 파일
+
+| 파일 | 용도 |
+|------|------|
+| `pkg/fuzzer/schedts.go` | LACE 스케줄 인식 타이밍 분석 |
+| `pkg/corpus/mi.go` | 상호 정보 시드 스케줄링 |
+| `pkg/fuzzer/linucb.go` | LinUCB 컨텍스트 밴딧 (4 arms, 8차원 특성) |
+| `pkg/fuzzer/bayesopt.go` | 하이퍼파라미터 튜닝용 베이지안 최적화 |
+
+---
+
+## Phase 12: 종합 성능 튜닝 — 완료
+
+**목표**: 4개 트랙에 걸친 체계적 성능 튜닝: DEzzer 정밀도, 컨텍스트 인식 스케줄링, 베이지안 최적화 개선, eBPF 인프라 개선.
+
+**분석 기반**: 5회 독립 검증 (3회 리스크 분석 + 2회 교차 점검). 7 CRITICAL + 13 HIGH 리스크 항목 식별 및 최종 계획에서 대응 완료.
+
+### Track A: DEzzer/뮤테이션 정밀도
+
+- **A2 (D18)**: prevOp 수정 — `mutateProgRequest`가 이전 연산자 이름을 DEzzer pair TS에 정확히 전달하도록 수정, pair TS 활용률 ~5% → ~50%+ 증가
+- **A4 (D20)**: pairCount 감쇠 — `pairCount`와 `clusterCount`를 `maybeDecay()`에서 레이어별 인자(pair: factor^0.5, cluster: factor^0.7)로 감쇠하여 비율 왜곡 방지
+- **A5 (D23)**: Splice alpha 정규화 모니터링 + CUSUM 리셋 대비 60초 상호 배제 윈도우로 이중 신뢰도 파괴 방지
+- **A7**: DEzzer 통계 리포팅 수정으로 정확한 대시보드 표시
+
+### Track B: 컨텍스트 인식 TS + 액션 스페이스
+
+- **B1**: 세밀한 연산자 선택을 위한 Cross-product TS (cluster × objective)
+- **B3**: DEzzer 뮤테이션 연산자 액션 스페이스 확장
+
+### Track C: 베이지안 최적화 개선
+
+- **C1**: BO 파라미터 공간 확장 (LinUCB alpha, 감쇠 인자)
+- **C2**: BO 수렴 속도 개선 (목표: ≤20 epoch에서 최적값의 90% 도달)
+
+### Track D: eBPF/인프라
+
+- **D2**: 최적 메모리/성능 밸런스를 위한 eBPF 맵 크기 튜닝
+
+### 검증
+
+각 트랙 soak test (표준 10분, A5 같은 고위험 항목은 30분) 검증. 트랙 간 빌드+테스트 게이트.
+
+---
+
+## Phase 14: 크로스 페이즈 시너지 통합 — 완료
+
+**목표**: DEzzer, Focus, eBPF, SyzGPT, Anamnesis 간 서브시스템 간 시너지 통합. 3라운드 리뷰 계획 (Architect R1 → Critic R2 → Architect R3).
+
+**범위**: 5개 Wave에 걸쳐 19개 항목 (17 D항목 + 14a + 14b). 7개 항목 Phase 15로 이연 (14c-14h, D12).
+
+### Wave 1: 기반 (D4, D6, D23, D8, D22, D3, D7) — 완료
+
+- **D4**: `classifyProgram` 6→10 클러스터 확장 — ClusterIOURING(6), ClusterBPF(7), ClusterKEYCTL(8), ClusterOther2(9) 추가. isFS()에서 io_uring 제거. configVersion=2.
+- **D6**: DEzzer verbose 로그 레벨 이미 3 (기구현).
+- **D23**: `maybeDecay()`에 alpha 폭주 방지 가드 추가 — global+cluster 사후확률 10000 캡.
+- **D8**: Write-to-freed 정렬에 512/1024 이미 포함 (기구현).
+- **D22**: Anamnesis 통계 네이밍 이미 일관적 (기구현).
+- **D3**: NgramClient 포트 `mgrconfig`으로 설정 가능 (기존 하드코딩).
+- **D7**: PageUafThreshold, FdReuseThreshold `mgrconfig`으로 설정 가능 (기본값 포함).
+
+### Wave 2: 정확도/효율성 (D5, D14, D13, D15, D9) — 완료
+
+- **D5**: `SetAIMutationHints`에서 JSON marshal/unmarshal 라운드트립 제거 — 직접 타입 단언. `encoding/json` import 제거.
+- **D14**: StepB 크래시 해시에 `totalSignal` 포함하여 커버리지 델타 차별화.
+- **D13**: `CostTracker`에 타입별 비용 추적 (StepB/StepD/LFS 호출 및 비용).
+- **D15**: 10000 실행마다 `BPF_MAP_GET_NEXT_KEY` + `BPF_MAP_DELETE_ELEM` 루프로 `seen_stacks` 주기적 초기화. executor에 새 `ebpf_seen_stacks_fd`.
+- **D9**: DEzzer에 새 `RecordAnamnesisBonus(op, cluster, multiplier)` 메서드. processResult에서 Anamnesis 평가 후 연결. 배수: 1.2 (score>=40), 1.5 (shouldFocus), 2.0 (tier<=2).
+
+### Wave 3: Focus 최적화 (D21, D26, D27, D10) — 완료
+
+- **D21**: `focusTitles`를 해시 기반 `focusDedup` LRU[uint64, bool]로 교체. 프로그램 바이트의 FNV-64a 해시 (트리거 타입 접두사 제거).
+- **D26**: 에폭 기반 (5분) Focus 예산 추적 (atomic 카운터). 에폭당 30% 예산 캡. 기존 생애 캡은 보조 가드레일로 유지.
+- **D27**: D21 설계에서 inherent한 크로스 트리거 디덥 — 같은 프로그램 해시면 트리거 타입 무관하게 건너뜀 (UAF, double-free, cross-cache).
+- **D10**: 대시보드 eBPF 통계를 3개 그래프 그룹으로 분리: `ebpf-uaf`, `ebpf-heap`, `ebpf-race`.
+
+### Wave 4: 학습 파이프라인 (D25) — 완료
+
+- **D25**: MOCK BiGRU 학습 데이터 수집 (1/100 샘플링, JSONL 포맷), 증분 학습 파이프라인, 어휘 확장, 체크포인트 관리. `tools/mock_model/train.py`로 CLI 지원.
+
+### Wave 5a: Phase 10 시너지 (14a, 14b) — 완료
+
+- **14a**: SyzGPT 자동 시드 생성 — specgen 출력에서 syzgpt 주입으로의 spec→syzlang→seed 파이프라인 연결.
+- **14b**: Focus 자동 집중 — `TriggerFocusForGap` 콜백이 spec 갭을 클러스터에 매핑, 최고 갭 클러스터에 대해 Focus 자동 트리거. `syz-manager/ai_triage.go`에 구현.
+
+### Phase 15로 이연
+
+14c (DEzzer 포화 타겟팅), 14d (CrashSpec 피드백), 14e (SpecDEzzer MAB), 14f (Anamnesis→스펙 리파인), 14g (SyzSpec→MOCK BiGRU), 14h (eBPF-Spec 런타임 추론). 아직 가용하지 않은 상당한 신규 인프라 필요.
+
+---
+
 ## Phase 6+: 고급 개선 로드맵
 
 **상세 로드맵**: `syzkaller/probe_log/improvement_roadmap.md` 참조 (기술 상세, 논문 레퍼런스, 비용 예측 포함).
 
 30+ 논문 (CCS/NDSS/ASPLOS/USENIX 2022-2026) 서베이 결과 39개 적용 가능 기술을 식별하고 7개 Phase로 우선순위화:
 
-| Phase | 초점 | 일정 | 핵심 기술 | 예상 효과 |
-|-------|------|------|----------|----------|
-| 6 | AI 비용 최적화 + 스케줄링 | 1주차 | Batch API, Prompt Caching, Tiered Routing, T-Scheduler, SyzMini, DEzzer | **API 비용 -80%**, 스케줄링 개선 |
-| 7 | 핵심 탐지력 강화 | 2-3주차 | SyzGPT (DRAG), CountDown (refcount), Cross-cache, 권한상승, GPTrace | **취약점 탐지 +323%**, UAF +66% |
-| 8 | 뮤테이션 & 커버리지 혁신 | 3-4주차 | Write-to-freed, Op-pair TS, Multi-obj MAB, MOCK BiGRU, Cluster TS, Effective Component | **커버리지 +3-12%**, 고위험 버그 2-3x |
-| 9 | 고급 커버리지 & 탐지 | 2개월 | KBinCov, Page-level UAF, Context-sensitive, FD, Anamnesis | **바이너리 커버리지 +87%** |
-| 10 | 스펙 자동 생성 | 2-3개월 | KernelGPT, SyzForge, SyzSpec | **커버리지 +13-18%**, 새 syscall |
-| 11 | 동시성 버그 | 3개월 | LACE, ACTOR, OZZ | **커버리지 +38%**, 레이스 컨디션 |
-| 12 | 고급 모니터링 & 연구 | 3개월+ | KASLR leak, Quarantine bypass, Snowplow, Big Sleep | 실험적 |
+| Phase | 초점 | 일정 | 핵심 기술 | 예상 효과 | 상태 |
+|-------|------|------|----------|----------|------|
+| 6 | AI 비용 최적화 + 스케줄링 | 1주차 | Batch API, Prompt Caching, Tiered Routing, T-Scheduler, SyzMini, DEzzer | **API 비용 -80%**, 스케줄링 개선 | **완료** |
+| 7 | 핵심 탐지력 강화 | 2-3주차 | SyzGPT (DRAG), CountDown (refcount), Cross-cache, 권한상승, GPTrace | **취약점 탐지 +323%**, UAF +66% | **완료** |
+| 8 | 뮤테이션 & 커버리지 혁신 | 3-4주차 | Write-to-freed, Op-pair TS, Multi-obj MAB, MOCK BiGRU, Cluster TS, Effective Component | **커버리지 +3-12%**, 고위험 버그 2-3x | **완료** |
+| 9 | 고급 커버리지 & 탐지 | 2개월 | KBinCov, Page-level UAF, Context-sensitive, FD, Anamnesis | **바이너리 커버리지 +87%** | **완료** |
+| 10 | 스펙 자동 생성 | 2-3개월 | DeepSeek 스펙 생성, SyzGPT 시드 | **커버리지 +13-18%**, 새 syscall | **완료** |
+| 11 | 동시성 & 성능 | 3개월 | LACE, MI 스케줄링, LinUCB, BayesOpt | **커버리지 +38%**, 레이스 컨디션 | **부분 완료** |
+| 12 | 종합 성능 튜닝 | 3개월+ | DEzzer 정밀도, BO 개선, eBPF 튜닝 | **체계적 최적화** | **완료** |
+| 14 | 크로스 페이즈 시너지 | 3개월+ | DEzzer-Focus-eBPF-SyzGPT-Anamnesis 통합 | **서브시스템 간 최적화** | **완료** |
 
 ### 비용 발생 기술 (API 예산 필요)
 - SyzGPT 시드 생성 (+$0.10-0.50/일)
@@ -716,16 +911,24 @@ cd syzkaller && make host
 | `prog/rand.go` | 정수 생성, 특수 값 |
 | `pkg/fuzzer/fuzzer.go` | 퍼징 루프, 큐 관리 |
 | `pkg/fuzzer/job.go` | Job 타입 (triage, smash, hints) |
+| `pkg/fuzzer/dezzer.go` | DEzzer TS+DE 옵티마이저 (쌍/클러스터/메타-밴딧) |
+| `pkg/fuzzer/schedts.go` | LACE 스케줄 인식 타이밍 분석 (Phase 11) |
+| `pkg/fuzzer/linucb.go` | LinUCB 컨텍스트 밴딧 (4 arms, 8차원 특성) (Phase 11) |
+| `pkg/fuzzer/bayesopt.go` | 하이퍼파라미터 튜닝용 베이지안 최적화 (Phase 11/12) |
+| `pkg/fuzzer/lru.go` | 범용 LRU 캐시 구현 |
+| `pkg/corpus/mi.go` | 상호 정보 시드 스케줄링 (Phase 11) |
 | `pkg/report/report.go` | 크래시 파싱 파이프라인 |
 | `pkg/report/crash/types.go` | 크래시 유형 정의 |
 | `pkg/report/impact_score.go` | 심각도 랭킹 |
 | `pkg/report/linux.go` | 리눅스 전용 크래시 파싱 |
+| `pkg/aitriage/aitriage.go` | AI 트리아지 핵심 로직 |
+| `pkg/aitriage/specgen.go` | AI 스펙 생성 엔진 (Phase 10) |
 | `pkg/manager/` | 매니저 비즈니스 로직 |
+| `syz-manager/syzgpt.go` | SyzGPT 시드 생성 매니저 (Phase 10) |
+| `syz-manager/ai_triage.go` | AI 트리아지 매니저 통합 |
 | `sys/linux/*.txt` | Syscall 기술 (syzlang) |
 | `executor/executor.cc` | VM 내 syscall 실행기 (C++) |
-| `executor/ebpf/probe_ebpf.bpf.c` | eBPF 힙 모니터 (BPF C) |
 | `executor/ebpf/probe_ebpf.bpf.c` | eBPF 힙 모니터 + write-to-freed (Phase 5/7/8a, 통합) |
-| `pkg/fuzzer/dezzer.go` | DEzzer TS+DE 옵티마이저 (쌍/클러스터/메타-밴딧) |
 | `tools/mock_model/` | MOCK BiGRU 모델 서비스 (Python) — Phase 8d |
 | `tools/syz-ebpf-loader/main.go` | BPF 로더 바이너리 (Go) |
 | `pkg/flatrpc/flatrpc.fbs` | FlatBuffers RPC 스키마 |

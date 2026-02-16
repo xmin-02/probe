@@ -26,7 +26,16 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"sync"
 )
+
+// PROBE: Object pool for serialization byte buffers to reduce allocation overhead.
+var execBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 0, 4<<10)
+		return &buf
+	},
+}
 
 const (
 	execInstrEOF = ^uint64(iota)
@@ -67,9 +76,12 @@ const (
 // If the provided buffer is too small for the program an error is returned.
 func (p *Prog) SerializeForExec() ([]byte, error) {
 	p.debugValidate()
+	// PROBE: Reuse byte buffer from pool to reduce allocation overhead.
+	bp := execBufPool.Get().(*[]byte)
+	buf := (*bp)[:0]
 	w := &execContext{
 		target: p.Target,
-		buf:    make([]byte, 0, 4<<10),
+		buf:    buf,
 		args:   make(map[Arg]argInfo),
 	}
 	w.write(uint64(len(p.Calls)))
@@ -81,12 +93,22 @@ func (p *Prog) SerializeForExec() ([]byte, error) {
 	}
 	w.write(execInstrEOF)
 	if len(w.buf) > ExecBufferSize {
+		// Return buffer to pool before returning error.
+		poolBuf := w.buf[:0]
+		execBufPool.Put(&poolBuf)
 		return nil, fmt.Errorf("encodingexec: too large program (%v/%v)", len(w.buf), ExecBufferSize)
 	}
 	if w.copyoutSeq > execMaxCommands {
+		poolBuf := w.buf[:0]
+		execBufPool.Put(&poolBuf)
 		return nil, fmt.Errorf("encodingexec: too many resources (%v/%v)", w.copyoutSeq, execMaxCommands)
 	}
-	return w.buf, nil
+	// Make a copy so the pooled buffer can be returned.
+	result := make([]byte, len(w.buf))
+	copy(result, w.buf)
+	poolBuf := w.buf[:0]
+	execBufPool.Put(&poolBuf)
+	return result, nil
 }
 
 func (w *execContext) serializeCall(c *Call) error {
@@ -337,15 +359,17 @@ func (w *execContext) writeArg(arg Arg) {
 		} else {
 			info, ok := w.args[a.Res]
 			if !ok {
-				panic("no copyout index")
+				// Broken reference (e.g., after mutation reordering). Use default value.
+				w.writeConstArg(a.Size(), a.Val, 0, 0, 0, a.Type().Format())
+			} else {
+				w.write(execArgResult)
+				meta := a.Size() | uint64(a.Type().Format())<<8
+				w.write(meta)
+				w.write(info.Idx)
+				w.write(a.OpDiv)
+				w.write(a.OpAdd)
+				w.write(a.Type().(*ResourceType).Default())
 			}
-			w.write(execArgResult)
-			meta := a.Size() | uint64(a.Type().Format())<<8
-			w.write(meta)
-			w.write(info.Idx)
-			w.write(a.OpDiv)
-			w.write(a.OpAdd)
-			w.write(a.Type().(*ResourceType).Default())
 		}
 	case *PointerArg:
 		switch a.Size() {

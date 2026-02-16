@@ -10,29 +10,42 @@
 package fuzzer
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"sync"
 	"time"
 )
 
 const (
-	ngramDefaultAddr     = "127.0.0.1:50051"
-	ngramDialTimeout     = 2 * time.Second
-	ngramReadTimeout     = 500 * time.Millisecond
-	ngramHealthInterval  = 5 * time.Second
-	ngramMinConfidence   = 0.10 // minimum confidence to use BiGRU prediction
+	ngramDefaultAddr      = "127.0.0.1:50051"
+	ngramDialTimeout      = 2 * time.Second
+	ngramReadTimeout      = 200 * time.Millisecond
+	ngramHealthInterval   = 5 * time.Second
+	ngramMinConfidence    = 0.10 // minimum confidence to use BiGRU prediction
+	ngramMaxFailures      = 3   // consecutive failures before bypass
+	ngramBypassCooldown   = 10 * time.Second
+	ngramTCPKeepAlive     = 15 * time.Second
 )
 
 // NgramClient is a lightweight TCP/JSON client for the MOCK BiGRU server.
-// Uses a simple JSON-line protocol to avoid pulling gRPC as a Go dependency.
+// Uses a persistent TCP connection with JSON-line protocol to avoid per-call
+// dial overhead and gRPC dependency.
 type NgramClient struct {
 	mu      sync.Mutex
 	addr    string
 	healthy bool
 	lastCheck time.Time
 	done    chan struct{}
+
+	// Persistent connection fields.
+	conn        net.Conn
+	connMu      sync.Mutex // separate lock for connection to avoid holding mu during I/O
+	reader      *bufio.Scanner
+	failCount   int
+	bypassUntil time.Time
 
 	// UCB-1 tracking: BiGRU vs ChoiceTable performance.
 	bigruWins   int64
@@ -134,10 +147,13 @@ func (c *NgramClient) ShouldUseBiGRU() bool {
 		return c.bigruTrials <= c.ctTrials
 	}
 
-	// UCB-1 comparison.
+	// UCB-1 comparison with exploration bonus.
+	totalTrials := float64(c.bigruTrials + c.ctTrials)
 	bigruRate := float64(c.bigruWins) / float64(c.bigruTrials)
 	ctRate := float64(c.ctWins) / float64(c.ctTrials)
-	return bigruRate >= ctRate
+	bigruUCB := bigruRate + math.Sqrt(2*math.Log(totalTrials)/float64(c.bigruTrials))
+	ctUCB := ctRate + math.Sqrt(2*math.Log(totalTrials)/float64(c.ctTrials))
+	return bigruUCB >= ctUCB
 }
 
 // Healthy returns whether the MOCK server is reachable.
@@ -159,44 +175,122 @@ func (c *NgramClient) Retrain(corpusDir string) error {
 	return nil
 }
 
-func (c *NgramClient) send(req ngramRequest) (*ngramResponse, error) {
-	conn, err := net.DialTimeout("tcp", c.addr, ngramDialTimeout)
-	if err != nil {
-		return nil, err
+// connect establishes or re-establishes the persistent TCP connection.
+// Must be called with connMu held.
+func (c *NgramClient) connect() error {
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+		c.reader = nil
 	}
-	defer conn.Close()
 
-	conn.SetDeadline(time.Now().Add(ngramReadTimeout))
+	dialer := net.Dialer{
+		Timeout:   ngramDialTimeout,
+		KeepAlive: ngramTCPKeepAlive,
+	}
+	conn, err := dialer.Dial("tcp", c.addr)
+	if err != nil {
+		return err
+	}
+	c.conn = conn
+	c.reader = bufio.NewScanner(conn)
+	c.reader.Buffer(make([]byte, 0, 8192), 8192)
+	c.failCount = 0
+	return nil
+}
+
+func (c *NgramClient) send(req ngramRequest) (*ngramResponse, error) {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+
+	// Check bypass: if too many consecutive failures, skip until cooldown.
+	if c.failCount >= ngramMaxFailures && time.Now().Before(c.bypassUntil) {
+		return nil, fmt.Errorf("bypassed: %d consecutive failures, cooldown until %v",
+			c.failCount, c.bypassUntil)
+	}
+
+	// Establish connection if needed.
+	if c.conn == nil {
+		if err := c.connect(); err != nil {
+			c.failCount++
+			if c.failCount >= ngramMaxFailures {
+				c.bypassUntil = time.Now().Add(ngramBypassCooldown)
+			}
+			return nil, err
+		}
+	}
+
+	// Try send+recv, reconnect once on error.
+	resp, err := c.sendOnConn(req)
+	if err != nil {
+		// Connection may be stale; reconnect and retry once.
+		if connErr := c.connect(); connErr != nil {
+			c.failCount++
+			if c.failCount >= ngramMaxFailures {
+				c.bypassUntil = time.Now().Add(ngramBypassCooldown)
+			}
+			return nil, connErr
+		}
+		resp, err = c.sendOnConn(req)
+		if err != nil {
+			c.failCount++
+			if c.failCount >= ngramMaxFailures {
+				c.bypassUntil = time.Now().Add(ngramBypassCooldown)
+			}
+			return nil, err
+		}
+	}
+
+	c.failCount = 0
+	return resp, nil
+}
+
+// sendOnConn performs the actual write+read on the current connection.
+// Must be called with connMu held.
+func (c *NgramClient) sendOnConn(req ngramRequest) (*ngramResponse, error) {
+	if c.conn == nil {
+		return nil, fmt.Errorf("no connection")
+	}
+
+	c.conn.SetDeadline(time.Now().Add(ngramReadTimeout))
 
 	data, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
 	data = append(data, '\n')
-	if _, err := conn.Write(data); err != nil {
+	if _, err := c.conn.Write(data); err != nil {
 		return nil, err
 	}
 
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, err
+	if !c.reader.Scan() {
+		if err := c.reader.Err(); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("connection closed by server")
 	}
 
 	var resp ngramResponse
-	if err := json.Unmarshal(buf[:n], &resp); err != nil {
+	if err := json.Unmarshal(c.reader.Bytes(), &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil
 }
 
-// Stop terminates the healthLoop goroutine.
+// Stop terminates the healthLoop goroutine and closes the persistent connection.
 func (c *NgramClient) Stop() {
 	select {
 	case <-c.done:
 	default:
 		close(c.done)
 	}
+	c.connMu.Lock()
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+		c.reader = nil
+	}
+	c.connMu.Unlock()
 }
 
 func (c *NgramClient) healthLoop() {

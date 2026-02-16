@@ -5,6 +5,7 @@ package fuzzer
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/pkg/stat"
@@ -12,9 +13,10 @@ import (
 
 // Cover keeps track of the signal known to the fuzzer.
 type Cover struct {
-	mu        sync.RWMutex
-	maxSignal signal.Signal // max signal ever observed (including flakes)
-	newSignal signal.Signal // newly identified max signal
+	mu               sync.RWMutex
+	maxSignal        signal.Signal // max signal ever observed (including flakes)
+	newSignal        signal.Signal // newly identified max signal
+	maxSignalLenCache atomic.Int64 // PROBE: lock-free cache of len(maxSignal)
 }
 
 func newCover() *Cover {
@@ -26,13 +28,15 @@ func newCover() *Cover {
 
 func (cover *Cover) addRawMaxSignal(signal []uint64, prio uint8) signal.Signal {
 	cover.mu.Lock()
-	defer cover.mu.Unlock()
 	diff := cover.maxSignal.DiffRaw(signal, prio)
 	if diff.Empty() {
+		cover.mu.Unlock()
 		return diff
 	}
 	cover.maxSignal.Merge(diff)
 	cover.newSignal.Merge(diff)
+	cover.maxSignalLenCache.Store(int64(cover.maxSignal.Len()))
+	cover.mu.Unlock()
 	return diff
 }
 
@@ -43,11 +47,9 @@ func (cover *Cover) CopyMaxSignal() signal.Signal {
 }
 
 // PROBE: MaxSignalLen returns the current size of the max signal set.
-// Used by focusJob to detect coverage progress.
+// Uses lock-free atomic cache updated by addRawMaxSignal.
 func (cover *Cover) MaxSignalLen() int {
-	cover.mu.RLock()
-	defer cover.mu.RUnlock()
-	return cover.maxSignal.Len()
+	return int(cover.maxSignalLenCache.Load())
 }
 
 func (cover *Cover) GrabSignalDelta() signal.Signal {

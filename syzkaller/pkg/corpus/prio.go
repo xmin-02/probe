@@ -28,11 +28,15 @@ func (pl *ProgramsList) chooseProgram(r *rand.Rand) *prog.Prog {
 	return pl.progs[idx]
 }
 
-func (pl *ProgramsList) saveProgram(p *prog.Prog, signal signal.Signal) {
-	prio := int64(len(signal))
-	if prio == 0 {
-		prio = 1
+func (pl *ProgramsList) saveProgram(p *prog.Prog, signal signal.Signal, miScore float64) {
+	covPrio := int64(len(signal))
+	if covPrio == 0 {
+		covPrio = 1
 	}
+	// Blend: 70% coverage-count + 30% MI score.
+	// miScore is in [0,1]; miBonus scales it relative to covPrio.
+	miBonus := int64(float64(covPrio) * miScore * miBlendWeight / (1.0 - miBlendWeight))
+	prio := covPrio + miBonus
 	pl.sumPrios += prio
 	pl.accPrios = append(pl.accPrios, pl.sumPrios)
 	pl.progs = append(pl.progs, p)

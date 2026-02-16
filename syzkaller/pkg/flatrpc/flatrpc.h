@@ -2363,6 +2363,9 @@ struct ProgInfoRawT : public ::flatbuffers::NativeTable {
   uint32_t ebpf_fd_reuse_count = 0;
   uint32_t ebpf_fd_reuse_score = 0;
   uint32_t ebpf_context_stacks = 0;
+  uint32_t ebpf_lock_contention = 0;
+  uint32_t ebpf_concurrent_access = 0;
+  uint32_t ebpf_sched_switch = 0;
   ProgInfoRawT() = default;
   ProgInfoRawT(const ProgInfoRawT &o);
   ProgInfoRawT(ProgInfoRawT&&) FLATBUFFERS_NOEXCEPT = default;
@@ -2398,7 +2401,10 @@ struct ProgInfoRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
     VT_EBPF_FD_CLOSE_COUNT = 48,
     VT_EBPF_FD_REUSE_COUNT = 50,
     VT_EBPF_FD_REUSE_SCORE = 52,
-    VT_EBPF_CONTEXT_STACKS = 54
+    VT_EBPF_CONTEXT_STACKS = 54,
+    VT_EBPF_LOCK_CONTENTION = 56,
+    VT_EBPF_CONCURRENT_ACCESS = 58,
+    VT_EBPF_SCHED_SWITCH = 60
   };
   const ::flatbuffers::Vector<::flatbuffers::Offset<rpc::CallInfoRaw>> *calls() const {
     return GetPointer<const ::flatbuffers::Vector<::flatbuffers::Offset<rpc::CallInfoRaw>> *>(VT_CALLS);
@@ -2478,6 +2484,15 @@ struct ProgInfoRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   uint32_t ebpf_context_stacks() const {
     return GetField<uint32_t>(VT_EBPF_CONTEXT_STACKS, 0);
   }
+  uint32_t ebpf_lock_contention() const {
+    return GetField<uint32_t>(VT_EBPF_LOCK_CONTENTION, 0);
+  }
+  uint32_t ebpf_concurrent_access() const {
+    return GetField<uint32_t>(VT_EBPF_CONCURRENT_ACCESS, 0);
+  }
+  uint32_t ebpf_sched_switch() const {
+    return GetField<uint32_t>(VT_EBPF_SCHED_SWITCH, 0);
+  }
   bool Verify(::flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyOffset(verifier, VT_CALLS) &&
@@ -2511,6 +2526,9 @@ struct ProgInfoRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            VerifyField<uint32_t>(verifier, VT_EBPF_FD_REUSE_COUNT, 4) &&
            VerifyField<uint32_t>(verifier, VT_EBPF_FD_REUSE_SCORE, 4) &&
            VerifyField<uint32_t>(verifier, VT_EBPF_CONTEXT_STACKS, 4) &&
+           VerifyField<uint32_t>(verifier, VT_EBPF_LOCK_CONTENTION, 4) &&
+           VerifyField<uint32_t>(verifier, VT_EBPF_CONCURRENT_ACCESS, 4) &&
+           VerifyField<uint32_t>(verifier, VT_EBPF_SCHED_SWITCH, 4) &&
            verifier.EndTable();
   }
   ProgInfoRawT *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
@@ -2600,6 +2618,15 @@ struct ProgInfoRawBuilder {
   void add_ebpf_context_stacks(uint32_t ebpf_context_stacks) {
     fbb_.AddElement<uint32_t>(ProgInfoRaw::VT_EBPF_CONTEXT_STACKS, ebpf_context_stacks, 0);
   }
+  void add_ebpf_lock_contention(uint32_t ebpf_lock_contention) {
+    fbb_.AddElement<uint32_t>(ProgInfoRaw::VT_EBPF_LOCK_CONTENTION, ebpf_lock_contention, 0);
+  }
+  void add_ebpf_concurrent_access(uint32_t ebpf_concurrent_access) {
+    fbb_.AddElement<uint32_t>(ProgInfoRaw::VT_EBPF_CONCURRENT_ACCESS, ebpf_concurrent_access, 0);
+  }
+  void add_ebpf_sched_switch(uint32_t ebpf_sched_switch) {
+    fbb_.AddElement<uint32_t>(ProgInfoRaw::VT_EBPF_SCHED_SWITCH, ebpf_sched_switch, 0);
+  }
   explicit ProgInfoRawBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -2638,11 +2665,17 @@ inline ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRaw(
     uint32_t ebpf_fd_close_count = 0,
     uint32_t ebpf_fd_reuse_count = 0,
     uint32_t ebpf_fd_reuse_score = 0,
-    uint32_t ebpf_context_stacks = 0) {
+    uint32_t ebpf_context_stacks = 0,
+    uint32_t ebpf_lock_contention = 0,
+    uint32_t ebpf_concurrent_access = 0,
+    uint32_t ebpf_sched_switch = 0) {
   ProgInfoRawBuilder builder_(_fbb);
   builder_.add_ebpf_min_reuse_ns(ebpf_min_reuse_ns);
   builder_.add_freshness(freshness);
   builder_.add_elapsed(elapsed);
+  builder_.add_ebpf_sched_switch(ebpf_sched_switch);
+  builder_.add_ebpf_concurrent_access(ebpf_concurrent_access);
+  builder_.add_ebpf_lock_contention(ebpf_lock_contention);
   builder_.add_ebpf_context_stacks(ebpf_context_stacks);
   builder_.add_ebpf_fd_reuse_score(ebpf_fd_reuse_score);
   builder_.add_ebpf_fd_reuse_count(ebpf_fd_reuse_count);
@@ -2696,7 +2729,10 @@ inline ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRawDirect(
     uint32_t ebpf_fd_close_count = 0,
     uint32_t ebpf_fd_reuse_count = 0,
     uint32_t ebpf_fd_reuse_score = 0,
-    uint32_t ebpf_context_stacks = 0) {
+    uint32_t ebpf_context_stacks = 0,
+    uint32_t ebpf_lock_contention = 0,
+    uint32_t ebpf_concurrent_access = 0,
+    uint32_t ebpf_sched_switch = 0) {
   auto calls__ = calls ? _fbb.CreateVector<::flatbuffers::Offset<rpc::CallInfoRaw>>(*calls) : 0;
   auto extra_raw__ = extra_raw ? _fbb.CreateVector<::flatbuffers::Offset<rpc::CallInfoRaw>>(*extra_raw) : 0;
   return rpc::CreateProgInfoRaw(
@@ -2726,7 +2762,10 @@ inline ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRawDirect(
       ebpf_fd_close_count,
       ebpf_fd_reuse_count,
       ebpf_fd_reuse_score,
-      ebpf_context_stacks);
+      ebpf_context_stacks,
+      ebpf_lock_contention,
+      ebpf_concurrent_access,
+      ebpf_sched_switch);
 }
 
 ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRaw(::flatbuffers::FlatBufferBuilder &_fbb, const ProgInfoRawT *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
@@ -3828,7 +3867,10 @@ inline ProgInfoRawT::ProgInfoRawT(const ProgInfoRawT &o)
         ebpf_fd_close_count(o.ebpf_fd_close_count),
         ebpf_fd_reuse_count(o.ebpf_fd_reuse_count),
         ebpf_fd_reuse_score(o.ebpf_fd_reuse_score),
-        ebpf_context_stacks(o.ebpf_context_stacks) {
+        ebpf_context_stacks(o.ebpf_context_stacks),
+        ebpf_lock_contention(o.ebpf_lock_contention),
+        ebpf_concurrent_access(o.ebpf_concurrent_access),
+        ebpf_sched_switch(o.ebpf_sched_switch) {
   calls.reserve(o.calls.size());
   for (const auto &calls_ : o.calls) { calls.emplace_back((calls_) ? new rpc::CallInfoRawT(*calls_) : nullptr); }
   extra_raw.reserve(o.extra_raw.size());
@@ -3862,6 +3904,9 @@ inline ProgInfoRawT &ProgInfoRawT::operator=(ProgInfoRawT o) FLATBUFFERS_NOEXCEP
   std::swap(ebpf_fd_reuse_count, o.ebpf_fd_reuse_count);
   std::swap(ebpf_fd_reuse_score, o.ebpf_fd_reuse_score);
   std::swap(ebpf_context_stacks, o.ebpf_context_stacks);
+  std::swap(ebpf_lock_contention, o.ebpf_lock_contention);
+  std::swap(ebpf_concurrent_access, o.ebpf_concurrent_access);
+  std::swap(ebpf_sched_switch, o.ebpf_sched_switch);
   return *this;
 }
 
@@ -3900,6 +3945,9 @@ inline void ProgInfoRaw::UnPackTo(ProgInfoRawT *_o, const ::flatbuffers::resolve
   { auto _e = ebpf_fd_reuse_count(); _o->ebpf_fd_reuse_count = _e; }
   { auto _e = ebpf_fd_reuse_score(); _o->ebpf_fd_reuse_score = _e; }
   { auto _e = ebpf_context_stacks(); _o->ebpf_context_stacks = _e; }
+  { auto _e = ebpf_lock_contention(); _o->ebpf_lock_contention = _e; }
+  { auto _e = ebpf_concurrent_access(); _o->ebpf_concurrent_access = _e; }
+  { auto _e = ebpf_sched_switch(); _o->ebpf_sched_switch = _e; }
 }
 
 inline ::flatbuffers::Offset<ProgInfoRaw> ProgInfoRaw::Pack(::flatbuffers::FlatBufferBuilder &_fbb, const ProgInfoRawT* _o, const ::flatbuffers::rehasher_function_t *_rehasher) {
@@ -3936,6 +3984,9 @@ inline ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRaw(::flatbuffers::FlatB
   auto _ebpf_fd_reuse_count = _o->ebpf_fd_reuse_count;
   auto _ebpf_fd_reuse_score = _o->ebpf_fd_reuse_score;
   auto _ebpf_context_stacks = _o->ebpf_context_stacks;
+  auto _ebpf_lock_contention = _o->ebpf_lock_contention;
+  auto _ebpf_concurrent_access = _o->ebpf_concurrent_access;
+  auto _ebpf_sched_switch = _o->ebpf_sched_switch;
   return rpc::CreateProgInfoRaw(
       _fbb,
       _calls,
@@ -3963,7 +4014,10 @@ inline ::flatbuffers::Offset<ProgInfoRaw> CreateProgInfoRaw(::flatbuffers::FlatB
       _ebpf_fd_close_count,
       _ebpf_fd_reuse_count,
       _ebpf_fd_reuse_score,
-      _ebpf_context_stacks);
+      _ebpf_context_stacks,
+      _ebpf_lock_contention,
+      _ebpf_concurrent_access,
+      _ebpf_sched_switch);
 }
 
 inline ExecResultRawT::ExecResultRawT(const ExecResultRawT &o)

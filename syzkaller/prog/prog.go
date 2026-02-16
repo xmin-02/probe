@@ -16,6 +16,10 @@ type Prog struct {
 
 	// Was deserialized using Unsafe mode, so can do unsafe things.
 	isUnsafe bool
+
+	// PROBE: Phase 11j — cached spectral dependency partitions for reorderConcurrent.
+	// Invalidated when calls are added/removed.
+	dependencyPartitions [][]int
 }
 
 const ExtraCallName = ".extra"
@@ -68,10 +72,20 @@ func (p *Prog) countArgs() int {
 // IMPORTANT: keep the exact values of "key" tag for existing props unchanged,
 // otherwise the backwards compatibility would be broken.
 type CallProps struct {
-	FailNth int  `key:"fail_nth"`
-	Async   bool `key:"async"`
-	Rerun   int  `key:"rerun"`
+	FailNth    int  `key:"fail_nth"`
+	Async      bool `key:"async"`
+	Rerun      int  `key:"rerun"`
+	DelayUs    int  `key:"delay_us"`
+	SchedYield bool `key:"sched_yield"`
 }
+
+// PROBE: Phase 11j — ACTOR delay patterns for concurrency-aware scheduling.
+const (
+	DelayNone        = 0
+	DelayRandom      = 1 // 1-100us random
+	DelayBetween     = 2 // 50us between syscalls
+	DelayAroundLocks = 3 // 100us around lock-related syscalls
+)
 
 type Call struct {
 	Meta    *Syscall
@@ -397,6 +411,7 @@ func (p *Prog) insertBefore(c *Call, calls []*Call) {
 		newCalls = append(newCalls, p.Calls[idx+1:]...)
 	}
 	p.Calls = newCalls
+	p.dependencyPartitions = nil // PROBE: invalidate spectral cache
 }
 
 // replaceArg replaces arg with arg1 in a program.
@@ -498,6 +513,7 @@ func (p *Prog) RemoveCall(idx int) {
 	}
 	copy(p.Calls[idx:], p.Calls[idx+1:])
 	p.Calls = p.Calls[:len(p.Calls)-1]
+	p.dependencyPartitions = nil // PROBE: invalidate spectral cache
 }
 
 func (p *Prog) sanitizeFix() {

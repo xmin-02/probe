@@ -46,6 +46,17 @@ type Request struct {
 	// Set by mutateProgRequest, read by processResult to record coverage gain.
 	MutOp string
 
+	// PROBE: Phase 12 B4 — sub-op name for two-level action space feedback.
+	SubOp string
+
+	// PROBE: Phase 11j — delay pattern index for LinUCB feedback.
+	// -1 = no delay decision made, 0-3 = delay pattern arm.
+	DelayPattern int
+
+	// PROBE: Phase 11k — schedule strategy arm for Global TS feedback.
+	// -1 = no strategy decision, 0-3 = SchedTS arm.
+	SchedArm int
+
 	// Avoid specifies set of executors that are preferable to avoid when executing this request.
 	// The restriction is soft since there can be only one executor at all or available right now.
 	Avoid []ExecutorID

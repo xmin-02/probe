@@ -695,21 +695,214 @@ Rationale: 8a is simplest with immediate value. 8b/8e extend DEzzer incrementall
 
 Each sub-phase: `go build` + `go vet` → 1h fuzzing (exec/sec baseline) → 4h run (crash discovery comparison).
 
+## Phase 9: Advanced Coverage & Detection — DONE
+
+**Goal**: Extend coverage metrics and vulnerability detection with page-level UAF, context-sensitive signals, FD lifecycle tracking, and AI-based exploit assessment.
+
+**Analysis basis**: KBinCov (CCS 2024), Anamnesis (2026), and custom detection heuristics for page-level and FD-based vulnerabilities.
+
+### 9a. Page-Level UAF Detection — DONE
+
+**Goal**: Detect page-level UAF by tracking page alloc/free patterns via eBPF. Extends slab-level UAF detection (Phase 5) to page allocator.
+
+**Design**: eBPF hooks on `tracepoint/kmem/mm_page_alloc` and `tracepoint/kmem/mm_page_free`. Tracks page-order allocations in dedicated BPF map. Score: page reuse within 1ms = high UAF probability.
+
+**New metrics**: `ebpf_page_alloc_count`, `ebpf_page_free_count`, `ebpf_page_uaf_score` in FlatBuffers.
+
+### 9b. Context-Sensitive Coverage — DONE
+
+**Goal**: Augment edge coverage with calling-context sensitivity for deeper signal differentiation.
+
+**Design**: Lightweight hash-based context tracking in signal processing. `pkg/signal/signal.go` modified to incorporate call-site context into signal hashes, enabling coverage distinctions for the same edge reached via different call paths.
+
+### 9c. FD Lifecycle Tracking — DONE
+
+**Goal**: Track file descriptor lifecycle (open/close/dup patterns) via eBPF for FD-reuse vulnerability detection.
+
+**Design**: eBPF programs on `sys_enter_close`, `sys_exit_openat` tracking FD allocation and deallocation patterns. `ebpf_fd_reuse_count` metric added to FlatBuffers. FD reuse within same execution = potential race condition signal.
+
+### 9d. Anamnesis Exploit Assessment — DONE
+
+**Goal**: AI-based exploit feasibility assessment using LLM analysis of crash context, memory layout, and known exploitation patterns.
+
+**Design**: `stepD()` in `pkg/aitriage/aitriage.go` runs after crash analysis. Uses DeepSeek API (primary) for cost-effective assessment. Scoring: 0-100 exploit feasibility. High scores (>=70) auto-trigger Focus Mode with priority boost. Assessment integrated into DEzzer feedback loop (Phase 14: RecordAnamnesisBonus).
+
+**Files**: `pkg/aitriage/aitriage.go` (stepD, assessment types), `pkg/aitriage/specgen.go` (spec generation), `pkg/fuzzer/fuzzer.go` (assessment integration in processResult)
+
+### 9e. Dashboard Enhancements — DONE
+
+**Stats**: `ebpf-uaf`, `ebpf-heap`, `ebpf-race` graph groups (split from single `ebpf` graph in Phase 14 D10). Anamnesis assessment stats on AI dashboard.
+
+---
+
+## Phase 10: AI Spec Auto-Generation — DONE
+
+**Goal**: Automatically generate syzkaller syscall specifications using LLM analysis of kernel source code, covering syscalls not yet described in syzlang.
+
+**Design**: DeepSeek API (primary, cost-effective) for spec generation. SyzSpec approach removed after analysis showed insufficient benefit.
+
+### Architecture
+
+```
+Kernel source analysis → Gap identification → LLM spec generation → Validation → Injection
+
+stepD() in aitriage.go:
+1. Identify syscalls with low/no coverage (gap analysis)
+2. Analyze kernel source for argument types, resource dependencies
+3. Generate syzlang specification via LLM
+4. Validate generated spec with prog.Deserialize()
+5. Inject valid specs into corpus as seed programs
+```
+
+### Key Components
+
+**`pkg/aitriage/specgen.go`**: Spec generation engine. Gap analysis, LLM prompt construction, syzlang output parsing and validation. Supports incremental generation (specs accumulated over time).
+
+**`syz-manager/syzgpt.go`**: Manager-side integration. Spec-to-seed pipeline, coverage tracking per generated spec, quality gating (discard specs with no coverage gain after 3 attempts).
+
+**Config**: Uses `ai_triage` config block. DeepSeek model auto-detected from model name prefix. Graceful degradation when API unavailable.
+
+**Cost**: ~$0.50-2.00 per generation run (DeepSeek pricing). Runs as part of hourly batch cycle.
+
+---
+
+## Phase 11: Concurrency & Performance Optimization — PARTIAL
+
+**Goal**: Add concurrency bug detection capabilities (LACE race detection, ACTOR delay injection) and performance optimizations (MI seed scheduling, LinUCB contextual bandit, Bayesian Optimization).
+
+### Wave 1 (11a-11h): P0/P1 Fixes + Track A Performance — DONE
+
+Critical bug fixes and performance improvements identified during Phase 8-10 integration:
+- P0 fixes: DEzzer array initialization, CUSUM circuit breaker (3 resets/10min limit), eBPF metric alignment
+- P1 fixes: smashJob DEzzer weight application, Focus job feedback loop stability
+- Track A: DEzzer TS accuracy improvements, exploration/exploitation balance tuning
+
+### Wave 2 (11i, 11m): LACE Race Detection + MI Seed Scheduling — DONE
+
+**11i. LACE Race Detection**: eBPF-based `sched_switch` tracepoint monitoring for detecting potential race conditions. Tracks concurrent execution patterns and context switch timing. `pkg/fuzzer/schedts.go` implements schedule-aware timing analysis.
+
+**11m. MI (Mutual Information) Seed Scheduling**: Information-theoretic seed prioritization using mutual information between program features and coverage outcomes. `pkg/corpus/mi.go` implements MI-based seed ranking for corpus scheduling optimization.
+
+### Wave 3 (11j): ACTOR + LinUCB + Spectral Graph — PENDING
+
+**11j-ACTOR**: Delay injection between syscalls to expose race conditions (ACTOR, USENIX Sec 2023). Not yet implemented.
+
+**11j-LinUCB**: Contextual bandit (LinUCB algorithm) for adaptive delay pattern selection. Code exists at `pkg/fuzzer/linucb.go` — 4 arms (no delay, random, between-calls, around-locks), 8-dimensional feature vector, Sherman-Morrison incremental inverse update, alpha annealing. **Not yet wired into fuzzing loop.**
+
+**11j-Spectral**: Spectral graph analysis for syscall dependency inference. Not yet implemented.
+
+### Wave 4 (11k, 11l): OZZ + Bayesian Optimization — PENDING
+
+**11k-OZZ**: `sched_yield` injection for systematic concurrency exploration. Not yet implemented.
+
+**11l-Bayesian Optimization**: `pkg/fuzzer/bayesopt.go` — Bayesian Optimization for automated hyperparameter tuning of DEzzer parameters (decay factor, exploration weight, etc.). Code exists but not fully integrated.
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `pkg/fuzzer/schedts.go` | LACE schedule-aware timing analysis |
+| `pkg/corpus/mi.go` | Mutual Information seed scheduling |
+| `pkg/fuzzer/linucb.go` | LinUCB contextual bandit (4 arms, 8-dim features) |
+| `pkg/fuzzer/bayesopt.go` | Bayesian Optimization for hyperparameter tuning |
+
+---
+
+## Phase 12: Comprehensive Performance Tuning — DONE
+
+**Goal**: Systematic performance tuning across 4 tracks: DEzzer precision, context-aware scheduling, Bayesian Optimization refinement, and eBPF infrastructure improvements.
+
+**Analysis basis**: 5-round independent verification (3x risk analysis + 2x cross-check). 7 CRITICAL + 13 HIGH risk items identified and mitigated in final plan.
+
+### Track A: DEzzer/Mutation Precision
+
+- **A2 (D18)**: prevOp fix — `mutateProgRequest` now correctly passes previous operator name to DEzzer pair TS, increasing pair TS utilization from ~5% to ~50%+
+- **A4 (D20)**: pairCount decay — `pairCount` and `clusterCount` now decayed in `maybeDecay()` with per-layer factors (pair: factor^0.5, cluster: factor^0.7) to prevent ratio distortion
+- **A5 (D23)**: Splice alpha normalization monitoring with 60-second mutual exclusion window against CUSUM resets to prevent double confidence destruction
+- **A7**: DEzzer stat reporting fixes for accurate dashboard display
+
+### Track B: Context-Aware TS + Action Space
+
+- **B1**: Cross-product TS (cluster × objective) for fine-grained operator selection
+- **B3**: Action space expansion for DEzzer mutation operators
+
+### Track C: Bayesian Optimization Refinement
+
+- **C1**: BO parameter space expansion (LinUCB alpha, decay factors)
+- **C2**: BO convergence speed improvement (target: 90% of best value in ≤20 epochs)
+
+### Track D: eBPF/Infrastructure
+
+- **D2**: eBPF map sizes tuning for optimal memory/performance balance
+
+### Verification
+
+Each track verified with soak tests (10-minute standard, 30-minute for high-risk items like A5). Build + test gates between tracks.
+
+---
+
+## Phase 14: Cross-Phase Synergy Integration — DONE
+
+**Goal**: Integrate cross-subsystem synergies across DEzzer, Focus, eBPF, SyzGPT, and Anamnesis. 3-round reviewed plan (Architect R1 → Critic R2 → Architect R3).
+
+**Scope**: 19 items (17 D-items + 14a + 14b) across 5 Waves. 7 items deferred to Phase 15 (14c-14h, D12).
+
+### Wave 1: Foundation (D4, D6, D23, D8, D22, D3, D7) — DONE
+
+- **D4**: `classifyProgram` expanded from 6 to 10 clusters — added ClusterIOURING(6), ClusterBPF(7), ClusterKEYCTL(8), ClusterOther2(9). io_uring removed from isFS(). configVersion=2.
+- **D6**: DEzzer verbose log level already at 3 (pre-existing).
+- **D23**: Alpha runaway defense-in-depth cap in `maybeDecay()` — caps global+cluster posteriors at 10000.
+- **D8**: Write-to-freed alignment already included 512/1024 (pre-existing).
+- **D22**: Anamnesis stat naming already consistent (pre-existing).
+- **D3**: NgramClient port configurable via `mgrconfig` (was hardcoded).
+- **D7**: PageUafThreshold and FdReuseThreshold configurable via `mgrconfig` with defaults.
+
+### Wave 2: Accuracy/Efficiency (D5, D14, D13, D15, D9) — DONE
+
+- **D5**: Removed JSON marshal/unmarshal round-trip from `SetAIMutationHints` — direct type assertion instead. `encoding/json` import removed.
+- **D14**: StepB crash hash now includes `totalSignal` for coverage delta differentiation.
+- **D13**: Per-type cost tracking (StepB/StepD/LFS calls and costs) in `CostTracker`.
+- **D15**: `seen_stacks` periodic clear every 10000 executions via `BPF_MAP_GET_NEXT_KEY` + `BPF_MAP_DELETE_ELEM` loop. New `ebpf_seen_stacks_fd` in executor.
+- **D9**: New `RecordAnamnesisBonus(op, cluster, multiplier)` method in DEzzer. Wired in processResult after Anamnesis assessment. Multipliers: 1.2 (score>=40), 1.5 (shouldFocus), 2.0 (tier<=2).
+
+### Wave 3: Focus Optimization (D21, D26, D27, D10) — DONE
+
+- **D21**: `focusTitles` replaced with hash-based `focusDedup` LRU[uint64, bool]. FNV-64a hash of program bytes with trigger-type prefix stripped.
+- **D26**: Per-epoch (5-minute) Focus budget tracking with atomic counters. 30% budget cap per epoch. Existing lifetime cap retained as secondary guardrail.
+- **D27**: Cross-trigger dedup inherent from D21 design — same program hash skips regardless of trigger type (UAF, double-free, cross-cache).
+- **D10**: Dashboard eBPF stats split into three graph groups: `ebpf-uaf`, `ebpf-heap`, `ebpf-race`.
+
+### Wave 4: Training Pipeline (D25) — DONE
+
+- **D25**: MOCK BiGRU training data collection (1/100 sampling rate, JSONL format), incremental training pipeline, vocabulary expansion, checkpoint management. CLI support via `tools/mock_model/train.py`.
+
+### Wave 5a: Phase 10 Synergy (14a, 14b) — DONE
+
+- **14a**: SyzGPT auto seed generation — spec→syzlang→seed pipeline wired from specgen output to syzgpt injection.
+- **14b**: Focus auto-concentrate — `TriggerFocusForGap` callback maps spec gaps to clusters, auto-triggers Focus for highest-gap clusters. Implemented in `syz-manager/ai_triage.go`.
+
+### Deferred to Phase 15
+
+14c (DEzzer saturation targeting), 14d (CrashSpec feedback), 14e (SpecDEzzer MAB), 14f (Anamnesis→spec refinement), 14g (SyzSpec→MOCK BiGRU), 14h (eBPF-Spec runtime reasoning). These require significant new infrastructure not yet available.
+
+---
+
 ## Phase 6+: Advanced Improvements Roadmap
 
 **Full roadmap**: See `syzkaller/probe_log/improvement_roadmap.md` for detailed descriptions, paper references, and cost projections.
 
 Based on a survey of 30+ papers (CCS/NDSS/ASPLOS/USENIX 2022-2026), 39 applicable techniques were identified and prioritized into 7 phases:
 
-| Phase | Focus | Timeline | Key Techniques | Expected Impact |
-|-------|-------|----------|----------------|-----------------|
-| 6 | AI Cost Optimization + Scheduling | Week 1 | Batch API, Prompt Caching, Tiered Routing, T-Scheduler, SyzMini, DEzzer | **-80% API cost**, better scheduling |
-| 7 | Core Detection Enhancement | Week 2-3 | SyzGPT (DRAG), CountDown (refcount), Cross-cache, Privilege escalation, GPTrace | **+323% vuln detection**, +66% UAF |
-| 8 | Mutation & Coverage Innovation | Week 3-4 | Write-to-freed, Op-pair TS, Multi-obj MAB, MOCK BiGRU, Cluster TS, Effective Component | **+3-12% coverage**, 2-3x high-risk bugs |
-| 9 | Advanced Coverage & Detection | Month 2 | KBinCov, Page-level UAF, Context-sensitive, FD lifecycle, Anamnesis | **+87% binary coverage** |
-| 10 | Spec Auto-Generation | Month 2-3 | KernelGPT, SyzForge, SyzSpec | **+13-18% coverage**, new syscalls |
-| 11 | Concurrency Bugs | Month 3 | LACE, ACTOR, OZZ | **+38% coverage**, race conditions |
-| 12 | Advanced Monitoring & Research | Month 3+ | KASLR leak, Quarantine bypass, Snowplow, Big Sleep | Experimental |
+| Phase | Focus | Timeline | Key Techniques | Expected Impact | Status |
+|-------|-------|----------|----------------|-----------------|--------|
+| 6 | AI Cost Optimization + Scheduling | Week 1 | Batch API, Prompt Caching, Tiered Routing, T-Scheduler, SyzMini, DEzzer | **-80% API cost**, better scheduling | **DONE** |
+| 7 | Core Detection Enhancement | Week 2-3 | SyzGPT (DRAG), CountDown (refcount), Cross-cache, Privilege escalation, GPTrace | **+323% vuln detection**, +66% UAF | **DONE** |
+| 8 | Mutation & Coverage Innovation | Week 3-4 | Write-to-freed, Op-pair TS, Multi-obj MAB, MOCK BiGRU, Cluster TS, Effective Component | **+3-12% coverage**, 2-3x high-risk bugs | **DONE** |
+| 9 | Advanced Coverage & Detection | Month 2 | KBinCov, Page-level UAF, Context-sensitive, FD, Anamnesis | **+87% binary coverage** | **DONE** |
+| 10 | Spec Auto-Generation | Month 2-3 | DeepSeek spec generation, SyzGPT seeds | **+13-18% coverage**, new syscalls | **DONE** |
+| 11 | Concurrency & Performance | Month 3 | LACE, MI scheduling, LinUCB, BayesOpt | **+38% coverage**, race conditions | **PARTIAL** |
+| 12 | Comprehensive Performance Tuning | Month 3+ | DEzzer precision, BO refinement, eBPF tuning | **Systematic optimization** | **DONE** |
+| 14 | Cross-Phase Synergy | Month 3+ | DEzzer-Focus-eBPF-SyzGPT-Anamnesis integration | **Cross-subsystem optimization** | **DONE** |
 
 ### Cost-incurring techniques (require API budget)
 - SyzGPT seed generation (+$0.10-0.50/day)
@@ -765,9 +958,16 @@ Based on a survey of 30+ papers (CCS/NDSS/ASPLOS/USENIX 2022-2026), 39 applicabl
 | `pkg/manager/` | Manager business logic |
 | `sys/linux/*.txt` | Syscall descriptions (syzlang) |
 | `executor/executor.cc` | In-VM syscall executor (C++) |
-| `executor/ebpf/probe_ebpf.bpf.c` | eBPF heap monitor (BPF C) |
 | `executor/ebpf/probe_ebpf.bpf.c` | eBPF heap monitor + write-to-freed (Phase 5/7/8a, unified) |
 | `pkg/fuzzer/dezzer.go` | DEzzer TS+DE optimizer (pair/cluster/meta-bandit) |
+| `pkg/aitriage/specgen.go` | AI spec generation engine (Phase 10) |
+| `pkg/fuzzer/schedts.go` | LACE schedule-aware timing (Phase 11) |
+| `pkg/corpus/mi.go` | MI seed scheduling (Phase 11) |
+| `pkg/fuzzer/linucb.go` | LinUCB contextual bandit (Phase 11) |
+| `pkg/fuzzer/bayesopt.go` | Bayesian Optimization (Phase 11/12) |
+| `pkg/fuzzer/lru.go` | Generic LRU cache implementation |
+| `syz-manager/syzgpt.go` | SyzGPT seed generation manager |
+| `syz-manager/ai_triage.go` | AI triage manager integration |
 | `tools/mock_model/` | MOCK BiGRU model service (Python) — Phase 8d |
 | `tools/syz-ebpf-loader/main.go` | BPF loader binary (Go) |
 | `pkg/flatrpc/flatrpc.fbs` | FlatBuffers RPC schema |

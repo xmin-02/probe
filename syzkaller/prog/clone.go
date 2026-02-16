@@ -5,7 +5,42 @@ package prog
 
 import (
 	"fmt"
+	"sync"
+	"sync/atomic"
 )
+
+// PROBE: Object pool for []*Call slices to reduce GC pressure during cloning.
+var callSlicePool = sync.Pool{
+	New: func() any {
+		s := make([]*Call, 0, 16)
+		return &s
+	},
+}
+
+// PROBE: Pool validation counters for monitoring pool effectiveness.
+var (
+	poolGetCount     atomic.Int64
+	poolInvalidCount atomic.Int64
+)
+
+// PoolStats returns pool get count and invalid count for monitoring.
+func PoolStats() (gets, invalids int64) {
+	return poolGetCount.Load(), poolInvalidCount.Load()
+}
+
+// ReturnCallSlice returns a []*Call slice to the pool for reuse.
+// The slice is reset to zero length but retains its capacity.
+func ReturnCallSlice(s []*Call) {
+	if s == nil {
+		return
+	}
+	// Clear references to allow GC of Call objects.
+	for i := range s {
+		s[i] = nil
+	}
+	s = s[:0]
+	callSlicePool.Put(&s)
+}
 
 func (p *Prog) Clone() *Prog {
 	return p.cloneWithMap(make(map[*ResultArg]*ResultArg))
@@ -25,14 +60,28 @@ func (p *Prog) cloneWithMap(newargs map[*ResultArg]*ResultArg) *Prog {
 		Calls:  cloneCalls(p.Calls, newargs),
 	}
 	p1.debugValidate()
+	// PROBE: Lightweight pool validation (no-cost in production).
+	if len(p1.Calls) == 0 || p1.Target == nil {
+		poolInvalidCount.Add(1)
+	}
 	return p1
 }
 
 func cloneCalls(origCalls []*Call, newargs map[*ResultArg]*ResultArg) []*Call {
-	calls := make([]*Call, len(origCalls))
+	poolGetCount.Add(1)
+	sp := callSlicePool.Get().(*[]*Call)
+	calls := (*sp)[:0]
+	if cap(calls) < len(origCalls) {
+		poolInvalidCount.Add(1)
+		calls = make([]*Call, len(origCalls))
+	} else {
+		calls = calls[:len(origCalls)]
+	}
 	for ci, c := range origCalls {
 		calls[ci] = cloneCall(c, newargs)
 	}
+	// Don't return to pool here -- caller owns the slice.
+	// Pool return happens via ReturnCallSlice when the program is done being used.
 	return calls
 }
 
@@ -96,10 +145,16 @@ func clone(arg Arg, newargs map[*ResultArg]*ResultArg) Arg {
 				r = newargs[a1.Res]
 				a1.Res = r
 			}
-			if r.uses == nil {
-				r.uses = make(map[*ResultArg]bool)
+			if r == nil {
+				// Dangling reference: the producer was not cloned (e.g., after reorder mutation).
+				// Reset to default value to avoid nil dereference.
+				a1.Res = nil
+			} else {
+				if r.uses == nil {
+					r.uses = make(map[*ResultArg]bool)
+				}
+				r.uses[a1] = true
 			}
-			r.uses[a1] = true
 		}
 		a1.uses = nil // filled when we clone the referent
 		if newargs != nil {

@@ -66,7 +66,11 @@ func (s Signal) Intersection(s1 Signal) Signal {
 	if s1.Empty() {
 		return nil
 	}
-	res := make(Signal, len(s))
+	sz := len(s)
+	if len(s1) < sz {
+		sz = len(s1)
+	}
+	res := make(Signal, sz)
 	for e, p := range s {
 		if p1, ok := s1[e]; ok && p1 >= p {
 			res[e] = p

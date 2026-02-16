@@ -243,7 +243,9 @@ func (a *ResultArg) serialize(ctx *serializer) {
 	}
 	id, ok := ctx.vars[a.Res]
 	if !ok {
-		panic("no result")
+		// Broken reference (e.g., after mutation reordering). Use default value.
+		ctx.printf("0x%x", a.Val)
+		return
 	}
 	ctx.printf("r%v", id)
 	if a.OpDiv != 0 {

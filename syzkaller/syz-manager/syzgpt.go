@@ -229,6 +229,72 @@ func (mgr *Manager) findCorpusExamples(sc *prog.Syscall, limit int) []string {
 	return examples
 }
 
+// extractSyzlangFromLLMResponse strips LLM preamble/postamble text and extracts
+// only the syzlang program lines. LLMs often prefix responses with explanatory
+// text like "Here's a program that..." which causes Deserialize to fail.
+func extractSyzlangFromLLMResponse(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return text
+	}
+
+	// Strip markdown code fences.
+	if idx := strings.Index(text, "```"); idx >= 0 {
+		// Find the content inside the first code fence.
+		start := idx + 3
+		if nl := strings.IndexByte(text[start:], '\n'); nl >= 0 {
+			start += nl + 1
+		}
+		end := strings.LastIndex(text, "```")
+		if end > start {
+			text = text[start:end]
+		} else {
+			text = text[start:]
+		}
+		text = strings.TrimSpace(text)
+	}
+
+	// Filter to syzlang-valid lines: syscall calls, comments, and blank lines.
+	// Drop lines that look like natural language (LLM preamble/postamble).
+	// Syzlang syscall lines match: ^[a-z_][a-z0-9_$]*(  — lowercase start with '('.
+	lines := strings.Split(text, "\n")
+	var result []string
+	inPreamble := true
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			if !inPreamble {
+				result = append(result, line)
+			}
+			continue
+		}
+		// Comment lines are valid syzlang.
+		if strings.HasPrefix(trimmed, "#") {
+			inPreamble = false
+			result = append(result, line)
+			continue
+		}
+		// Syzlang syscall lines: start with lowercase letter or underscore, contain '('.
+		// This positively matches syscall patterns like "open(", "ioctl$KVM_CREATE(" etc.
+		// and rejects English sentences like "Looking at...", "Here is...", "Based on...".
+		if len(trimmed) > 0 && (trimmed[0] >= 'a' && trimmed[0] <= 'z' || trimmed[0] == '_') &&
+			strings.Contains(trimmed, "(") {
+			inPreamble = false
+			result = append(result, line)
+			continue
+		}
+		// If we haven't seen any valid lines yet, skip (preamble).
+		// If we already have valid lines, stop (postamble).
+		if !inPreamble {
+			break
+		}
+	}
+	if len(result) == 0 {
+		return strings.TrimSpace(text)
+	}
+	return strings.TrimSpace(strings.Join(result, "\n"))
+}
+
 // aiValidateAndInject validates an LLM-generated program and injects it into the fuzzer.
 // Returns true if the program was valid and injected.
 func (mgr *Manager) aiValidateAndInject(progText string) (bool, error) {
@@ -236,6 +302,9 @@ func (mgr *Manager) aiValidateAndInject(progText string) (bool, error) {
 	if f == nil {
 		return false, fmt.Errorf("fuzzer not ready")
 	}
+
+	// Strip LLM preamble/postamble before deserialization.
+	progText = extractSyzlangFromLLMResponse(progText)
 
 	// Non-strict deserialization (tolerant of LLM output quirks).
 	p, err := mgr.target.Deserialize([]byte(progText), prog.NonStrict)

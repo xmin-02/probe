@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 )
 
@@ -83,6 +84,24 @@ func (t *Triager) stepD(ctx context.Context) {
 		return
 	}
 
+	// Phase 14 W5a-14b: Trigger Focus for identified gaps (auto-concentrate).
+	// This provides immediate feedback on gap syscalls while specs are being generated.
+	if t.TriggerFocusForGap != nil {
+		focusTriggered := 0
+		for _, gap := range gaps {
+			count := t.TriggerFocusForGap(gap.SyscallFamily, gap.Syscalls)
+			if count > 0 {
+				focusTriggered += count
+				t.logf("[Step D] Focus auto-concentrate: triggered %d programs for '%s' gap",
+					count, gap.SyscallFamily)
+			}
+		}
+		if focusTriggered > 0 {
+			t.logf("[Step D] Focus auto-concentrate: %d total programs triggered across %d gaps",
+				focusTriggered, len(gaps))
+		}
+	}
+
 	// Skip already-generated drivers.
 	gaps = t.filterExistingSpecs(gaps)
 	if len(gaps) == 0 {
@@ -130,13 +149,31 @@ func (t *Triager) stepD(ctx context.Context) {
 
 	t.logf("[Step D] SpecGen batch complete: %d generated, %d saved (of %d gaps)",
 		generated, succeeded, len(gaps))
+
+	// D13: Log per-type cost breakdown.
+	t.cost.mu.Lock()
+	stepDCost := t.cost.StepDCostUSD
+	stepDCalls := t.cost.StepDCalls
+	t.cost.mu.Unlock()
+	t.logf("[Step D] SpecGen cost: $%.4f (%d calls)", stepDCost, stepDCalls)
+
+	// Phase 14 W5a-14a: Auto-inject generated specs as seed programs.
+	if succeeded > 0 {
+		t.injectSpecSeeds(ctx)
+	}
 }
 
 // analyzeSpecGaps identifies syscall families with zero or very low coverage.
+// Note: SyscallCoverage only includes syscalls present in the corpus (from CallCover).
+// Syscalls with truly zero corpus entries won't appear in the map at all.
+// We use relaxed thresholds to catch families with even partial low coverage.
 func analyzeSpecGaps(snap *FuzzingSnapshot) []SpecGap {
 	if snap.SyscallCoverage == nil || len(snap.SyscallCoverage) == 0 {
+		log.Logf(1, "PROBE: [SpecGen] analyzeSpecGaps: SyscallCoverage is empty (corpus may be empty or CallCover not populated)")
 		return nil
 	}
+
+	log.Logf(1, "PROBE: [SpecGen] analyzeSpecGaps: %d syscalls in coverage map", len(snap.SyscallCoverage))
 
 	// Group syscalls by family (prefix before '$').
 	type familyInfo struct {
@@ -162,14 +199,29 @@ func analyzeSpecGaps(snap *FuzzingSnapshot) []SpecGap {
 		}
 	}
 
-	// Find families where >50% syscalls have zero coverage.
+	log.Logf(1, "PROBE: [SpecGen] analyzeSpecGaps: %d families found", len(families))
+
+	// Find families with low coverage.
+	// Relaxed criteria: include single-syscall families with zero coverage,
+	// and families where >=30% of syscalls have zero coverage.
 	var gaps []SpecGap
 	for family, fi := range families {
-		if len(fi.syscalls) < 2 {
-			continue // Skip trivial single-syscall families.
+		// Single-syscall families: only include if zero coverage.
+		if len(fi.syscalls) == 1 {
+			if fi.totalCov == 0 {
+				gaps = append(gaps, SpecGap{
+					Driver:        family,
+					SyscallFamily: family,
+					Coverage:      fi.totalCov,
+					Syscalls:      fi.syscalls,
+					ZeroCovCount:  fi.zeroCov,
+				})
+			}
+			continue
 		}
+		// Multi-syscall families: >=30% zero coverage ratio.
 		zeroRatio := float64(fi.zeroCov) / float64(len(fi.syscalls))
-		if zeroRatio < 0.5 {
+		if zeroRatio < 0.3 {
 			continue
 		}
 		gaps = append(gaps, SpecGap{
@@ -180,6 +232,8 @@ func analyzeSpecGaps(snap *FuzzingSnapshot) []SpecGap {
 			ZeroCovCount:  fi.zeroCov,
 		})
 	}
+
+	log.Logf(1, "PROBE: [SpecGen] analyzeSpecGaps: %d gaps identified", len(gaps))
 
 	// Sort by coverage (lowest first), then by zero-coverage count (highest first).
 	sort.Slice(gaps, func(i, j int) bool {
@@ -363,4 +417,88 @@ func countSyscalls(spec string) int {
 		}
 	}
 	return count
+}
+
+// Phase 14 W5a-14a: injectSpecSeeds reads generated spec files and injects them as seed programs.
+// Quality gate: seeds with no coverage gain after 3 attempts are discarded.
+func (t *Triager) injectSpecSeeds(ctx context.Context) {
+	if t.ValidateAndInjectProg == nil {
+		t.logf("[SpecGen→Seed] ValidateAndInjectProg callback not set, skipping injection")
+		return
+	}
+
+	specDir := filepath.Join(t.workdir, "specgen")
+	entries, err := os.ReadDir(specDir)
+	if err != nil {
+		t.logf("[SpecGen→Seed] Failed to read specgen dir: %v", err)
+		return
+	}
+
+	injected, failed := 0, 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		driver := entry.Name()
+		specFile := filepath.Join(specDir, driver, driver+".txt")
+
+		// Check if spec file exists
+		data, err := os.ReadFile(specFile)
+		if err != nil {
+			continue
+		}
+
+		specText := string(data)
+		if len(specText) == 0 {
+			continue
+		}
+
+		// Check status - only inject "pending" specs (not already tested)
+		statusFile := filepath.Join(specDir, driver, "status.json")
+		var status struct {
+			Status string `json:"status"`
+		}
+		if statusData, err := os.ReadFile(statusFile); err == nil {
+			json.Unmarshal(statusData, &status)
+			if status.Status != "pending" {
+				continue // Skip if already processed
+			}
+		}
+
+		// Attempt injection with quality gate (3 attempts max)
+		success := false
+		for attempt := 1; attempt <= 3; attempt++ {
+			ok, err := t.ValidateAndInjectProg(specText)
+			if err != nil {
+				t.logf("[SpecGen→Seed] Driver '%s' attempt %d/%d failed: %v", driver, attempt, 3, err)
+				continue
+			}
+			if ok {
+				success = true
+				injected++
+				t.logf("[SpecGen→Seed] Driver '%s' injected successfully", driver)
+				// Update status to "injected"
+				t.saveSpecStatus(driver, "injected", specFile, countSyscalls(specText), "")
+				break
+			}
+		}
+
+		if !success {
+			failed++
+			t.logf("[SpecGen→Seed] Driver '%s' failed after 3 attempts (no coverage gain)", driver)
+			// Update status to "no_coverage"
+			t.saveSpecStatus(driver, "no_coverage", specFile, countSyscalls(specText), "no coverage gain after 3 attempts")
+		}
+	}
+
+	if injected > 0 || failed > 0 {
+		t.logf("[SpecGen→Seed] Complete: %d injected, %d failed (no coverage)", injected, failed)
+	}
 }

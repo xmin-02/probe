@@ -21,7 +21,7 @@
 // LRU hash auto-evicts old entries, preventing unbounded growth.
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, 8192);
+	__uint(max_entries, 12288); // Phase 12 D2: 8192→12288 (1.5x, frequently near capacity)
 	__type(key, __u64);
 	__type(value, __u64);
 } freed_objects SEC(".maps");
@@ -45,7 +45,7 @@ struct {
 // 7b': Per-call-site alloc/free statistics for AI strategy.
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, 512);
+	__uint(max_entries, 768); // Phase 12 D2: 512→768 (1.5x, more call sites for AI strategy)
 	__type(key, __u64);              // call_site address
 	__type(value, struct site_stats);
 } slab_sites SEC(".maps");
@@ -71,7 +71,7 @@ struct {
 // 9c: Kernel stack trace storage for context-sensitive coverage.
 struct {
 	__uint(type, BPF_MAP_TYPE_STACK_TRACE);
-	__uint(max_entries, 1024);
+	__uint(max_entries, 1536); // Phase 12 D2: 1024→1536 (1.5x, richer context stacks)
 	__type(key, __u32);
 	__type(value, __u64[PERF_MAX_STACK_DEPTH]);
 } stack_traces SEC(".maps");
@@ -84,6 +84,14 @@ struct {
 	__type(key, __u64);
 	__type(value, __u8);
 } seen_stacks SEC(".maps");
+
+// 7c: Per-CPU scratch for cross-cache alloc-side hash comparison.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} cache_alloc_scratch SEC(".maps");
 
 // 9c: Helper — record a context-sensitive stack for an exploit-relevant event.
 // event_type: unique ID per detector (1=slab_reuse, 2=cross_cache, 3=write_freed,
@@ -126,8 +134,10 @@ int trace_kfree(struct trace_event_raw_kfree *ctx)
 	struct probe_metrics *m = bpf_map_lookup_elem(&metrics, &key);
 
 	// Double-free: ptr already in freed_objects (freed without intervening alloc)
+	// Epoch filter: only count if the previous free happened during THIS execution.
+	// Without this check, stale LRU entries from prior executions cause massive false positives.
 	__u64 *existing = bpf_map_lookup_elem(&freed_objects, &ptr);
-	if (existing && m) {
+	if (existing && m && *existing >= m->execution_start_ns) {
 		__sync_fetch_and_add(&m->double_free_count, 1);
 		record_context_stack(m, ctx, 6); // 9c: double-free context
 	}
@@ -286,30 +296,46 @@ int BPF_KPROBE(kprobe_cache_free, struct kmem_cache *s, void *x)
 	return 0;
 }
 
-// Check on kmem_cache_alloc if the pointer was freed from a different cache.
-SEC("tracepoint/kmem/kmem_cache_alloc")
-int trace_cache_alloc(struct trace_event_raw_kmem_cache_alloc *ctx)
+// Record alloc-side cache hash on kmem_cache_alloc entry.
+SEC("kprobe/kmem_cache_alloc")
+int BPF_KPROBE(kprobe_cache_alloc, struct kmem_cache *s, gfp_t flags)
 {
-	__u64 ptr = (__u64)ctx->ptr;
+	const char *name = BPF_CORE_READ(s, name);
+	char buf[32] = {};
+	bpf_probe_read_kernel_str(buf, sizeof(buf), name);
+	__u32 hash = 5381;
+	for (int i = 0; i < 32 && buf[i]; i++)
+		hash = hash * 33 + buf[i];
+	__u32 key = 0;
+	bpf_map_update_elem(&cache_alloc_scratch, &key, &hash, BPF_ANY);
+	return 0;
+}
+
+// On kmem_cache_alloc return, compare free-side vs alloc-side hash.
+SEC("kretprobe/kmem_cache_alloc")
+int BPF_KRETPROBE(kretprobe_cache_alloc, void *ret)
+{
+	__u64 ptr = (__u64)ret;
 	if (ptr == 0)
 		return 0;
-
 	__u32 *prev_hash = bpf_map_lookup_elem(&cache_freed, &ptr);
 	if (!prev_hash)
 		return 0;
-
-	// The pointer was previously freed from a cache with hash *prev_hash.
-	// If it's being allocated from a different cache now, that's cross-cache reuse.
-	// We detect this simply: if the pointer appears in cache_freed, it means
-	// it was freed from one cache and is now being allocated (possibly from another).
-	// This is a strong cross-cache indicator.
+	__u32 saved_free_hash = *prev_hash;
 	__u32 key = 0;
-	struct probe_metrics *m = bpf_map_lookup_elem(&metrics, &key);
-	if (m) {
-		__sync_fetch_and_add(&m->cross_cache_count, 1);
-		record_context_stack(m, ctx, 2); // 9c: cross-cache context
+	__u32 *alloc_hash = bpf_map_lookup_elem(&cache_alloc_scratch, &key);
+	if (!alloc_hash) {
+		bpf_map_delete_elem(&cache_freed, &ptr);
+		return 0;
 	}
-
+	// Only count as cross-cache if cache names actually differ
+	if (*alloc_hash != saved_free_hash) {
+		struct probe_metrics *m = bpf_map_lookup_elem(&metrics, &key);
+		if (m) {
+			__sync_fetch_and_add(&m->cross_cache_count, 1);
+			record_context_stack(m, ctx, 2); // 9c: cross-cache context
+		}
+	}
 	bpf_map_delete_elem(&cache_freed, &ptr);
 	return 0;
 }
@@ -323,9 +349,9 @@ int trace_cache_alloc(struct trace_event_raw_kmem_cache_alloc *ctx)
 // is being written to a freed kernel object.
 //
 // Strategy: cross-reference destination address with freed_objects LRU map.
-// Check exact address + common slab-aligned addresses (64, 128, 256 bytes)
+// Check exact address + common slab-aligned addresses (64, 128, 256, 512, 1024 bytes)
 // to handle writes to offsets within freed objects.
-// Time window: 50ms to prevent stale false positives.
+// Time window: 200ms to prevent stale false positives.
 SEC("kprobe/_copy_from_user")
 int BPF_KPROBE(kprobe_copy_from_user, void *to, const void *from, unsigned long n)
 {
@@ -351,6 +377,14 @@ int BPF_KPROBE(kprobe_copy_from_user, void *to, const void *from, unsigned long 
 		__u64 aligned = dst & ~255ULL; // 256-byte slab alignment
 		free_ts = bpf_map_lookup_elem(&freed_objects, &aligned);
 	}
+	if (!free_ts) {
+		__u64 aligned = dst & ~511ULL; // 512-byte slab alignment
+		free_ts = bpf_map_lookup_elem(&freed_objects, &aligned);
+	}
+	if (!free_ts) {
+		__u64 aligned = dst & ~1023ULL; // 1024-byte slab alignment
+		free_ts = bpf_map_lookup_elem(&freed_objects, &aligned);
+	}
 	if (!free_ts)
 		return 0;
 
@@ -358,9 +392,9 @@ int BPF_KPROBE(kprobe_copy_from_user, void *to, const void *from, unsigned long 
 	if (*free_ts < m->execution_start_ns)
 		return 0;
 
-	// Time window: 50ms (50,000,000 ns) — filter stale entries
+	// Time window: 200ms (200,000,000 ns) — filter stale entries
 	__u64 now = bpf_ktime_get_ns();
-	if (now - *free_ts > 50000000ULL)
+	if (now - *free_ts > 200000000ULL)
 		return 0;
 
 	__sync_fetch_and_add(&m->write_to_freed_count, 1);
@@ -476,6 +510,154 @@ int BPF_KPROBE(kprobe_fd_install, unsigned int fd, struct file *file)
 	__sync_fetch_and_add(&m->fd_reuse_count, 1);
 	record_context_stack(m, ctx, 5); // 9c: FD reuse context
 	bpf_map_delete_elem(&freed_fds, &composite_key);
+	return 0;
+}
+
+// ============================================================
+// Phase 11i: LACE — Lock-Aware Contention Estimation
+// ============================================================
+
+// Per-CPU map to track mutex lock entry timestamps for contention measurement.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+	__uint(max_entries, 256);
+	__type(key, __u64);   // mutex address
+	__type(value, __u64); // entry timestamp (ktime_ns)
+} lock_entry_ts SEC(".maps");
+
+// Per-CPU flag: 1 if this CPU currently holds a lock (for concurrent access detection).
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64); // count of locks held
+} lock_held SEC(".maps");
+
+// Track context switches for executor. 1/10 sampling.
+SEC("tracepoint/sched/sched_switch")
+int trace_sched_switch(struct trace_event_raw_sched_switch *ctx)
+{
+	// 1/10 sampling to reduce overhead
+	__u64 pidtgid = bpf_get_current_pid_tgid();
+	if ((pidtgid & 0xf) > 1) // ~1/8 sampling (close to 1/10)
+		return 0;
+
+	__u32 key = 0;
+	struct probe_metrics *m = bpf_map_lookup_elem(&metrics, &key);
+	if (!m || m->execution_start_ns == 0)
+		return 0;
+
+	__sync_fetch_and_add(&m->sched_switch_count, 1);
+
+	// Check if a lock is held during this context switch (true contention).
+	__u64 *held = bpf_map_lookup_elem(&lock_held, &key);
+	if (held && *held > 0) {
+		__sync_fetch_and_add(&m->concurrent_access_count, 1);
+	}
+
+	return 0;
+}
+
+// Measure mutex lock contention: record entry timestamp.
+SEC("kprobe/mutex_lock")
+int BPF_KPROBE(kprobe_mutex_lock, void *lock)
+{
+	__u32 key = 0;
+	struct probe_metrics *m = bpf_map_lookup_elem(&metrics, &key);
+	if (!m || m->execution_start_ns == 0)
+		return 0;
+
+	__u64 ts = bpf_ktime_get_ns();
+	__u64 lock_addr = (__u64)lock;
+	bpf_map_update_elem(&lock_entry_ts, &lock_addr, &ts, BPF_ANY);
+	return 0;
+}
+
+// Measure mutex unlock: check if lock was held long enough to indicate contention.
+SEC("kretprobe/mutex_lock")
+int BPF_KRETPROBE(kretprobe_mutex_lock)
+{
+	__u32 key = 0;
+	struct probe_metrics *m = bpf_map_lookup_elem(&metrics, &key);
+	if (!m || m->execution_start_ns == 0)
+		return 0;
+
+	// Increment lock_held counter on successful acquisition.
+	__u64 *held = bpf_map_lookup_elem(&lock_held, &key);
+	if (held)
+		__sync_fetch_and_add(held, 1);
+
+	return 0;
+}
+
+SEC("kprobe/mutex_unlock")
+int BPF_KPROBE(kprobe_mutex_unlock, void *lock)
+{
+	__u32 key = 0;
+	struct probe_metrics *m = bpf_map_lookup_elem(&metrics, &key);
+	if (!m || m->execution_start_ns == 0)
+		return 0;
+
+	// Decrement lock_held counter.
+	__u64 *held = bpf_map_lookup_elem(&lock_held, &key);
+	if (held && *held > 0)
+		__sync_fetch_and_add(held, -1ULL);
+
+	// Check contention: if mutex_lock took >1us, it's contention.
+	__u64 lock_addr = (__u64)lock;
+	__u64 *entry_ts = bpf_map_lookup_elem(&lock_entry_ts, &lock_addr);
+	if (entry_ts) {
+		__u64 now = bpf_ktime_get_ns();
+		if (now - *entry_ts > 1000) // >1us = contention
+			__sync_fetch_and_add(&m->lock_contention_count, 1);
+		bpf_map_delete_elem(&lock_entry_ts, &lock_addr);
+	}
+	return 0;
+}
+
+// Spinlock contention detection via raw_spin_lock / raw_spin_unlock.
+SEC("kprobe/raw_spin_lock")
+int BPF_KPROBE(kprobe_raw_spin_lock, void *lock)
+{
+	__u32 key = 0;
+	struct probe_metrics *m = bpf_map_lookup_elem(&metrics, &key);
+	if (!m || m->execution_start_ns == 0)
+		return 0;
+
+	__u64 ts = bpf_ktime_get_ns();
+	__u64 lock_addr = (__u64)lock;
+	bpf_map_update_elem(&lock_entry_ts, &lock_addr, &ts, BPF_ANY);
+
+	// Mark lock held.
+	__u64 *held = bpf_map_lookup_elem(&lock_held, &key);
+	if (held)
+		__sync_fetch_and_add(held, 1);
+
+	return 0;
+}
+
+SEC("kprobe/raw_spin_unlock")
+int BPF_KPROBE(kprobe_raw_spin_unlock, void *lock)
+{
+	__u32 key = 0;
+	struct probe_metrics *m = bpf_map_lookup_elem(&metrics, &key);
+	if (!m || m->execution_start_ns == 0)
+		return 0;
+
+	// Decrement lock_held counter.
+	__u64 *held = bpf_map_lookup_elem(&lock_held, &key);
+	if (held && *held > 0)
+		__sync_fetch_and_add(held, -1ULL);
+
+	// Check contention timing.
+	__u64 lock_addr = (__u64)lock;
+	__u64 *entry_ts = bpf_map_lookup_elem(&lock_entry_ts, &lock_addr);
+	if (entry_ts) {
+		__u64 now = bpf_ktime_get_ns();
+		if (now - *entry_ts > 1000) // >1us = contention
+			__sync_fetch_and_add(&m->lock_contention_count, 1);
+		bpf_map_delete_elem(&lock_entry_ts, &lock_addr);
+	}
 	return 0;
 }
 

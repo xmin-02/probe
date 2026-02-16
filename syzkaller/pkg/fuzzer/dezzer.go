@@ -24,12 +24,18 @@
 package fuzzer
 
 import (
+	"context"
+	"encoding/csv"
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/google/syzkaller/pkg/stat"
 	"github.com/google/syzkaller/prog"
 )
 
@@ -46,7 +52,7 @@ const (
 	dezzerWindowSize = 100 // sliding window per operator
 	dezzerPopSize    = 10  // DE population size
 	dezzerEvolveEvery = 100 // evolve DE every N records
-	dezzerNumOps     = 5   // squash, splice, insert, mutate_arg, remove
+	dezzerNumOps     = 6   // squash, splice, insert, mutate_arg, remove, reorder
 
 	// Thompson Sampling.
 	dezzerWarmupRecords       = 1000  // delta=1.0 during warm-up (no TS/DE applied)
@@ -95,8 +101,16 @@ const (
 	dezzerPairMinData = 50 // minimum observations before using pair TS (fallback to single-op)
 
 	// Phase 8e: Per-cluster TS.
-	numClusters          = 6
+	numClusters          = 10
 	dezzerClusterMinData = 100 // per-cluster fallback threshold
+
+	// Phase 11a: EMA + CUSUM change-point detection.
+	dezzerEMASmoothingAlpha  = 0.05  // EMA smoothing factor (slow tracker)
+	dezzerCUSUMThreshold     = 5.0   // CUSUM alarm threshold (H)
+	dezzerCUSUMDrift         = 0.01  // CUSUM allowance/drift parameter (k)
+	dezzerCUSUMSampleEvery   = 100   // only update CUSUM every N records (noise reduction)
+	dezzerCUSUMMaxResetsWin  = 3     // max resets allowed per window before circuit breaker
+	dezzerCUSUMBreakerWinSec = 600   // circuit breaker window (10 minutes)
 
 	// Phase 8c: Multi-objective meta-bandit.
 	NumObjectives     = 3
@@ -110,7 +124,7 @@ const (
 )
 
 // opNames maps operator index to name.
-var opNames = [dezzerNumOps]string{"squash", "splice", "insert", "mutate_arg", "remove"}
+var opNames = [dezzerNumOps]string{"squash", "splice", "insert", "mutate_arg", "remove", "reorder"}
 
 // opNameToIndex returns the index for a given operator name, or -1 if unknown.
 func opNameToIndex(name string) int {
@@ -120,6 +134,51 @@ func opNameToIndex(name string) int {
 		}
 	}
 	return -1
+}
+
+// Phase 12 B4: Sub-op names for two-level action space.
+// Each parent op maps to 2-6 sub-ops. Total: 17 feasible arms.
+var subOpNames = map[string][]string{
+	"mutate_arg": {"mutate_arg_int", "mutate_arg_ptr", "mutate_arg_string", "mutate_arg_array", "mutate_arg_struct", "mutate_arg_resource"},
+	"splice":     {"splice_same_cluster", "splice_cross_cluster"},
+	"squash":     {"squash_adjacent", "squash_distant", "squash_merge_args"},
+	"insert":     {"insert_related", "insert_random", "insert_resource"},
+	"remove":     {"remove_random"},
+	"reorder":    {"reorder_deps", "reorder_random"},
+}
+
+// maxSubOps is the maximum number of sub-ops for any parent op.
+const maxSubOps = 6
+
+// subOpToIndex returns the index of a sub-op within its parent op, or -1 if unknown.
+func subOpToIndex(parentOp, subOp string) int {
+	subs, ok := subOpNames[parentOp]
+	if !ok {
+		return -1
+	}
+	for i, s := range subs {
+		if s == subOp {
+			return i
+		}
+	}
+	return -1
+}
+
+// parentOp extracts the 6-op parent name from a sub-op name or returns the name as-is.
+// Phase 12 B4: Ensures RecordResult always receives a valid 6-op name.
+func parentOp(op string) string {
+	if opNameToIndex(op) >= 0 {
+		return op // already a valid parent op
+	}
+	// Try to find which parent this sub-op belongs to.
+	for parent, subs := range subOpNames {
+		for _, s := range subs {
+			if s == op {
+				return parent
+			}
+		}
+	}
+	return op // unknown — return as-is, will be caught by opNameToIndex
 }
 
 // DEzzer is a hybrid Thompson Sampling + Differential Evolution optimizer.
@@ -147,7 +206,7 @@ type DEzzer struct {
 	// State tracking.
 	totalRecords  int64
 	warmupDone    bool
-	lastDecayTime time.Time
+	lastDecayNano atomic.Int64 // Phase 11a: atomic unix-nano timestamp for decay check
 	saturated     bool
 
 	// Exploration mode.
@@ -162,10 +221,10 @@ type DEzzer struct {
 	stagnantGens int
 	lastBestCorr WeightVector
 
-	// Phase 12 ML feature log (ring buffer).
-	featureLog    [dezzerFeatureLogSize]FeatureTuple
-	featureLogIdx int
-	featureLogLen int
+	// Phase 12 ML feature log (atomic ring buffer).
+	featureLog      [dezzerFeatureLogSize]FeatureTuple
+	featureLogIdx   atomic.Int64 // Phase 11a: atomic monotonic counter replaces time.Now()
+	featureLogLen   int
 
 	// Phase 8b: Op-pair conditional TS.
 	pairAlpha [dezzerNumOps][dezzerNumOps]float64 // pairAlpha[prevOp][nextOp]
@@ -177,6 +236,11 @@ type DEzzer struct {
 	clusterBeta  [numClusters][dezzerNumOps]float64
 	clusterCount [numClusters]int64
 
+	// Phase 12 B3: Cross-product TS (cluster x objective = 6x3 = 18 contexts, 108 posteriors).
+	crossAlpha [numClusters][NumObjectives][dezzerNumOps]float64
+	crossBeta  [numClusters][NumObjectives][dezzerNumOps]float64
+	crossCount [numClusters][NumObjectives]int64
+
 	// Phase 8c: Multi-objective meta-bandit.
 	objAlpha   [NumObjectives][dezzerNumOps]float64
 	objBeta    [NumObjectives][dezzerNumOps]float64
@@ -185,6 +249,46 @@ type DEzzer struct {
 	currentObj int                    // current epoch objective
 	epochLeft  int                    // remaining records in this epoch
 	startTime  time.Time             // fuzzer start time (dynamic coverage floor)
+
+	// Phase 11a: EMA + CUSUM change-point detection.
+	emaRate     float64 // exponential moving average of success rate
+	cusumHi     float64 // CUSUM upper statistic (detecting increase)
+	cusumLo     float64 // CUSUM lower statistic (detecting decrease)
+	cusumResets int64   // number of CUSUM regime changes detected
+
+	// Phase 11a: CUSUM circuit breaker (prevents over-triggering).
+	cusumDisabled     bool      // true when circuit breaker has tripped
+	cusumDisableTime  time.Time // when the breaker tripped
+	cusumRecentResets []int64   // timestamps (unix seconds) of recent resets within window
+
+	// Phase 11l: CUSUM shadow pause during BO parameter transitions.
+	cusumShadowUntil time.Time // CUSUM paused until this time (zero = not paused)
+
+	// Phase 12 A5: Normalization + CUSUM mutual exclusion (60s suppression window).
+	lastNormalization time.Time // when normalization last ran (suppress CUSUM for 60s after)
+	lastCUSUMReset    time.Time // when CUSUM last reset (suppress normalization for 60s after)
+
+	// Phase 12 B1: Feature enrichment references.
+	entropyRef        *atomic.Int64 // pointer to fuzzer.coverageEntropy (lock-free read)
+	configVersion     int           // increments when eBPF map config changes (NEW-5)
+	recordsSinceCUSUM int64         // records since last CUSUM reset
+
+	// Phase 12 B4: Sub-op posteriors (global level only — pair TS stays at 6-op granularity).
+	subOpAlpha [dezzerNumOps][maxSubOps]float64
+	subOpBeta  [dezzerNumOps][maxSubOps]float64
+	subOpCount [dezzerNumOps][maxSubOps]int64
+
+	// Phase 12 C1: BO-tunable overrides (0 = use constant default).
+	boDecayFactor  float64 // overrides dezzerDecayFactor when > 0
+	boTSDeltaLimit float64 // overrides dezzerTSDeltaLimit when > 0
+
+	// Phase 12 B4: stat counter for pair TS fallback (unknown prevOp).
+	statPairTSFallback *stat.Val
+
+	// Phase 11a: CUSUM stat references (registered by fuzzer's stats.go).
+	statCusumResets *stat.Val
+	statCusumValue  *stat.Val
+	statEmaRate     *stat.Val
 
 	logf func(level int, msg string, args ...any)
 }
@@ -209,27 +313,35 @@ type WeightVector struct {
 	Insert    float64
 	MutateArg float64
 	Remove    float64
+	Reorder   float64
 }
 
 // FeatureTuple stores (context, operator, reward) for Phase 12 ML training.
 type FeatureTuple struct {
-	Timestamp int64          // unix seconds
-	OpIdx     int            // operator index
-	CovGain   int            // raw coverage gain
-	Success   bool           // covGain > 0
-	Source    FeedbackSource // which feedback path
-	Saturated bool           // was system in saturation mode
+	Timestamp        int64          // monotonic record ID
+	OpIdx            int            // operator index
+	CovGain          int            // raw coverage gain
+	Success          bool           // covGain > 0
+	Source           FeedbackSource // which feedback path
+	Saturated        bool           // was system in saturation mode
+	ProgramCluster   int            // Phase 12 B1: kernel subsystem cluster (0-9)
+	CoverageEntropy  int            // Phase 12 B1: Shannon entropy x1000
+	EMARate          int            // Phase 12 B1: DEzzer EMA success rate x10000
+	RecordsSinceCUSUM int64         // Phase 12 B1: records since last CUSUM reset
+	PrevOp           int            // Phase 12 B1: previous operator index (-1 if none)
+	ConfigVersion    int            // Phase 12 B1: eBPF config version (NEW-5)
 }
 
 // NewDEzzer creates a new hybrid TS+DE optimizer.
 func NewDEzzer(logf func(level int, msg string, args ...any)) *DEzzer {
 	d := &DEzzer{
 		logf:          logf,
-		lastDecayTime: time.Now(),
-		aiBaseWeights: WeightVector{1.0, 1.0, 1.0, 1.0, 1.0},
+		aiBaseWeights: WeightVector{1.0, 1.0, 1.0, 1.0, 1.0, 1.0},
 		startTime:     time.Now(),
 		epochLeft:     objEpochSize,
+		emaRate:       0.5, // neutral initial EMA
 	}
+	d.lastDecayNano.Store(time.Now().UnixNano())
 	// Initialize TS posteriors with uniform prior.
 	for i := 0; i < dezzerNumOps; i++ {
 		d.alpha[i] = dezzerAlphaFloor
@@ -256,6 +368,14 @@ func NewDEzzer(logf func(level int, msg string, args ...any)) *DEzzer {
 			d.objBeta[o][i] = 1.0
 		}
 	}
+	// Phase 12 B4: Initialize sub-op TS with uniform prior.
+	for i := 0; i < dezzerNumOps; i++ {
+		subs := subOpNames[opNames[i]]
+		for j := 0; j < len(subs); j++ {
+			d.subOpAlpha[i][j] = 1.0
+			d.subOpBeta[i][j] = 1.0
+		}
+	}
 	// Initialize DE population around 1.0 (±5%).
 	rnd := rand.New(rand.NewSource(42))
 	for i := range d.population {
@@ -267,14 +387,30 @@ func NewDEzzer(logf func(level int, msg string, args ...any)) *DEzzer {
 // RecordResult records an operator execution result for TS+DE optimization.
 // Phase 8b: prevOp tracks the previous mutation operator for pair TS ("" = no pair).
 // Phase 8e: cluster is the kernel subsystem cluster index (-1 = global only).
-func (d *DEzzer) RecordResult(op, prevOp string, covGainBits int, source FeedbackSource, cluster int) {
+func (d *DEzzer) RecordResult(op, prevOp, subOp string, covGainBits int, source FeedbackSource, cluster int) {
 	idx := opNameToIndex(op)
 	if idx < 0 {
+		if d.logf != nil {
+			d.logf(1, "PROBE: DEzzer unknown op '%s' dropped", op)
+		}
 		return
 	}
 
+	success := covGainBits > 0
+	prevIdx := opNameToIndex(prevOp)
+
+	// Phase 12 B1: Pre-compute lock-protected values for feature enrichment.
+	// Quick lock to snapshot emaRate + recordsSinceCUSUM, then recordFeature outside main lock.
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	emaRateSnap := int(d.emaRate * 10000)
+	recordsSinceCUSUMSnap := d.recordsSinceCUSUM
+	d.mu.Unlock()
+
+	// Phase 11a: Record feature with atomic counter (no lock needed for ring buffer write).
+	// Phase 12 B1: Enriched with context fields.
+	d.recordFeature(idx, covGainBits, success, source, cluster, emaRateSnap, recordsSinceCUSUMSnap, prevIdx)
+
+	d.mu.Lock()
 
 	// 1. Update sliding window.
 	stats := &d.opStats[idx]
@@ -283,12 +419,12 @@ func (d *DEzzer) RecordResult(op, prevOp string, covGainBits int, source Feedbac
 	stats.WindowIdx = (wIdx + 1) % dezzerWindowSize
 	stats.Count++
 	d.totalRecords++
+	d.recordsSinceCUSUM++ // Phase 12 B1: track records since last CUSUM reset
 
-	// 2. Time-based decay for TS posteriors.
+	// 2. Time-based decay for TS posteriors (Phase 11a: atomic timestamp check).
 	d.maybeDecay()
 
 	// 3. Update TS posterior (binary signal + path weight + IPW).
-	success := covGainBits > 0
 	pathWeight := d.pathWeight(source)
 	ipwWeight := d.ipwWeight(idx)
 	weight := math.Min(pathWeight*ipwWeight, dezzerIPWCap)
@@ -305,7 +441,7 @@ func (d *DEzzer) RecordResult(op, prevOp string, covGainBits int, source Feedbac
 	}
 
 	// Phase 8b: Update pair TS if we have a valid prevOp.
-	prevIdx := opNameToIndex(prevOp)
+	// (prevIdx already computed above for B1 feature enrichment)
 	if prevIdx >= 0 {
 		if success {
 			d.pairAlpha[prevIdx][idx] += weight
@@ -313,6 +449,9 @@ func (d *DEzzer) RecordResult(op, prevOp string, covGainBits int, source Feedbac
 			d.pairBeta[prevIdx][idx] += weight
 		}
 		d.pairCount[prevIdx][idx]++
+	} else if prevOp != "" && d.statPairTSFallback != nil {
+		// Phase 12 B4: Track pair TS fallback when prevOp is unknown.
+		d.statPairTSFallback.Add(1)
 	}
 
 	// Phase 8e: Update per-cluster TS if valid cluster.
@@ -325,6 +464,16 @@ func (d *DEzzer) RecordResult(op, prevOp string, covGainBits int, source Feedbac
 		d.clusterCount[cluster]++
 	}
 
+	// Phase 12 B3: Update cross-product TS (cluster x objective).
+	if cluster >= 0 && cluster < numClusters && d.currentObj >= 0 && d.currentObj < NumObjectives {
+		if success {
+			d.crossAlpha[cluster][d.currentObj][idx] += weight
+		} else {
+			d.crossBeta[cluster][d.currentObj][idx] += weight
+		}
+		d.crossCount[cluster][d.currentObj]++
+	}
+
 	// Phase 8c: Update objective-specific TS.
 	if d.currentObj >= 0 && d.currentObj < NumObjectives {
 		if success {
@@ -334,8 +483,23 @@ func (d *DEzzer) RecordResult(op, prevOp string, covGainBits int, source Feedbac
 		}
 	}
 
-	// 4. Feature log for Phase 12 ML.
-	d.recordFeature(idx, covGainBits, success, source)
+	// Phase 12 B4: Update sub-op posteriors (two-level action space).
+	if subOp != "" {
+		subIdx := subOpToIndex(op, subOp)
+		if subIdx >= 0 {
+			if success {
+				d.subOpAlpha[idx][subIdx] += weight
+			} else {
+				d.subOpBeta[idx][subIdx] += weight
+			}
+			d.subOpCount[idx][subIdx]++
+		}
+	}
+
+	// Phase 11a: EMA + CUSUM change-point detection (every N records to reduce noise).
+	if d.totalRecords%dezzerCUSUMSampleEvery == 0 {
+		d.updateEMACUSUM(success)
+	}
 
 	// 5. Check warm-up completion.
 	if !d.warmupDone && d.totalRecords >= dezzerWarmupRecords {
@@ -360,10 +524,12 @@ func (d *DEzzer) RecordResult(op, prevOp string, covGainBits int, source Feedbac
 		}
 	}
 
-	// 7. DE evolution (lazy, every 100 records).
-	if d.totalRecords%dezzerEvolveEvery == 0 && d.warmupDone {
+	// 7. DE evolution (Phase 11a: snapshot pattern — copy state, evolve outside lock).
+	needEvolve := d.totalRecords%dezzerEvolveEvery == 0 && d.warmupDone
+	var deSnapshot deEvolveSnapshot
+	if needEvolve {
 		d.recalcDEFitness()
-		d.evolveDEOneGeneration()
+		deSnapshot = d.snapshotDEState()
 	}
 
 	// Phase 8c: Epoch management — re-select objective periodically.
@@ -371,6 +537,16 @@ func (d *DEzzer) RecordResult(op, prevOp string, covGainBits int, source Feedbac
 	if d.epochLeft <= 0 && d.warmupDone {
 		d.currentObj = d.selectObjective()
 		d.epochLeft = objEpochSize
+	}
+
+	d.mu.Unlock()
+
+	// Phase 11a: DE evolution outside the lock.
+	if needEvolve {
+		newPop, newFit, newBest, newGen := d.evolveDEOutsideLock(deSnapshot)
+		d.mu.Lock()
+		d.applyDEResults(newPop, newFit, newBest, newGen)
+		d.mu.Unlock()
 	}
 }
 
@@ -387,6 +563,71 @@ func (d *DEzzer) RecordCrash(op string) {
 	if d.logf != nil {
 		d.logf(0, "PROBE: DEzzer crash bonus for '%s' (alpha now %.1f)", op, d.alpha[idx])
 	}
+}
+
+// RecordAnamnesisBonus applies an exploit-assessment bonus to the mutation operator's
+// Thompson Sampling posterior. Called after Anamnesis assessment in processResult.
+// Phase 14 D9: Connect Anamnesis exploit assessment to DEzzer mutation optimizer.
+func (d *DEzzer) RecordAnamnesisBonus(op string, cluster int, multiplier float64) {
+	idx := opNameToIndex(op)
+	if idx < 0 || cluster < 0 || cluster >= numClusters {
+		return
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Add bonus alpha proportional to multiplier.
+	// e.g., 1.2 -> 2.0, 1.5 -> 5.0, 2.0 -> 10.0
+	bonus := (multiplier - 1.0) * 10.0
+	d.alpha[idx] += bonus
+	if cluster < numClusters {
+		d.clusterAlpha[cluster][idx] += bonus
+	}
+
+	if d.logf != nil {
+		d.logf(1, "PROBE: DEzzer Anamnesis bonus for '%s' cluster=%d mult=%.1f (alpha +%.1f)",
+			op, cluster, multiplier, bonus)
+	}
+}
+
+// SelectSubOp returns a sub-op name for the given parent op using Thompson Sampling.
+// Phase 12 B4: Two-level action space — proportional selection over sub-op posteriors.
+// Returns "" if the parent has no sub-ops or only one (deterministic).
+func (d *DEzzer) SelectSubOp(parentOp string) string {
+	subs, ok := subOpNames[parentOp]
+	if !ok || len(subs) == 0 {
+		return ""
+	}
+	if len(subs) == 1 {
+		return subs[0]
+	}
+	pidx := opNameToIndex(parentOp)
+	if pidx < 0 {
+		return subs[0]
+	}
+	d.mu.Lock()
+	// Compute posterior means for proportional selection.
+	var probs [maxSubOps]float64
+	total := 0.0
+	for i := 0; i < len(subs); i++ {
+		a := math.Max(1.0, d.subOpAlpha[pidx][i])
+		b := math.Max(1.0, d.subOpBeta[pidx][i])
+		probs[i] = a / (a + b)
+		total += probs[i]
+	}
+	d.mu.Unlock()
+
+	// Proportional selection (roulette wheel).
+	r := rand.Float64() * total
+	cum := 0.0
+	for i := 0; i < len(subs); i++ {
+		cum += probs[i]
+		if r <= cum {
+			return subs[i]
+		}
+	}
+	return subs[len(subs)-1]
 }
 
 // GetCurrentWeights returns final weights: Default × AI Base × TS Delta × DE Correction.
@@ -406,6 +647,7 @@ func (d *DEzzer) GetCurrentWeights() prog.MutateOpts {
 			InsertWeight:       maxInt(1, int(float64(defaults.InsertWeight)*d.aiBaseWeights.Insert)),
 			MutateArgWeight:    maxInt(1, int(float64(defaults.MutateArgWeight)*d.aiBaseWeights.MutateArg)),
 			RemoveCallWeight:   maxInt(1, int(float64(defaults.RemoveCallWeight)*d.aiBaseWeights.Remove)),
+			ReorderWeight:      maxInt(1, int(float64(defaults.ReorderWeight)*d.aiBaseWeights.Reorder)),
 		}
 	}
 
@@ -420,6 +662,7 @@ func (d *DEzzer) GetCurrentWeights() prog.MutateOpts {
 		InsertWeight:       maxInt(1, int(float64(defaults.InsertWeight)*d.aiBaseWeights.Insert*tsDelta.Insert*deCorr.Insert)),
 		MutateArgWeight:    maxInt(1, int(float64(defaults.MutateArgWeight)*d.aiBaseWeights.MutateArg*tsDelta.MutateArg*deCorr.MutateArg)),
 		RemoveCallWeight:   maxInt(1, int(float64(defaults.RemoveCallWeight)*d.aiBaseWeights.Remove*tsDelta.Remove*deCorr.Remove)),
+		ReorderWeight:      maxInt(1, int(float64(defaults.ReorderWeight)*d.aiBaseWeights.Reorder*tsDelta.Reorder*deCorr.Reorder)),
 	}
 }
 
@@ -442,6 +685,7 @@ func (d *DEzzer) GetCurrentWeightsForPair(prevOp string, cluster int) prog.Mutat
 			InsertWeight:       maxInt(1, int(float64(defaults.InsertWeight)*d.aiBaseWeights.Insert)),
 			MutateArgWeight:    maxInt(1, int(float64(defaults.MutateArgWeight)*d.aiBaseWeights.MutateArg)),
 			RemoveCallWeight:   maxInt(1, int(float64(defaults.RemoveCallWeight)*d.aiBaseWeights.Remove)),
+			ReorderWeight:      maxInt(1, int(float64(defaults.ReorderWeight)*d.aiBaseWeights.Reorder)),
 		}
 	}
 
@@ -457,15 +701,16 @@ func (d *DEzzer) GetCurrentWeightsForPair(prevOp string, cluster int) prog.Mutat
 		InsertWeight:       maxInt(1, int(float64(defaults.InsertWeight)*d.aiBaseWeights.Insert*tsDelta.Insert*deCorr.Insert)),
 		MutateArgWeight:    maxInt(1, int(float64(defaults.MutateArgWeight)*d.aiBaseWeights.MutateArg*tsDelta.MutateArg*deCorr.MutateArg)),
 		RemoveCallWeight:   maxInt(1, int(float64(defaults.RemoveCallWeight)*d.aiBaseWeights.Remove*tsDelta.Remove*deCorr.Remove)),
+		ReorderWeight:      maxInt(1, int(float64(defaults.ReorderWeight)*d.aiBaseWeights.Reorder*tsDelta.Reorder*deCorr.Reorder)),
 	}
 }
 
 // computeTSDeltaLayered computes TS delta using the best available data:
-// pair TS (Phase 8b) → cluster TS (Phase 8e) → global TS (fallback).
+// Phase 12 B3: pair TS → cross-product TS → cluster TS (+A3 blend) → global TS (+A3 blend).
 func (d *DEzzer) computeTSDeltaLayered(prevOp string, cluster int) WeightVector {
 	prevIdx := opNameToIndex(prevOp)
 
-	// Try pair TS first (Phase 8b).
+	// Try pair TS first (Phase 8b) — most specific, operator-pair conditioning.
 	if prevIdx >= 0 {
 		totalPairData := int64(0)
 		for j := 0; j < dezzerNumOps; j++ {
@@ -476,13 +721,33 @@ func (d *DEzzer) computeTSDeltaLayered(prevOp string, cluster int) WeightVector 
 		}
 	}
 
-	// Try cluster TS (Phase 8e).
-	if cluster >= 0 && cluster < numClusters && d.clusterCount[cluster] >= dezzerClusterMinData {
-		return d.computeClusterTSDelta(cluster)
+	// Phase 12 B3: Try cross-product TS (cluster x objective).
+	// When active, SKIP A3 objective blend (NEW-1: already encodes objective dimension).
+	if cluster >= 0 && cluster < numClusters &&
+		d.currentObj >= 0 && d.currentObj < NumObjectives &&
+		d.crossCount[cluster][d.currentObj] >= 50 {
+		return d.computeCrossTSDelta(cluster, d.currentObj)
 	}
 
-	// Fallback to global TS.
-	return d.computeTSDelta()
+	// Try cluster TS (Phase 8e) + A3 objective blend.
+	if cluster >= 0 && cluster < numClusters && d.clusterCount[cluster] >= dezzerClusterMinData {
+		clusterDelta := d.computeClusterTSDelta(cluster)
+		// Phase 12 A3: Blend with objective TS if sufficient data.
+		if d.currentObj >= 0 && d.currentObj < NumObjectives && d.objCounts[d.currentObj] >= 200 {
+			objDelta := d.computeObjectiveTSDelta(d.currentObj)
+			return blendWeightVectors(clusterDelta, 0.9, objDelta, 0.1)
+		}
+		return clusterDelta
+	}
+
+	// Fallback to global TS + A3 objective blend.
+	globalDelta := d.computeTSDelta()
+	// Phase 12 A3: Blend with objective TS if sufficient data.
+	if d.currentObj >= 0 && d.currentObj < NumObjectives && d.objCounts[d.currentObj] >= 200 {
+		objDelta := d.computeObjectiveTSDelta(d.currentObj)
+		return blendWeightVectors(globalDelta, 0.9, objDelta, 0.1)
+	}
+	return globalDelta
 }
 
 // computePairTSDelta computes TS delta conditioned on prevOp.
@@ -503,6 +768,62 @@ func (d *DEzzer) computeClusterTSDelta(cluster int) WeightVector {
 	return d.probsToTSDelta(probs)
 }
 
+// computeObjectiveTSDelta computes TS delta for the current objective.
+// Phase 12 A3: Uses objAlpha/objBeta for objective-aware blending.
+func (d *DEzzer) computeObjectiveTSDelta(objIdx int) WeightVector {
+	var probs [dezzerNumOps]float64
+	for i := 0; i < dezzerNumOps; i++ {
+		probs[i] = d.objAlpha[objIdx][i] / (d.objAlpha[objIdx][i] + d.objBeta[objIdx][i])
+	}
+	return d.probsToTSDelta(probs)
+}
+
+// computeCrossTSDelta computes TS delta for the (cluster, objective) cross-product.
+// Phase 12 B3: 108 Beta posteriors for context-aware operator selection.
+func (d *DEzzer) computeCrossTSDelta(cluster, objIdx int) WeightVector {
+	var probs [dezzerNumOps]float64
+	for i := 0; i < dezzerNumOps; i++ {
+		a := d.crossAlpha[cluster][objIdx][i]
+		b := d.crossBeta[cluster][objIdx][i]
+		if a+b > 0 {
+			probs[i] = a / (a + b)
+		} else {
+			probs[i] = 0.5 // uninformative prior
+		}
+	}
+	// Blend with global TS when cross-product data is sparse (50-200 range).
+	if d.crossCount[cluster][objIdx] < 200 {
+		globalProbs := d.globalProbs()
+		blendRatio := float64(d.crossCount[cluster][objIdx]) / 200.0 // 0.25 at 50, 1.0 at 200
+		for i := 0; i < dezzerNumOps; i++ {
+			probs[i] = blendRatio*probs[i] + (1.0-blendRatio)*globalProbs[i]
+		}
+	}
+	return d.probsToTSDelta(probs)
+}
+
+// globalProbs returns global success probabilities for blending.
+func (d *DEzzer) globalProbs() [dezzerNumOps]float64 {
+	var probs [dezzerNumOps]float64
+	for i := 0; i < dezzerNumOps; i++ {
+		probs[i] = d.alpha[i] / (d.alpha[i] + d.beta[i])
+	}
+	return probs
+}
+
+// blendWeightVectors blends two weight vectors: result = a*va + b*vb.
+// Phase 12 A3: Used for objective TS blending (0.9*layered + 0.1*obj).
+func blendWeightVectors(va WeightVector, a float64, vb WeightVector, b float64) WeightVector {
+	return WeightVector{
+		Squash:    va.Squash*a + vb.Squash*b,
+		Splice:    va.Splice*a + vb.Splice*b,
+		Insert:    va.Insert*a + vb.Insert*b,
+		MutateArg: va.MutateArg*a + vb.MutateArg*b,
+		Remove:    va.Remove*a + vb.Remove*b,
+		Reorder:   va.Reorder*a + vb.Reorder*b,
+	}
+}
+
 // probsToTSDelta converts success probabilities into a TS delta weight vector.
 func (d *DEzzer) probsToTSDelta(probs [dezzerNumOps]float64) WeightVector {
 	meanProb := 0.0
@@ -511,8 +832,9 @@ func (d *DEzzer) probsToTSDelta(probs [dezzerNumOps]float64) WeightVector {
 	}
 	meanProb /= float64(dezzerNumOps)
 
-	lo := 1.0 - dezzerTSDeltaLimit
-	hi := 1.0 + dezzerTSDeltaLimit
+	limit := d.getTSDeltaLimit() // Phase 12 C1: BO-tunable
+	lo := 1.0 - limit
+	hi := 1.0 + limit
 	var arr [dezzerNumOps]float64
 
 	maxProb := 0.0
@@ -545,6 +867,31 @@ func (d *DEzzer) probsToTSDelta(probs [dezzerNumOps]float64) WeightVector {
 // SetAIBaseWeights updates the AI base weights with selective reset.
 // Small changes → soft TS reset (30% preserve) + DE kept.
 // Large changes → hard reset both TS and DE.
+// SetBOOverrides sets BO-tunable parameters. Phase 12 C1.
+// decayFactor=0 means use default constant, tsDeltaLimit=0 means use default constant.
+func (d *DEzzer) SetBOOverrides(decayFactor, tsDeltaLimit float64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.boDecayFactor = decayFactor
+	d.boTSDeltaLimit = tsDeltaLimit
+}
+
+// getDecayFactor returns the effective decay factor (BO override or default).
+func (d *DEzzer) getDecayFactor() float64 {
+	if d.boDecayFactor > 0 {
+		return d.boDecayFactor
+	}
+	return dezzerDecayFactor
+}
+
+// getTSDeltaLimit returns the effective TS delta limit (BO override or default).
+func (d *DEzzer) getTSDeltaLimit() float64 {
+	if d.boTSDeltaLimit > 0 {
+		return d.boTSDeltaLimit
+	}
+	return dezzerTSDeltaLimit
+}
+
 func (d *DEzzer) SetAIBaseWeights(opts prog.MutateOpts) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -556,6 +903,7 @@ func (d *DEzzer) SetAIBaseWeights(opts prog.MutateOpts) {
 		Insert:    safeDiv(float64(opts.InsertWeight), float64(defaults.InsertWeight)),
 		MutateArg: safeDiv(float64(opts.MutateArgWeight), float64(defaults.MutateArgWeight)),
 		Remove:    safeDiv(float64(opts.RemoveCallWeight), float64(defaults.RemoveCallWeight)),
+		Reorder:   safeDiv(float64(opts.ReorderWeight), float64(maxInt(1, defaults.ReorderWeight))),
 	}
 
 	// Compute change magnitude.
@@ -613,9 +961,9 @@ func (d *DEzzer) SetAIBaseWeights(opts prog.MutateOpts) {
 	}
 
 	if d.logf != nil {
-		d.logf(0, "PROBE: DEzzer AI base — Sq:%.2f Sp:%.2f In:%.2f MA:%.2f Rm:%.2f",
+		d.logf(0, "PROBE: DEzzer AI base — Sq:%.2f Sp:%.2f In:%.2f MA:%.2f Rm:%.2f Ro:%.2f",
 			d.aiBaseWeights.Squash, d.aiBaseWeights.Splice, d.aiBaseWeights.Insert,
-			d.aiBaseWeights.MutateArg, d.aiBaseWeights.Remove)
+			d.aiBaseWeights.MutateArg, d.aiBaseWeights.Remove, d.aiBaseWeights.Reorder)
 	}
 }
 
@@ -654,6 +1002,12 @@ type DEzzerSnapshot struct {
 	// Phase 8c: Multi-objective status.
 	CurrentObjective string         `json:"current_objective,omitempty"`
 	ObjectiveCounts  map[string]int64 `json:"objective_counts,omitempty"`
+
+	// Phase 11a: EMA + CUSUM diagnostics.
+	EMARate     float64 `json:"ema_rate"`
+	CUSUMHi    float64 `json:"cusum_hi"`
+	CUSUMLo    float64 `json:"cusum_lo"`
+	CUSUMResets int64  `json:"cusum_resets"`
 }
 
 func (d *DEzzer) Snapshot() DEzzerSnapshot {
@@ -686,7 +1040,7 @@ func (d *DEzzer) Snapshot() DEzzerSnapshot {
 	aiArr := vecToArr(d.aiBaseWeights)
 	defaultWeights := [dezzerNumOps]int{
 		defaults.SquashWeight, defaults.SpliceWeight, defaults.InsertWeight,
-		defaults.MutateArgWeight, defaults.RemoveCallWeight,
+		defaults.MutateArgWeight, defaults.RemoveCallWeight, defaults.ReorderWeight,
 	}
 
 	for i, name := range opNames {
@@ -716,7 +1070,7 @@ func (d *DEzzer) Snapshot() DEzzerSnapshot {
 	}
 
 	// Phase 8e: Cluster counts.
-	clusterNames := [numClusters]string{"fs", "net", "mm", "ipc", "device", "other"}
+	clusterNames := [numClusters]string{"fs", "net", "mm", "ipc", "device", "other", "io_uring", "bpf", "keyctl", "other2"}
 	snap.ClusterCounts = make(map[string]int64)
 	for c := 0; c < numClusters; c++ {
 		if d.clusterCount[c] > 0 {
@@ -731,6 +1085,12 @@ func (d *DEzzer) Snapshot() DEzzerSnapshot {
 	for i := 0; i < NumObjectives; i++ {
 		snap.ObjectiveCounts[objNames[i]] = d.objCounts[i]
 	}
+
+	// Phase 11a: EMA + CUSUM diagnostics.
+	snap.EMARate = d.emaRate
+	snap.CUSUMHi = d.cusumHi
+	snap.CUSUMLo = d.cusumLo
+	snap.CUSUMResets = d.cusumResets
 
 	return snap
 }
@@ -751,10 +1111,10 @@ func (d *DEzzer) StatusString() string {
 		parts = append(parts, fmt.Sprintf("%s=%.1f%%", name, sr*100))
 	}
 
-	return fmt.Sprintf("gen=%d TS={Sq:%.2f Sp:%.2f In:%.2f MA:%.2f Rm:%.2f} DE={Sq:%.3f Sp:%.3f In:%.3f MA:%.3f Rm:%.3f} rates=[%s]%s",
+	return fmt.Sprintf("gen=%d TS={Sq:%.2f Sp:%.2f In:%.2f MA:%.2f Rm:%.2f Ro:%.2f} DE={Sq:%.3f Sp:%.3f In:%.3f MA:%.3f Rm:%.3f Ro:%.3f} rates=[%s]%s",
 		d.generation,
-		tsArr[0], tsArr[1], tsArr[2], tsArr[3], tsArr[4],
-		deArr[0], deArr[1], deArr[2], deArr[3], deArr[4],
+		tsArr[0], tsArr[1], tsArr[2], tsArr[3], tsArr[4], tsArr[5],
+		deArr[0], deArr[1], deArr[2], deArr[3], deArr[4], deArr[5],
 		joinStrings(parts, ", "),
 		d.statusSuffix())
 }
@@ -779,8 +1139,9 @@ func (d *DEzzer) computeTSDelta() WeightVector {
 	d.saturated = meanProb < dezzerSaturationThreshold
 
 	var arr [dezzerNumOps]float64
-	lo := 1.0 - dezzerTSDeltaLimit
-	hi := 1.0 + dezzerTSDeltaLimit
+	limit2 := d.getTSDeltaLimit() // Phase 12 C1: BO-tunable
+	lo := 1.0 - limit2
+	hi := 1.0 + limit2
 
 	if d.saturated {
 		// Saturation mode: relative performance (best operator = max delta).
@@ -811,34 +1172,195 @@ func (d *DEzzer) computeTSDelta() WeightVector {
 }
 
 // maybeDecay applies time-based exponential decay to TS posteriors.
+// Phase 11a: Uses atomic timestamp to avoid time.Now() syscall in the fast path.
 func (d *DEzzer) maybeDecay() {
-	now := time.Now()
-	elapsed := now.Sub(d.lastDecayTime).Seconds()
-	if elapsed < float64(dezzerDecayIntervalSec) {
+	nowNano := time.Now().UnixNano()
+	lastNano := d.lastDecayNano.Load()
+	elapsedSec := float64(nowNano-lastNano) / 1e9
+	if elapsedSec < float64(dezzerDecayIntervalSec) {
 		return
 	}
 
-	intervals := int(elapsed / float64(dezzerDecayIntervalSec))
-	factor := math.Pow(dezzerDecayFactor, float64(intervals))
+	intervals := int(elapsedSec / float64(dezzerDecayIntervalSec))
+	factor := math.Pow(d.getDecayFactor(), float64(intervals)) // Phase 12 C1: BO-tunable
 	for i := 0; i < dezzerNumOps; i++ {
 		d.alpha[i] = math.Max(dezzerAlphaFloor, d.alpha[i]*factor)
 		d.beta[i] = math.Max(dezzerBetaFloor, d.beta[i]*factor)
 	}
 	// Phase 8b: Decay pair TS.
+	// Phase 12 A4: Per-layer decay gradient — pair uses factor^0.5 (slower than alpha/beta).
+	pairFactor := math.Pow(factor, 0.5)
 	for i := 0; i < dezzerNumOps; i++ {
 		for j := 0; j < dezzerNumOps; j++ {
 			d.pairAlpha[i][j] = math.Max(1.0, d.pairAlpha[i][j]*factor)
 			d.pairBeta[i][j] = math.Max(1.0, d.pairBeta[i][j]*factor)
+			// Phase 12 A4: Decay pairCount with slower factor, floor 50.
+			newPC := int64(float64(d.pairCount[i][j]) * pairFactor)
+			if newPC < dezzerPairMinData {
+				newPC = dezzerPairMinData
+			}
+			if d.pairCount[i][j] > dezzerPairMinData {
+				d.pairCount[i][j] = newPC
+			}
 		}
 	}
 	// Phase 8e: Decay cluster TS.
+	// Phase 12 A4: Per-layer decay gradient — cluster uses factor^0.7.
+	clusterFactor := math.Pow(factor, 0.7)
 	for c := 0; c < numClusters; c++ {
 		for i := 0; i < dezzerNumOps; i++ {
 			d.clusterAlpha[c][i] = math.Max(1.0, d.clusterAlpha[c][i]*factor)
 			d.clusterBeta[c][i] = math.Max(1.0, d.clusterBeta[c][i]*factor)
 		}
+		// Phase 12 A4: Decay clusterCount with slower factor, floor 100.
+		newCC := int64(float64(d.clusterCount[c]) * clusterFactor)
+		if newCC < 100 {
+			newCC = 100
+		}
+		if d.clusterCount[c] > 100 {
+			d.clusterCount[c] = newCC
+		}
 	}
-	d.lastDecayTime = now
+	// Phase 12 B3: Decay cross-product TS with factor^0.3 (slowest — most sparse data).
+	crossFactor := math.Pow(factor, 0.3)
+	for c := 0; c < numClusters; c++ {
+		for o := 0; o < NumObjectives; o++ {
+			for i := 0; i < dezzerNumOps; i++ {
+				d.crossAlpha[c][o][i] = math.Max(1.0, d.crossAlpha[c][o][i]*factor)
+				d.crossBeta[c][o][i] = math.Max(1.0, d.crossBeta[c][o][i]*factor)
+			}
+			// crossCount decays with crossFactor (factor^0.3), floor 50.
+			newXC := int64(float64(d.crossCount[c][o]) * crossFactor)
+			if newXC < 50 {
+				newXC = 50
+			}
+			if d.crossCount[c][o] > 50 {
+				d.crossCount[c][o] = newXC
+			}
+		}
+	}
+	// Phase 12 B4: Decay sub-op TS with factor^0.4 (slow — sparse sub-op data).
+	subFactor := math.Pow(factor, 0.4)
+	for i := 0; i < dezzerNumOps; i++ {
+		subs := subOpNames[opNames[i]]
+		for j := 0; j < len(subs); j++ {
+			d.subOpAlpha[i][j] = math.Max(1.0, d.subOpAlpha[i][j]*factor)
+			d.subOpBeta[i][j] = math.Max(1.0, d.subOpBeta[i][j]*factor)
+			newSC := int64(float64(d.subOpCount[i][j]) * subFactor)
+			if newSC < 20 {
+				newSC = 20
+			}
+			if d.subOpCount[i][j] > 20 {
+				d.subOpCount[i][j] = newSC
+			}
+		}
+	}
+
+	// D23: Defense-in-depth alpha cap (closes CUSUM suppression window)
+	for i := 0; i < dezzerNumOps; i++ {
+		sum := d.alpha[i] + d.beta[i]
+		if sum > 10000 {
+			ratio := 1000.0 / sum
+			d.alpha[i] *= ratio
+			d.beta[i] *= ratio
+		}
+	}
+
+	// D23: Apply same cap to cluster-level posteriors
+	for c := 0; c < numClusters; c++ {
+		for i := 0; i < dezzerNumOps; i++ {
+			sum := d.clusterAlpha[c][i] + d.clusterBeta[c][i]
+			if sum > 10000 {
+				ratio := 1000.0 / sum
+				d.clusterAlpha[c][i] *= ratio
+				d.clusterBeta[c][i] *= ratio
+			}
+		}
+	}
+
+	d.lastDecayNano.Store(nowNano)
+}
+
+// StartNormalization runs a periodic goroutine (60s interval) that normalizes
+// runaway TS posteriors. Phase 12 A5: Separate from maybeDecay to avoid lock doubling (HIGH-2).
+// DO NOT normalize cross-product posteriors (CRIT-6).
+// CUSUM mutual exclusion: suppress normalization for 60s after CUSUM reset (NEW-8).
+func (d *DEzzer) StartNormalization(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				d.maybeNormalize()
+			}
+		}
+	}()
+}
+
+// maybeNormalize checks and normalizes runaway alpha+beta posteriors.
+// Threshold: 10000 → normalize to 1000 preserving ratio. Caller: periodic goroutine only.
+func (d *DEzzer) maybeNormalize() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Phase 12 A5 NEW-8: Suppress normalization for 60s after CUSUM reset.
+	if !d.lastCUSUMReset.IsZero() && time.Since(d.lastCUSUMReset) < 60*time.Second {
+		return
+	}
+
+	const threshold = 10000.0
+	const target = 1000.0
+	normalized := false
+
+	// Global alpha/beta normalization.
+	for i := 0; i < dezzerNumOps; i++ {
+		sum := d.alpha[i] + d.beta[i]
+		if sum > threshold {
+			ratio := target / sum
+			d.alpha[i] *= ratio
+			d.beta[i] *= ratio
+			normalized = true
+		}
+	}
+
+	// Pair alpha/beta normalization (same threshold).
+	for i := 0; i < dezzerNumOps; i++ {
+		for j := 0; j < dezzerNumOps; j++ {
+			sum := d.pairAlpha[i][j] + d.pairBeta[i][j]
+			if sum > threshold {
+				ratio := target / sum
+				d.pairAlpha[i][j] *= ratio
+				d.pairBeta[i][j] *= ratio
+				normalized = true
+			}
+		}
+	}
+
+	// Cluster alpha/beta normalization (same threshold).
+	for c := 0; c < numClusters; c++ {
+		for i := 0; i < dezzerNumOps; i++ {
+			sum := d.clusterAlpha[c][i] + d.clusterBeta[c][i]
+			if sum > threshold {
+				ratio := target / sum
+				d.clusterAlpha[c][i] *= ratio
+				d.clusterBeta[c][i] *= ratio
+				normalized = true
+			}
+		}
+	}
+
+	// NOTE: DO NOT normalize cross-product posteriors (B3, CRIT-6).
+	// They naturally stay bounded by 108-way split + decay (~1390 steady-state).
+
+	if normalized {
+		d.lastNormalization = time.Now()
+		if d.logf != nil {
+			d.logf(0, "PROBE: DEzzer A5 normalization triggered (threshold=%.0f→target=%.0f)", threshold, target)
+		}
+	}
 }
 
 // pathWeight returns the feedback quality weight for the given source.
@@ -855,15 +1377,12 @@ func (d *DEzzer) pathWeight(source FeedbackSource) float64 {
 
 // ipwWeight returns inverse propensity weight to correct for selection bias.
 // Rarely-selected operators get higher weight per observation.
+// Phase 11a: Uses d.totalRecords directly instead of summing opStats.Count.
 func (d *DEzzer) ipwWeight(opIdx int) float64 {
-	total := int64(0)
-	for i := 0; i < dezzerNumOps; i++ {
-		total += d.opStats[i].Count
-	}
-	if total == 0 {
+	if d.totalRecords == 0 {
 		return 1.0
 	}
-	propensity := float64(d.opStats[opIdx].Count) / float64(total)
+	propensity := float64(d.opStats[opIdx].Count) / float64(d.totalRecords)
 	if propensity < 0.05 {
 		propensity = 0.05 // cap at 20x to prevent extreme weights
 	}
@@ -906,76 +1425,6 @@ func (d *DEzzer) recalcDEFitness() {
 	}
 }
 
-// evolveDEOneGeneration runs one DE/rand/1 evolution step with ±5% correction.
-func (d *DEzzer) evolveDEOneGeneration() {
-	rnd := rand.New(rand.NewSource(d.totalRecords + int64(d.generation)))
-	corrLimit := d.activeCorrLimit()
-
-	// Conflict recovery countdown.
-	if d.conflictDampened {
-		d.dampenGensLeft--
-		if d.dampenGensLeft <= 0 {
-			d.conflictDampened = false
-			if d.logf != nil {
-				d.logf(0, "PROBE: DEzzer DE correction range restored to ±%.0f%%", dezzerDECorrLimit*100)
-			}
-		}
-	}
-
-	for i := range d.population {
-		a, b, c := i, i, i
-		for a == i {
-			a = rnd.Intn(dezzerPopSize)
-		}
-		for b == i || b == a {
-			b = rnd.Intn(dezzerPopSize)
-		}
-		for c == i || c == a || c == b {
-			c = rnd.Intn(dezzerPopSize)
-		}
-
-		trial := d.deMutantVector(d.population[a], d.population[b], d.population[c], rnd)
-		trial = clampVectorRange(trial, corrLimit)
-		trialFit := d.evalDEVector(trial, corrLimit)
-
-		if trialFit >= d.fitness[i] {
-			d.population[i] = trial
-			d.fitness[i] = trialFit
-			if trialFit > d.fitness[d.bestIdx] {
-				d.bestIdx = i
-			}
-		}
-	}
-
-	d.generation++
-
-	// Conflict detection.
-	d.checkConflict()
-
-	// Stagnation detection.
-	best := d.population[d.bestIdx]
-	if best == d.lastBestCorr {
-		d.stagnantGens++
-	} else {
-		d.stagnantGens = 0
-		d.lastBestCorr = best
-	}
-	if d.stagnantGens >= dezzerStagnantLimit {
-		d.partialRestart(corrLimit)
-	}
-
-	// Periodic logging.
-	if d.logf != nil && d.generation%10 == 0 {
-		tsDelta := d.computeTSDelta()
-		deCorr := d.population[d.bestIdx]
-		d.logf(0, "PROBE: DEzzer gen=%d TS={Sq:%.2f Sp:%.2f In:%.2f MA:%.2f Rm:%.2f} DE={Sq:%.3f Sp:%.3f In:%.3f MA:%.3f Rm:%.3f}%s",
-			d.generation,
-			tsDelta.Squash, tsDelta.Splice, tsDelta.Insert, tsDelta.MutateArg, tsDelta.Remove,
-			deCorr.Squash, deCorr.Splice, deCorr.Insert, deCorr.MutateArg, deCorr.Remove,
-			d.statusSuffix())
-	}
-}
-
 // checkConflict detects when TS and DE disagree on direction for ≥3/5 operators.
 func (d *DEzzer) checkConflict() {
 	tsDelta := d.computeTSDelta()
@@ -1003,6 +1452,292 @@ func (d *DEzzer) checkConflict() {
 		for i := range d.population {
 			d.population[i] = clampVectorRange(d.population[i], dezzerDampenedCorrLimit)
 		}
+	}
+}
+
+// --- Phase 11a: DE snapshot pattern (copy-evolve-apply outside lock) ---
+
+// deEvolveSnapshot holds a frozen copy of DE state for lock-free evolution.
+type deEvolveSnapshot struct {
+	population [dezzerPopSize]WeightVector
+	fitness    [dezzerPopSize]float64
+	bestIdx    int
+	generation int
+	corrLimit  float64
+	totalRec   int64
+	rates      [dezzerNumOps]float64
+	// conflict state
+	conflictDampened bool
+	dampenGensLeft   int
+	stagnantGens     int
+	lastBestCorr     WeightVector
+}
+
+// snapshotDEState copies DE state under the lock for evolution outside.
+func (d *DEzzer) snapshotDEState() deEvolveSnapshot {
+	snap := deEvolveSnapshot{
+		population:       d.population,
+		fitness:          d.fitness,
+		bestIdx:          d.bestIdx,
+		generation:       d.generation,
+		corrLimit:        d.activeCorrLimit(),
+		totalRec:         d.totalRecords,
+		conflictDampened: d.conflictDampened,
+		dampenGensLeft:   d.dampenGensLeft,
+		stagnantGens:     d.stagnantGens,
+		lastBestCorr:     d.lastBestCorr,
+	}
+	for i := 0; i < dezzerNumOps; i++ {
+		snap.rates[i], _ = d.opSuccessRate(i)
+	}
+	return snap
+}
+
+// evolveDEOutsideLock runs one DE generation using a snapshot (no lock held).
+func (d *DEzzer) evolveDEOutsideLock(snap deEvolveSnapshot) (
+	[dezzerPopSize]WeightVector, [dezzerPopSize]float64, int, int,
+) {
+	pop := snap.population
+	fit := snap.fitness
+	bestIdx := snap.bestIdx
+	corrLimit := snap.corrLimit
+	generation := snap.generation
+
+	// Conflict recovery countdown.
+	dampened := snap.conflictDampened
+	if dampened {
+		snap.dampenGensLeft--
+		if snap.dampenGensLeft <= 0 {
+			dampened = false
+			corrLimit = dezzerDECorrLimit
+		}
+	}
+
+	rnd := rand.New(rand.NewSource(snap.totalRec + int64(generation)))
+
+	meanRate := 0.0
+	for _, r := range snap.rates {
+		meanRate += r
+	}
+	meanRate /= float64(dezzerNumOps)
+
+	// evalVec evaluates fitness for a vector using snapshot rates.
+	evalVec := func(v WeightVector) float64 {
+		arr := vecToArr(v)
+		f := 0.0
+		for i := 0; i < dezzerNumOps; i++ {
+			ideal := 1.0
+			if meanRate > 1e-10 {
+				ideal = clampFloat(snap.rates[i]/meanRate, 1.0-corrLimit, 1.0+corrLimit)
+			}
+			diff := arr[i] - ideal
+			f -= diff * diff
+		}
+		return f
+	}
+
+	for i := range pop {
+		a, b, c := i, i, i
+		for a == i {
+			a = rnd.Intn(dezzerPopSize)
+		}
+		for b == i || b == a {
+			b = rnd.Intn(dezzerPopSize)
+		}
+		for c == i || c == a || c == b {
+			c = rnd.Intn(dezzerPopSize)
+		}
+
+		trial := d.deMutantVector(pop[a], pop[b], pop[c], rnd)
+		trial = clampVectorRange(trial, corrLimit)
+		trialFit := evalVec(trial)
+
+		if trialFit >= fit[i] {
+			pop[i] = trial
+			fit[i] = trialFit
+			if trialFit > fit[bestIdx] {
+				bestIdx = i
+			}
+		}
+	}
+
+	generation++
+	return pop, fit, bestIdx, generation
+}
+
+// applyDEResults writes back evolved DE state under the lock.
+func (d *DEzzer) applyDEResults(
+	pop [dezzerPopSize]WeightVector, fit [dezzerPopSize]float64,
+	bestIdx, generation int,
+) {
+	d.population = pop
+	d.fitness = fit
+	d.bestIdx = bestIdx
+	d.generation = generation
+
+	// Conflict detection on new population.
+	d.checkConflict()
+
+	// Stagnation detection.
+	best := d.population[d.bestIdx]
+	if best == d.lastBestCorr {
+		d.stagnantGens++
+	} else {
+		d.stagnantGens = 0
+		d.lastBestCorr = best
+	}
+	if d.stagnantGens >= dezzerStagnantLimit {
+		d.partialRestart(d.activeCorrLimit())
+	}
+
+	// Periodic logging.
+	if d.logf != nil && d.generation%10 == 0 {
+		tsDelta := d.computeTSDelta()
+		deCorr := d.population[d.bestIdx]
+		d.logf(0, "PROBE: DEzzer gen=%d TS={Sq:%.2f Sp:%.2f In:%.2f MA:%.2f Rm:%.2f Ro:%.2f} DE={Sq:%.3f Sp:%.3f In:%.3f MA:%.3f Rm:%.3f Ro:%.3f}%s",
+			d.generation,
+			tsDelta.Squash, tsDelta.Splice, tsDelta.Insert, tsDelta.MutateArg, tsDelta.Remove, tsDelta.Reorder,
+			deCorr.Squash, deCorr.Splice, deCorr.Insert, deCorr.MutateArg, deCorr.Remove, deCorr.Reorder,
+			d.statusSuffix())
+	}
+}
+
+// --- Phase 11a: EMA + CUSUM change-point detection ---
+
+// updateEMACUSUM tracks the exponential moving average of success rate
+// and applies a two-sided CUSUM test for regime changes.
+// On alarm, TS posteriors get a partial reset to accelerate adaptation.
+// Circuit breaker: disables CUSUM for 10 minutes if >3 resets in a window.
+// Caller must hold d.mu. Called every dezzerCUSUMSampleEvery records.
+func (d *DEzzer) updateEMACUSUM(success bool) {
+	// Phase 11l: Skip CUSUM during shadow pause (BO parameter transition).
+	if !d.cusumShadowUntil.IsZero() && time.Now().Before(d.cusumShadowUntil) {
+		d.updateCUSUMStats()
+		return
+	}
+
+	now := time.Now()
+	nowSec := now.Unix()
+
+	// Circuit breaker: if disabled, check if cooldown has expired.
+	if d.cusumDisabled {
+		if now.Sub(d.cusumDisableTime).Seconds() < float64(dezzerCUSUMBreakerWinSec) {
+			// Still in cooldown — only update stats, skip CUSUM logic.
+			d.updateCUSUMStats()
+			return
+		}
+		// Cooldown expired: re-enable CUSUM, full reset state.
+		d.cusumDisabled = false
+		d.cusumHi = 0
+		d.cusumLo = 0
+		d.cusumRecentResets = d.cusumRecentResets[:0]
+		if d.logf != nil {
+			d.logf(0, "PROBE: DEzzer CUSUM circuit breaker released, resuming detection")
+		}
+	}
+
+	sample := 0.0
+	if success {
+		sample = 1.0
+	}
+
+	// Update EMA.
+	d.emaRate = dezzerEMASmoothingAlpha*sample + (1.0-dezzerEMASmoothingAlpha)*d.emaRate
+
+	// Two-sided CUSUM: detect both upward and downward shifts.
+	d.cusumHi = math.Max(0, d.cusumHi+(sample-d.emaRate-dezzerCUSUMDrift))
+	d.cusumLo = math.Max(0, d.cusumLo+(d.emaRate-sample-dezzerCUSUMDrift))
+
+	// Check for alarm (regime change).
+	// Phase 12 A5: Suppress CUSUM alarm for 60s after normalization (mutual exclusion).
+	cusumSuppressed := !d.lastNormalization.IsZero() && now.Sub(d.lastNormalization) < 60*time.Second
+	if !cusumSuppressed && (d.cusumHi > dezzerCUSUMThreshold || d.cusumLo > dezzerCUSUMThreshold) {
+		d.cusumResets++
+		d.lastCUSUMReset = now       // Phase 12 A5: record for mutual exclusion
+		d.recordsSinceCUSUM = 0      // Phase 12 B1: reset regime-local counter
+		// Phase 12 B3: Reset crossCount to force fresh learning after regime change.
+		for c := 0; c < numClusters; c++ {
+			for o := 0; o < NumObjectives; o++ {
+				d.crossCount[c][o] = 0
+			}
+		}
+		// Phase 12 B4: Reset sub-op counts on CUSUM regime change.
+		for i := 0; i < dezzerNumOps; i++ {
+			for j := 0; j < maxSubOps; j++ {
+				d.subOpCount[i][j] = 0
+			}
+		}
+		// Partial reset: keep 50% of TS posteriors to accelerate adaptation.
+		for i := 0; i < dezzerNumOps; i++ {
+			d.alpha[i] = dezzerAlphaFloor + 0.5*(d.alpha[i]-dezzerAlphaFloor)
+			d.beta[i] = dezzerBetaFloor + 0.5*(d.beta[i]-dezzerBetaFloor)
+		}
+		// Full zero reset of CUSUM accumulators (prevents re-triggering cascade).
+		d.cusumHi = 0
+		d.cusumLo = 0
+
+		// Track this reset timestamp for circuit breaker.
+		d.cusumRecentResets = append(d.cusumRecentResets, nowSec)
+		// Evict old entries outside the window.
+		cutoff := nowSec - int64(dezzerCUSUMBreakerWinSec)
+		trimIdx := 0
+		for trimIdx < len(d.cusumRecentResets) && d.cusumRecentResets[trimIdx] < cutoff {
+			trimIdx++
+		}
+		if trimIdx > 0 {
+			d.cusumRecentResets = d.cusumRecentResets[trimIdx:]
+		}
+
+		// Circuit breaker: too many resets in window → disable CUSUM.
+		if len(d.cusumRecentResets) > dezzerCUSUMMaxResetsWin {
+			d.cusumDisabled = true
+			d.cusumDisableTime = now
+			if d.logf != nil {
+				d.logf(0, "PROBE: DEzzer CUSUM circuit breaker tripped (%d resets in %ds window), disabling for %ds",
+					len(d.cusumRecentResets), dezzerCUSUMBreakerWinSec, dezzerCUSUMBreakerWinSec)
+			}
+		} else if d.logf != nil {
+			d.logf(0, "PROBE: DEzzer CUSUM regime change #%d detected (EMA=%.4f), TS partial reset",
+				d.cusumResets, d.emaRate)
+		}
+
+		if d.statCusumResets != nil {
+			d.statCusumResets.Add(1)
+		}
+	}
+
+	d.updateCUSUMStats()
+}
+
+// updateCUSUMStats updates the stat gauges for dashboard reporting.
+// Caller must hold d.mu.
+func (d *DEzzer) updateCUSUMStats() {
+	if d.statCusumValue != nil {
+		cusumMax := math.Max(d.cusumHi, d.cusumLo)
+		d.statCusumValue.Add(int(cusumMax*1000) - d.statCusumValue.Val())
+	}
+	if d.statEmaRate != nil {
+		d.statEmaRate.Add(int(d.emaRate*10000) - d.statEmaRate.Val())
+	}
+}
+
+// SetCUSUMStats sets the stat references for CUSUM metrics.
+// Called by the fuzzer during initialization after stats are registered.
+func (d *DEzzer) SetCUSUMStats(cusumResets, cusumValue, emaRate *stat.Val) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.statCusumResets = cusumResets
+	d.statCusumValue = cusumValue
+	d.statEmaRate = emaRate
+}
+
+// PauseCUSUM sets a shadow pause for CUSUM (prevents false alarms during BO transitions).
+func (d *DEzzer) PauseCUSUM(duration time.Duration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.cusumShadowUntil = time.Now().Add(duration)
+	if d.logf != nil {
+		d.logf(0, "PROBE: DEzzer CUSUM shadow pause for %v", duration)
 	}
 }
 
@@ -1094,8 +1829,8 @@ func (d *DEzzer) partialRestart(corrLimit float64) {
 
 	if d.logf != nil {
 		best := d.population[d.bestIdx]
-		d.logf(0, "PROBE: DEzzer DE partial restart (kept top %d) — gen=%d corr={Sq:%.3f Sp:%.3f In:%.3f MA:%.3f Rm:%.3f}",
-			dezzerKeepBest, d.generation, best.Squash, best.Splice, best.Insert, best.MutateArg, best.Remove)
+		d.logf(0, "PROBE: DEzzer DE partial restart (kept top %d) — gen=%d corr={Sq:%.3f Sp:%.3f In:%.3f MA:%.3f Rm:%.3f Ro:%.3f}",
+			dezzerKeepBest, d.generation, best.Squash, best.Splice, best.Insert, best.MutateArg, best.Remove, best.Reorder)
 	}
 }
 
@@ -1139,19 +1874,154 @@ func (d *DEzzer) opSuccessRate(opIdx int) (float64, float64) {
 	return float64(successes) / float64(n), float64(totalGain) / float64(n)
 }
 
-func (d *DEzzer) recordFeature(opIdx int, covGain int, success bool, source FeedbackSource) {
-	d.featureLog[d.featureLogIdx] = FeatureTuple{
-		Timestamp: time.Now().Unix(),
-		OpIdx:     opIdx,
-		CovGain:   covGain,
-		Success:   success,
-		Source:    source,
-		Saturated: d.saturated,
+// recordFeature writes to the feature ring buffer using an atomic counter.
+// Phase 11a: No lock needed — uses atomic index for monotonic slot assignment.
+// Phase 12 B1: Enriched with context fields (pre-computed under lock, passed as params).
+func (d *DEzzer) recordFeature(opIdx int, covGain int, success bool, source FeedbackSource,
+	cluster int, emaRate int, recordsSinceCUSUM int64, prevOpIdx int) {
+	entropy := 0
+	if d.entropyRef != nil {
+		entropy = int(d.entropyRef.Load())
 	}
-	d.featureLogIdx = (d.featureLogIdx + 1) % dezzerFeatureLogSize
-	if d.featureLogLen < dezzerFeatureLogSize {
-		d.featureLogLen++
+	seq := d.featureLogIdx.Add(1) - 1
+	slot := int(seq % int64(dezzerFeatureLogSize))
+	d.featureLog[slot] = FeatureTuple{
+		Timestamp:         seq, // monotonic record ID instead of wall-clock
+		OpIdx:             opIdx,
+		CovGain:           covGain,
+		Success:           success,
+		Source:            source,
+		Saturated:         d.saturated,
+		ProgramCluster:    cluster,
+		CoverageEntropy:   entropy,
+		EMARate:           emaRate,
+		RecordsSinceCUSUM: recordsSinceCUSUM,
+		PrevOp:            prevOpIdx,
+		ConfigVersion:     d.configVersion,
 	}
+}
+
+// --- Phase 12 B2: FeatureTuple export API ---
+
+// ExportFeatures returns up to 100K tuples from the ring buffer, ordered by monotonic timestamp.
+// Handles wrap-around correctly by snapshotting the atomic index.
+func (d *DEzzer) ExportFeatures() []FeatureTuple {
+	currentIdx := d.featureLogIdx.Load()
+	if currentIdx == 0 {
+		return nil
+	}
+	count := int(currentIdx)
+	if count > dezzerFeatureLogSize {
+		count = dezzerFeatureLogSize
+	}
+	result := make([]FeatureTuple, 0, count)
+	startSeq := currentIdx - int64(count)
+	for seq := startSeq; seq < currentIdx; seq++ {
+		slot := int(seq % int64(dezzerFeatureLogSize))
+		ft := d.featureLog[slot]
+		if ft.Timestamp >= startSeq { // validate not overwritten
+			result = append(result, ft)
+		}
+	}
+	return result
+}
+
+// StartAutoExport starts a goroutine that appends ring buffer to CSV every 2 minutes.
+// Phase 12 B2: Tracks last-exported seq to avoid duplicates. Auto-rotates at 10M rows.
+func (d *DEzzer) StartAutoExport(ctx context.Context, workdir string) {
+	if workdir == "" {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		var lastExportedSeq int64
+		var totalRows int64
+		var fileIdx int
+
+		csvPath := func() string {
+			if fileIdx == 0 {
+				return workdir + "/feature_log.csv"
+			}
+			return fmt.Sprintf("%s/feature_log_%d.csv", workdir, fileIdx)
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				currentIdx := d.featureLogIdx.Load()
+				if currentIdx <= lastExportedSeq {
+					continue
+				}
+				// Determine range to export.
+				startSeq := lastExportedSeq
+				endSeq := currentIdx
+				// Don't go further back than ring buffer size.
+				if endSeq-startSeq > int64(dezzerFeatureLogSize) {
+					startSeq = endSeq - int64(dezzerFeatureLogSize)
+				}
+				// Auto-rotate at 10M rows.
+				if totalRows >= 10_000_000 {
+					fileIdx++
+					totalRows = 0
+				}
+				path := csvPath()
+				f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				if err != nil {
+					if d.logf != nil {
+						d.logf(0, "PROBE: B2 auto-export failed to open %s: %v", path, err)
+					}
+					continue
+				}
+				w := csv.NewWriter(f)
+				// Write header if new file.
+				if totalRows == 0 {
+					w.Write([]string{"seq", "op", "cov_gain", "success", "source", "saturated",
+						"cluster", "entropy", "ema_rate", "records_since_cusum", "prev_op", "config_ver"})
+				}
+				var exported int64
+				for seq := startSeq; seq < endSeq; seq++ {
+					slot := int(seq % int64(dezzerFeatureLogSize))
+					ft := d.featureLog[slot]
+					if ft.Timestamp < startSeq {
+						continue // stale entry
+					}
+					successStr := "0"
+					if ft.Success {
+						successStr = "1"
+					}
+					satStr := "0"
+					if ft.Saturated {
+						satStr = "1"
+					}
+					w.Write([]string{
+						strconv.FormatInt(ft.Timestamp, 10),
+						strconv.Itoa(ft.OpIdx),
+						strconv.Itoa(ft.CovGain),
+						successStr,
+						strconv.Itoa(int(ft.Source)),
+						satStr,
+						strconv.Itoa(ft.ProgramCluster),
+						strconv.Itoa(ft.CoverageEntropy),
+						strconv.Itoa(ft.EMARate),
+						strconv.FormatInt(ft.RecordsSinceCUSUM, 10),
+						strconv.Itoa(ft.PrevOp),
+						strconv.Itoa(ft.ConfigVersion),
+					})
+					exported++
+				}
+				w.Flush()
+				f.Close()
+				totalRows += exported
+				lastExportedSeq = endSeq
+				if d.logf != nil && exported > 0 {
+					d.logf(1, "PROBE: B2 auto-exported %d features to %s (total=%d)", exported, path, totalRows)
+				}
+			}
+		}
+	}()
 }
 
 // --- Phase 8c: Multi-objective meta-bandit ---
@@ -1233,15 +2103,16 @@ func randomVector(rnd *rand.Rand, limit float64) WeightVector {
 		Insert:    1.0 + (rnd.Float64()-0.5)*2*limit,
 		MutateArg: 1.0 + (rnd.Float64()-0.5)*2*limit,
 		Remove:    1.0 + (rnd.Float64()-0.5)*2*limit,
+		Reorder:   1.0 + (rnd.Float64()-0.5)*2*limit,
 	}
 }
 
 func vecToArr(v WeightVector) [dezzerNumOps]float64 {
-	return [dezzerNumOps]float64{v.Squash, v.Splice, v.Insert, v.MutateArg, v.Remove}
+	return [dezzerNumOps]float64{v.Squash, v.Splice, v.Insert, v.MutateArg, v.Remove, v.Reorder}
 }
 
 func arrToVec(a [dezzerNumOps]float64) WeightVector {
-	return WeightVector{a[0], a[1], a[2], a[3], a[4]}
+	return WeightVector{a[0], a[1], a[2], a[3], a[4], a[5]}
 }
 
 func clampVectorRange(v WeightVector, limit float64) WeightVector {
@@ -1252,6 +2123,7 @@ func clampVectorRange(v WeightVector, limit float64) WeightVector {
 	v.Insert = clampFloat(v.Insert, lo, hi)
 	v.MutateArg = clampFloat(v.MutateArg, lo, hi)
 	v.Remove = clampFloat(v.Remove, lo, hi)
+	v.Reorder = clampFloat(v.Reorder, lo, hi)
 	return v
 }
 
