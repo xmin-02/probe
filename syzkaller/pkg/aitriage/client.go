@@ -47,10 +47,14 @@ func NewClient(cfg mgrconfig.AITriageConfig) (LLMClient, error) {
 			model:   cfg.Model,
 			baseURL: baseURL,
 		}, nil
-	case "openai":
+	case "openai", "deepseek":
 		baseURL := cfg.APIURL
 		if baseURL == "" {
-			baseURL = "https://api.openai.com"
+			if provider == "deepseek" {
+				baseURL = "https://api.deepseek.com"
+			} else {
+				baseURL = "https://api.openai.com"
+			}
 		}
 		return &openaiClient{
 			apiKey:  cfg.APIKey,
