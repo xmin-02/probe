@@ -44,6 +44,37 @@ While traditional kernel fuzzers are coverage-guided (maximizing code coverage),
 - LenType priority boost for size-related mutations
 - Hints OOB boundary extension (boundary +/- 1, +/- 2)
 
+### Advanced Coverage & Mutation
+- **Shannon entropy** plateau detection for coverage stagnation awareness
+- **BiGRU sequence model** (MOCK server) for context-aware syscall prediction with UCB-1 arm selection
+- **Spectral graph partitioning** for dependency-aware mutation ordering
+- **Effective component inference** via ablation cache (crash-essential syscall identification)
+- **N-gram context-aware coverage** for coverage diversity tracking
+
+### Extended eBPF Detection
+- **Page-level UAF** / Dirty Pagetable detection (`mm_page_alloc`/`mm_page_free` tracepoints)
+- **FD lifecycle tracking**: `close_fd`/`fd_install` kprobes for FD reuse/hijack detection
+- **Context-sensitive coverage**: unique (event, stack_id) pairs per execution
+- **LACE race detection**: lock contention, concurrent access, sched_switch monitoring
+
+### Concurrency-Aware Fuzzing
+- **LinUCB contextual bandit** for delay pattern selection (8-dim feature vector)
+- **OZZ sched_yield injection** for kernel race triggering
+- **4-arm schedule strategy** via Global Thompson Sampling (none / delay / yield / both)
+- Adaptive delay injection rate with 20% cap
+
+### Hyperparameter Auto-Tuning
+- **Bayesian Optimization** via 8-dimensional Nelder-Mead simplex
+- Full state machine: reflection, expansion, contraction, shrink with convergence detection
+- Safety rollback (70% baseline threshold) with EMA transition
+- **Warm-start** save/load with staleness detection (kernel hash, corpus size, 48h expiry)
+- Cascade health monitoring for Thompson Sampling layers
+
+### AI Spec Generation
+- **DeepSeek API** integration for syscall specification generation from crash analysis
+- Multi-provider LLM support with graceful degradation (no API key = feature disabled)
+- **MI (Mutual Information) seed scheduling** for corpus diversity optimization
+
 ## Architecture
 
 ```
@@ -347,6 +378,37 @@ Google [syzkaller](https://github.com/google/syzkaller) 기반의 **익스플로
 - OOB 경계 뮤테이션 (off-by-one/two, 2배 크기, 페이지 오버슈트)
 - LenType 우선순위 강화로 크기 관련 뮤테이션 증가
 - Hints OOB 경계 확장 (경계값 +/- 1, +/- 2)
+
+### 고급 커버리지 & 뮤테이션
+- **Shannon 엔트로피** 정체 감지로 커버리지 포화 인식
+- **BiGRU 시퀀스 모델** (MOCK 서버) 기반 컨텍스트 인식 시스콜 예측 + UCB-1 암 선택
+- **스펙트럴 그래프 분할**로 의존성 기반 뮤테이션 순서 결정
+- **유효 컴포넌트 추론**: ablation 캐시를 통한 크래시 필수 시스콜 식별
+- **N-gram 컨텍스트 인식 커버리지**로 커버리지 다양성 추적
+
+### 확장 eBPF 탐지
+- **페이지 수준 UAF** / Dirty Pagetable 탐지 (`mm_page_alloc`/`mm_page_free` tracepoint)
+- **FD 생명주기 추적**: `close_fd`/`fd_install` kprobe로 FD 재사용/하이재킹 탐지
+- **컨텍스트 민감 커버리지**: 실행 단위 고유 (이벤트, stack_id) 쌍
+- **LACE 레이스 탐지**: lock contention, 동시 접근, sched_switch 모니터링
+
+### 동시성 인식 퍼징
+- **LinUCB 컨텍스트 밴딧**으로 딜레이 패턴 선택 (8차원 특징 벡터)
+- **OZZ sched_yield 주입**으로 커널 레이스 트리거링
+- **4-arm 스케줄 전략**: Global Thompson Sampling (none / delay / yield / both)
+- 적응형 딜레이 주입 비율 (20% 상한)
+
+### 하이퍼파라미터 자동 튜닝
+- **Bayesian Optimization**: 8차원 Nelder-Mead simplex
+- 풀 상태 머신: reflection, expansion, contraction, shrink + 수렴 감지
+- 안전 롤백 (베이스라인 70% 임계값) + EMA 전환
+- **Warm-start** 저장/로드 (커널 해시, 코퍼스 크기, 48시간 만료 감지)
+- Thompson Sampling 계층 캐스케이드 건강 모니터링
+
+### AI 스펙 생성
+- **DeepSeek API** 연동으로 크래시 분석 기반 시스콜 스펙 자동 생성
+- 멀티 프로바이더 LLM 지원 + graceful degradation (API 키 없으면 기능 비활성화)
+- **MI (Mutual Information) 시드 스케줄링**으로 코퍼스 다양성 최적화
 
 ## 아키텍처
 
