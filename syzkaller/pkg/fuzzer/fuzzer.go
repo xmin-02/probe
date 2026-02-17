@@ -9,6 +9,7 @@ import (
 	"hash/fnv"
 	"math"
 	"math/rand"
+	"reflect"
 	"runtime"
 	"sort"
 	"strings"
@@ -1124,7 +1125,7 @@ func (fuzzer *Fuzzer) InjectSeed(progText string) error {
 // Accepts aitriage.MutationHints via interface{} to avoid import cycle.
 // The hints struct must have SpliceWeight, InsertWeight, MutateArgWeight, RemoveWeight float64 fields.
 func (fuzzer *Fuzzer) SetAIMutationHints(hints interface{}) {
-	// Extract fields via type assertion to avoid import cycle with aitriage.
+	// Extract fields via reflect to avoid import cycle with aitriage.
 	type mutHints struct {
 		SpliceWeight    float64
 		InsertWeight    float64
@@ -1132,24 +1133,20 @@ func (fuzzer *Fuzzer) SetAIMutationHints(hints interface{}) {
 		RemoveWeight    float64
 		Reason          string
 	}
-	// Type assert and copy fields directly
-	src, ok := hints.(struct {
-		SpliceWeight    float64
-		InsertWeight    float64
-		MutateArgWeight float64
-		RemoveWeight    float64
-		Reason          string
-	})
-	if !ok {
-		fuzzer.Logf(0, "PROBE: AI mutation hints type assertion failed")
+	v := reflect.ValueOf(hints)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		fuzzer.Logf(0, "PROBE: AI mutation hints: expected struct, got %v", v.Kind())
 		return
 	}
 	mh := mutHints{
-		SpliceWeight:    src.SpliceWeight,
-		InsertWeight:    src.InsertWeight,
-		MutateArgWeight: src.MutateArgWeight,
-		RemoveWeight:    src.RemoveWeight,
-		Reason:          src.Reason,
+		SpliceWeight:    v.FieldByName("SpliceWeight").Float(),
+		InsertWeight:    v.FieldByName("InsertWeight").Float(),
+		MutateArgWeight: v.FieldByName("MutateArgWeight").Float(),
+		RemoveWeight:    v.FieldByName("RemoveWeight").Float(),
+		Reason:          v.FieldByName("Reason").String(),
 	}
 
 	defaults := prog.DefaultMutateOpts
