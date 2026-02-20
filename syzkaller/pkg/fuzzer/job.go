@@ -649,6 +649,7 @@ type focusJob struct {
 const (
 	focusMaxIters      = 100 // Reduced from 300: prevent Focus monopolization.
 	focusNoProgressMax = 20  // Reduced from 50: faster early exit on diminishing returns.
+	focusWallTimeout   = 10 * time.Minute // P0 fix: absolute wall-clock cap per focus job.
 )
 
 func (job *focusJob) run(fuzzer *Fuzzer) {
@@ -688,7 +689,14 @@ func (job *focusJob) run(fuzzer *Fuzzer) {
 	observeIters := focusMaxIters / 4 // 25 iterations
 	var maxObservedGain int
 
+	wallTimeout := false
 	for i := 0; i < focusMaxIters; i++ {
+		// P0 fix: Wall-clock timeout prevents any single focus job from running too long.
+		if time.Since(start) > focusWallTimeout {
+			wallTimeout = true
+			fuzzer.Logf(0, "PROBE: focus wall-clock timeout at iter %d (>%v)", i, focusWallTimeout)
+			break
+		}
 		mutOpts := fuzzer.getAIMutateOpts(prevOp, cluster) // Phase 8b: pair-aware weights
 
 		var p *prog.Prog
@@ -768,9 +776,11 @@ func (job *focusJob) run(fuzzer *Fuzzer) {
 	}
 
 	earlyExit := noProgress >= focusNoProgressMax
-	optimalStop := totalIters < focusMaxIters && !earlyExit && totalIters > observeIters
+	optimalStop := totalIters < focusMaxIters && !earlyExit && !wallTimeout && totalIters > observeIters
 	exitReason := "completed"
-	if earlyExit {
+	if wallTimeout {
+		exitReason = fmt.Sprintf("wall-timeout(%v)", focusWallTimeout)
+	} else if earlyExit {
 		exitReason = fmt.Sprintf("no-progress(%d)", focusNoProgressMax)
 	} else if optimalStop {
 		exitReason = "optimal-stop"

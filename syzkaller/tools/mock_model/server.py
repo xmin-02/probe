@@ -4,6 +4,7 @@ Serves PredictNext, Health, and Retrain RPCs for the Go fuzzer client.
 """
 
 import os
+import socket
 import sys
 import time
 import logging
@@ -235,7 +236,6 @@ class JSONTCPHandler:
 
 def _run_json_tcp(handler: JSONTCPHandler, port: int):
     """Run a simple JSON-over-TCP server for the Go fuzzer client."""
-    import socket
     import selectors
 
     sel = selectors.DefaultSelector()

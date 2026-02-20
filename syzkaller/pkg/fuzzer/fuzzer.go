@@ -47,6 +47,7 @@ type Fuzzer struct {
 	// PROBE: Focus Mode state.
 	focusMu        sync.Mutex
 	focusDedup     *LRU[uint64, bool] // Phase 14 D21: hash-based dedup (cross-trigger)
+	focusTypeLast  map[string]time.Time // P0 fix: per-bug-type cooldown (prevents 1000x same-bug focus)
 	focusActive    bool               // true while a focus job is running
 	focusTarget    string             // title of the current focus target
 	focusPending   []focusCandidate   // queued candidates waiting for current focus to finish
@@ -129,6 +130,7 @@ func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
 		ctRegenerate: make(chan struct{}),
 
 		focusDedup:    NewLRU[uint64, bool](10000),
+		focusTypeLast: make(map[string]time.Time),
 		ablationCache: NewLRU[string, []bool](2000),
 		raceStartTime: time.Now(),
 	}
@@ -848,6 +850,25 @@ type focusCandidate struct {
 	tier  int
 }
 
+// focusTypeCooldownDur is the minimum interval between focus jobs of the same bug type.
+// Prevents the same eBPF trigger (e.g., ebpf-uaf) from monopolizing focus for hours
+// when many different programs hit the same kernel bug.
+const focusTypeCooldownDur = 30 * time.Minute
+
+// focusTypeKey extracts the bug type prefix from a focus title.
+// "PROBE:ebpf-uaf:<prog>" → "ebpf-uaf", "PROBE:priv-esc" → "priv-esc".
+func focusTypeKey(title string) string {
+	// Title format: "PROBE:<type>:<prog...>" or "PROBE:<type>"
+	if !strings.HasPrefix(title, "PROBE:") {
+		return title
+	}
+	rest := title[len("PROBE:"):]
+	if idx := strings.Index(rest, ":"); idx >= 0 {
+		return rest[:idx]
+	}
+	return rest
+}
+
 // Phase 14 D21+D27: Hash-based focus dedup with cross-trigger deduplication.
 // Hashes the program itself (not the title), so the same program is deduped
 // even if it triggers different exploit patterns (e.g., "double-free" vs "UAF").
@@ -868,6 +889,14 @@ func (fuzzer *Fuzzer) AddFocusCandidate(p *prog.Prog, title string, tier int) bo
 
 	hash := focusProgHash(p)
 	if fuzzer.focusDedup.Contains(hash) {
+		return false
+	}
+
+	// P0 fix: Per-bug-type cooldown — prevents same trigger type (e.g., ebpf-uaf)
+	// from monopolizing focus when many different programs hit the same kernel bug.
+	typeKey := focusTypeKey(title)
+	if last, ok := fuzzer.focusTypeLast[typeKey]; ok && time.Since(last) < focusTypeCooldownDur {
+		fuzzer.statFocusDropped.Add(1)
 		return false
 	}
 
@@ -907,6 +936,8 @@ func (fuzzer *Fuzzer) launchFocusJob(p *prog.Prog, title string, tier int) {
 	// Phase 14 D21: Store hash instead of title for cross-trigger dedup.
 	hash := focusProgHash(p)
 	fuzzer.focusDedup.Put(hash, true)
+	// P0 fix: Record bug-type cooldown start.
+	fuzzer.focusTypeLast[focusTypeKey(title)] = time.Now()
 	fuzzer.focusActive = true
 	fuzzer.focusTarget = title
 
