@@ -5,6 +5,7 @@ package corpus
 
 import (
 	"context"
+	"log"
 	"math"
 	"math/rand"
 	"sync"
@@ -138,6 +139,17 @@ func (mi *MIScorer) calcMI(corpus *Corpus) {
 	mi.mu.Unlock()
 
 	mi.statCalcCount.Add(1)
+
+	// Diagnostic log: confirm MI recalculation is running.
+	avgScore := 0.0
+	if len(rawScores) > 0 {
+		for _, s := range rawScores {
+			avgScore += s
+		}
+		avgScore /= float64(len(rawScores))
+	}
+	log.Printf("PROBE: MI recalc done: %d/%d programs scored, avg=%.3f, max=%.3f",
+		sampleSize, n, avgScore, maxScore)
 }
 
 // getScore returns the MI score for a program, or 0 if not yet scored.
@@ -165,6 +177,8 @@ func (mi *MIScorer) shouldRecalc() bool {
 
 // runUpdater periodically recalculates MI scores until the context is cancelled.
 func (mi *MIScorer) runUpdater(ctx context.Context, corpus *Corpus) {
+	log.Printf("PROBE: MI updater started (interval=%v, early=%v for first %v)",
+		miUpdateInterval, miEarlyInterval, miEarlyDuration)
 	// Initial delay: wait for corpus to accumulate some programs.
 	select {
 	case <-ctx.Done():

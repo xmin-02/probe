@@ -294,6 +294,7 @@ func (c *NgramClient) Stop() {
 }
 
 func (c *NgramClient) healthLoop() {
+	var checkCount int
 	for {
 		select {
 		case <-c.done:
@@ -308,6 +309,20 @@ func (c *NgramClient) healthLoop() {
 			c.healthy = resp.Healthy
 		}
 		c.lastCheck = time.Now()
+		checkCount++
+		// Log UCB-1 status every ~60s (12 checks * 5s interval).
+		if checkCount%12 == 0 {
+			bigruRate, ctRate := 0.0, 0.0
+			if c.bigruTrials > 0 {
+				bigruRate = float64(c.bigruWins) / float64(c.bigruTrials) * 100
+			}
+			if c.ctTrials > 0 {
+				ctRate = float64(c.ctWins) / float64(c.ctTrials) * 100
+			}
+			c.logf(0, "PROBE: N-gram UCB-1 status: healthy=%v, BiGRU=%d/%d (%.1f%%), CT=%d/%d (%.1f%%)",
+				c.healthy, c.bigruWins, c.bigruTrials, bigruRate,
+				c.ctWins, c.ctTrials, ctRate)
+		}
 		c.mu.Unlock()
 	}
 }

@@ -36,6 +36,8 @@ type LinUCB struct {
 	b        [linucbArms][]float64   // d x 1 per arm
 	alpha    float64                 // exploration coefficient (annealing)
 	totalObs int64                   // total observations for annealing
+	armPicks [linucbArms]int64       // arm selection counts for diagnostics
+	logf     func(level int, msg string, args ...any)
 }
 
 // NewLinUCB creates a new LinUCB contextual bandit with identity-initialized matrices.
@@ -117,11 +119,20 @@ func (l *LinUCB) Update(arm int, features []float64, reward float64) {
 
 	// Anneal alpha: alpha = max(0.1, 0.5 * (1 - totalObs/1000))
 	l.totalObs++
+	l.armPicks[arm]++
 	ratio := float64(l.totalObs) / float64(linucbAnnealN)
 	if ratio > 1.0 {
 		ratio = 1.0
 	}
 	l.alpha = math.Max(linucbAlphaMin, linucbAlphaMax*(1.0-ratio))
+
+	// Diagnostic log every 1000 observations.
+	if l.logf != nil && l.totalObs%1000 == 0 {
+		l.logf(0, "PROBE: LinUCB status: obs=%d, alpha=%.3f, arms=[None:%d Rand:%d Between:%d Locks:%d], reward=%.3f",
+			l.totalObs, l.alpha,
+			l.armPicks[0], l.armPicks[1], l.armPicks[2], l.armPicks[3],
+			reward)
+	}
 }
 
 // SetAlpha overrides the LinUCB exploration parameter. Phase 12 C1: BO-tunable.

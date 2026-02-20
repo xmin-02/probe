@@ -143,6 +143,7 @@ func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
 	f.dezzer.StartNormalization(ctx)           // Phase 12 A5: periodic normalization goroutine (60s)
 	f.dezzer.StartAutoExport(ctx, cfg.Workdir) // Phase 12 B2: periodic feature log export (2min)
 	f.linucb = NewLinUCB() // Phase 11j: LinUCB delay pattern bandit
+	f.linucb.logf = f.Logf
 	f.schedTS = NewSchedTS()       // Phase 11k: Global Thompson Sampling for schedule strategy
 	f.bayesOpt = NewBayesOpt(cfg.Logf) // Phase 11l: Bayesian Optimization for hyperparameter tuning
 	// Phase 12 C3: BO warm-start — load saved params and set save path.
