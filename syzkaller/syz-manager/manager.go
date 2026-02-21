@@ -1266,6 +1266,7 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 		corpusUpdates := make(chan corpus.NewItemEvent, 128)
 		mgr.corpus = corpus.NewFocusedCorpus(context.Background(),
 			corpusUpdates, mgr.coverFilters.Areas)
+		mgr.corpus.RunMIUpdater()
 		mgr.http.Corpus.Store(mgr.corpus)
 
 		rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
