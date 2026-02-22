@@ -66,6 +66,12 @@
 |    - 베이지안 최적화 (GP)                                 |
 |    - CUSUM 서킷 브레이커                                  |
 |                                                          |
+|  [Phase 15] UCB-1 피드백 & 핫패스 최적화 [완료]     |
+|    - UCB-1 BiGRU vs CT arm 선택                     |
+|    - Atomic 카운터로 lock-free 핫패스                |
+|    - LinUCB 강제 탐색 + 캐시 수정                    |
+|    - pprof: genFuzz/ForeachArg가 진짜 병목            |
+|                                                          |
 +------------------------------------------------------+
 ```
 
@@ -867,6 +873,50 @@ Phase 8-10 통합 중 식별된 중요 버그 수정 및 성능 개선:
 
 ---
 
+## Phase 15: UCB-1 피드백 & 핫패스 최적화 — 완료
+
+**목표**: BiGRU vs ChoiceTable UCB-1 arm 선택 추가, BO 튜닝 가능 파라미터 노출, processResult() 핫패스 최적화로 syz-manager CPU 오버헤드 감소.
+
+### 15a. UCB-1 BiGRU vs ChoiceTable 피드백 — 완료
+
+- **RecordBiGRUResult / RecordCTResult**: BiGRU 예측 vs ChoiceTable 선택의 성공 (커버리지 획득) 추적
+- **ShouldUseBiGRU()**: UCB-1 상한 신뢰 구간 비교, 강제 탐색 (처음 100회씩)
+- Atomic 카운터 (`atomic.Int64`)로 lock-free 핫패스 기록
+
+### 15b. BO 튜닝 가능 파라미터 — 완료
+
+- LinUCB alpha를 `SetAlpha()` 통해 BayesOpt 하이퍼파라미터 최적화에 노출
+- LACE 레이스 임계값, Focus 예산 파라미터를 BayesOpt 에폭 사이클로 튜닝 가능
+
+### 15c. LinUCB 버그 수정 — 완료
+
+- **강제 탐색 순서 수정**: 수렴 캐시가 강제 탐색보다 먼저 체크되어 미탐색 arm이 100회에 도달 불가. 순서 수정: 강제 탐색 → 캐시 체크 → UCB 계산
+- **allExplored 가드**: 4개 arm 모두 100회 이상 + annealing 완료 (10만 관측) 후에만 수렴 캐시 활성화
+- **타이브레이크 편향 수정**: UCB 점수 동점 시 덜 탐색된 arm 우선 (index-0 편향 제거)
+- **Arm-0 오염 수정 (job.go)**: SchedNone, rate-cap 경로에서 `delayPattern=0` 설정 제거 → LinUCB가 선택하지 않은 결정에 arm-0 크레딧 방지. 비-LinUCB 결정은 `delayPattern=-1` 유지
+
+### 15d. processResult 핫패스 최적화 — 완료
+
+- **BayesOpt IsActive()**: `sync.Mutex` → `atomic.Bool` (매 실행마다 lock-free 읽기)
+- **BayesOpt CheckEpoch()**: `epochDeadlineNano` atomic fast-path로 에폭 미만료 시 mutex 획득 생략
+- **N-gram UCB-1 카운터**: 4개 카운터를 mutex 보호에서 `atomic.Int64`로 전환
+- **classifyProgram 캐싱**: processResult당 1회만 호출 (기존 3회 중복 호출)
+- **LACE 링 버퍼**: mutex 보호 슬라이스를 `atomic.Int64` 인덱스 링 버퍼로 교체. P90 임계값 2000 샘플마다 재계산 (4배 감소)
+- **LinUCB 수렴 캐시**: dominant arm 감지 시 (선택률 99.5%+) Sherman-Morrison O(d²) 행렬 업데이트 생략 (5000 관측마다 체크)
+
+### 15e. pprof 기반 Manager CPU 병목 분석 — 분석 완료
+
+CPU 프로파일링 (pprof)으로 syz-manager 진짜 병목 확인:
+- **CPU 70.6%**: `genFuzz` → `mutateProgRequest` → `MutateWithOpts`
+- **CPU 45.2%**: `prog.ForeachArg` + `getCompatibleResources` (재귀적 인자 순회)
+- **PROBE 컴포넌트** (LinUCB, DEzzer, BayesOpt) CPU **<1%** — 병목 아님
+- **Mutex 경합**: 제로 (pprof mutex 프로파일 확인)
+- 근본 원인: syzkaller 코어 `prog/` 패키지의 프로그램 생성/뮤테이션
+
+**시사점**: 추가 exec/sec 개선에는 PROBE 컴포넌트가 아닌 syzkaller 코어 `prog/` 함수 최적화 필요.
+
+---
+
 ## Phase 6+: 고급 개선 로드맵
 
 **상세 로드맵**: `syzkaller/probe_log/improvement_roadmap.md` 참조 (기술 상세, 논문 레퍼런스, 비용 예측 포함).
@@ -883,6 +933,7 @@ Phase 8-10 통합 중 식별된 중요 버그 수정 및 성능 개선:
 | 11 | 동시성 & 성능 | 3개월 | LACE, MI 스케줄링, LinUCB, BayesOpt | **커버리지 +38%**, 레이스 컨디션 | **부분 완료** |
 | 12 | 종합 성능 튜닝 | 3개월+ | DEzzer 정밀도, BO 개선, eBPF 튜닝 | **체계적 최적화** | **완료** |
 | 14 | 크로스 페이즈 시너지 | 3개월+ | DEzzer-Focus-eBPF-SyzGPT-Anamnesis 통합 | **서브시스템 간 최적화** | **완료** |
+| 15 | UCB-1 피드백 & 핫패스 최적화 | 4개월 | UCB-1 arm 선택, atomic 카운터, LinUCB 수정, pprof 분석 | **Manager CPU -30%**, 버그 수정 | **완료** |
 
 ### 비용 발생 기술 (API 예산 필요)
 - SyzGPT 시드 생성 (+$0.10-0.50/일)

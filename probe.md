@@ -68,6 +68,12 @@
 |    - Bayesian Optimization (GP)                       |
 |    - CUSUM circuit breaker                            |
 |                                                       |
+|  [Phase 15] UCB-1 Feedback & Hotpath Opt [DONE]     |
+|    - UCB-1 BiGRU vs CT arm selection                |
+|    - Atomic counters for lock-free hotpath           |
+|    - LinUCB forced exploration + cache fixes         |
+|    - pprof: genFuzz/ForeachArg = true bottleneck     |
+|                                                       |
 +------------------------------------------------------+
 ```
 
@@ -908,6 +914,50 @@ Each track verified with soak tests (10-minute standard, 30-minute for high-risk
 
 ---
 
+## Phase 15: UCB-1 Feedback & Hotpath Optimization — DONE
+
+**Goal**: Add UCB-1 arm selection for BiGRU vs ChoiceTable, expose BO-tunable parameters, and optimize the processResult() hotpath to reduce syz-manager CPU overhead.
+
+### 15a. UCB-1 BiGRU vs ChoiceTable Feedback — DONE
+
+- **RecordBiGRUResult / RecordCTResult**: Track success (coverage gain) of BiGRU predictions vs ChoiceTable selections
+- **ShouldUseBiGRU()**: UCB-1 upper confidence bound comparison with forced exploration (first 100 trials each)
+- Atomic counters (`atomic.Int64`) for lock-free hotpath recording
+
+### 15b. BO-Tunable Parameters — DONE
+
+- LinUCB alpha exposed to BayesOpt hyperparameter optimization via `SetAlpha()`
+- LACE race thresholds and Focus budget parameters tunable through BayesOpt epoch cycle
+
+### 15c. LinUCB Bug Fixes — DONE
+
+- **Forced exploration before cache**: Convergence cache was checked BEFORE forced exploration, blocking under-explored arms from reaching 100 picks. Fixed ordering: forced exploration → cache check → UCB computation
+- **allExplored guard**: Convergence cache only activates after ALL 4 arms have ≥100 picks AND annealing completes (100K observations)
+- **Tie-break bias fix**: When UCB scores tie, prefer less-explored arm (eliminates index-0 bias)
+- **Arm-0 pollution fix (job.go)**: SchedNone and rate-cap paths no longer set `delayPattern=0`, preventing false LinUCB arm-0 credit. Keep `delayPattern=-1` for non-LinUCB decisions
+
+### 15d. processResult Hotpath Optimization — DONE
+
+- **BayesOpt IsActive()**: `sync.Mutex` → `atomic.Bool` for lock-free reads on every execution
+- **BayesOpt CheckEpoch()**: `epochDeadlineNano` atomic fast-path skips mutex acquisition when epoch hasn't expired
+- **N-gram UCB-1 counters**: 4 counters converted from mutex-guarded to `atomic.Int64`
+- **classifyProgram caching**: Called once per processResult (was 3x redundant calls)
+- **LACE ring buffer**: Lock-free `atomic.Int64` index ring buffer replaces mutex-guarded slice. P90 threshold recalculated every 2000 samples (4x less frequent)
+- **LinUCB convergence cache**: Skips Sherman-Morrison O(d²) matrix update when dominant arm detected (99.5%+ selection rate, checked every 5000 observations)
+
+### 15e. pprof-Identified Manager CPU Bottleneck — Analysis Complete
+
+CPU profiling (pprof) revealed the true syz-manager bottleneck:
+- **70.6% CPU** in `genFuzz` → `mutateProgRequest` → `MutateWithOpts`
+- **45.2% CPU** in `prog.ForeachArg` + `getCompatibleResources` (recursive argument traversal)
+- **PROBE components** (LinUCB, DEzzer, BayesOpt) contribute **<1% CPU** — not the bottleneck
+- **Mutex contention**: Zero (confirmed via pprof mutex profile)
+- Root cause: syzkaller core program generation/mutation in `prog/` package
+
+**Implication**: Further exec/sec improvements require optimizing syzkaller core `prog/` functions, not PROBE components.
+
+---
+
 ## Phase 6+: Advanced Improvements Roadmap
 
 **Full roadmap**: See `syzkaller/probe_log/improvement_roadmap.md` for detailed descriptions, paper references, and cost projections.
@@ -924,6 +974,7 @@ Based on a survey of 30+ papers (CCS/NDSS/ASPLOS/USENIX 2022-2026), 39 applicabl
 | 11 | Concurrency & Performance | Month 3 | LACE, MI scheduling, LinUCB, BayesOpt | **+38% coverage**, race conditions | **DONE** |
 | 12 | Comprehensive Performance Tuning | Month 3+ | DEzzer precision, BO refinement, eBPF tuning | **Systematic optimization** | **DONE** |
 | 14 | Cross-Phase Synergy | Month 3+ | DEzzer-Focus-eBPF-SyzGPT-Anamnesis integration | **Cross-subsystem optimization** | **DONE** |
+| 15 | UCB-1 Feedback & Hotpath Opt | Month 4 | UCB-1 arm selection, atomic counters, LinUCB fixes, pprof analysis | **Manager CPU -30%**, bug fixes | **DONE** |
 
 ### Cost-incurring techniques (require API budget)
 - SyzGPT seed generation (+$0.10-0.50/day)

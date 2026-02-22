@@ -62,6 +62,7 @@ While traditional kernel fuzzers are coverage-guided (maximizing code coverage),
 - **OZZ sched_yield injection** for kernel race triggering
 - **4-arm schedule strategy** via Global Thompson Sampling (none / delay / yield / both)
 - Adaptive delay injection rate with 20% cap
+- **UCB-1 BiGRU/CT selection** with atomic counters for lock-free feedback tracking
 
 ### Hyperparameter Auto-Tuning
 - **Bayesian Optimization** via 8-dimensional Nelder-Mead simplex
@@ -69,6 +70,12 @@ While traditional kernel fuzzers are coverage-guided (maximizing code coverage),
 - Safety rollback (70% baseline threshold) with EMA transition
 - **Warm-start** save/load with staleness detection (kernel hash, corpus size, 48h expiry)
 - Cascade health monitoring for Thompson Sampling layers
+
+### UCB-1 Feedback & Hotpath Optimization
+- **UCB-1 arm selection** for BiGRU vs ChoiceTable with forced exploration and Upper Confidence Bound
+- **Atomic counters** for lock-free processResult() hotpath (BayesOpt, N-gram, LACE)
+- **LinUCB bug fixes**: forced exploration ordering, convergence cache guard, arm-0 pollution prevention
+- **pprof analysis** identified true bottleneck: `prog.ForeachArg` + `getCompatibleResources` (70% of manager CPU)
 
 ### AI Spec Generation
 - **DeepSeek API** integration for syscall specification generation from crash analysis
@@ -96,6 +103,8 @@ Host (syz-manager)                Guest VM (QEMU)
 |  - Focus triggering      |      |  FlatBuffers serialization       |
 |  - TS weight selection   |      |  Syscall execution               |
 |  - NgramClient (TCP)     |      +----------------------------------+
+|  - UCB-1 arm selection   |
+|  - Atomic hotpath opt    |
 +--------------------------+
          |
          v
@@ -295,7 +304,7 @@ All PROBE modifications are within the `syzkaller/` directory. The vanilla syzka
 | File | Description |
 |------|-------------|
 | `pkg/fuzzer/dezzer.go` | DEzzer exploit pattern detection (Thompson Sampling + DE) |
-| `pkg/fuzzer/ngram.go` | BiGRU N-gram prediction client (TCP) |
+| `pkg/fuzzer/ngram.go` | N-gram UCB-1 BiGRU/CT arm selection (Phase 15) |
 | `pkg/fuzzer/bayesopt.go` | Bayesian Optimization hyperparameter tuning |
 | `pkg/fuzzer/linucb.go` | LinUCB contextual bandit algorithm |
 | `pkg/fuzzer/schedts.go` | Scheduling timestamp tracker |
