@@ -109,12 +109,12 @@ func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 		delayed := fuzzer.delayedExecs.Load()
 		total := fuzzer.delayTotal.Load()
 		if total > 0 && delayed*100/total > 20 {
-			delayPattern = prog.DelayNone
+			// Rate cap: no delay, keep delayPattern=-1 so LinUCB doesn't get false arm-0 credit.
 		} else if rnd.Intn(10) == 0 { // 10% base injection rate
 			schedArm = fuzzer.schedTS.SelectArm(rnd)
 			switch schedArm {
 			case SchedNone:
-				delayPattern = prog.DelayNone
+				// Keep delayPattern=-1: LinUCB didn't choose this, don't credit arm 0.
 				fuzzer.statDelayNone.Add(1)
 			case SchedDelayOnly:
 				features := fuzzer.buildDelayFeatures(newP, false)

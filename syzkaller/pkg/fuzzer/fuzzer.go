@@ -82,7 +82,13 @@ type Fuzzer struct {
 	raceSchedThreshold uint32       // sched_switch threshold
 	raceFocusPending   []focusCandidate // independent race Focus queue (max 2)
 	raceStartTime      time.Time    // when LACE started (for 24h threshold logic)
-	raceSamples        []uint32     // lock contention samples for P90 calibration
+	raceSamples        []uint32     // lock contention samples for P90 calibration (legacy)
+
+	// LACE lock-free optimization: ring buffer + atomic threshold.
+	raceSampleRing      [raceSampleRingSize]uint32 // fixed-size ring for lock-free sampling
+	raceSampleIdx       atomic.Int64               // monotonic index into ring
+	raceThresholdAtomic atomic.Uint32              // lock-free threshold for hot path
+	lastRaceFocusNano   atomic.Int64               // UnixNano for 3-min cooldown (lock-free)
 
 	// PROBE: Phase 11j — LinUCB delay pattern bandit (separate from DEzzer).
 	linucb       *LinUCB
@@ -257,6 +263,10 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 	// If we are already triaging this exact prog, this is flaky coverage.
 	// Hanged programs are harmful as they consume executor procs.
 	dontTriage := flags&progInTriage > 0 || res.Status == queue.Hanged
+
+	// PROBE: Cache classifyProgram result — called 3x in processResult, now computed once.
+	progCluster := classifyProgram(req.Prog)
+
 	// Triage the program.
 	// We do it before unblocking the waiting threads because
 	// it may result it concurrent modification of req.Prog.
@@ -276,8 +286,7 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 			}
 			// Phase 12 A2: Pass req.PrevMutOp as prevOp for pair TS conditioning.
 			// Phase 12 B1: Pass actual cluster for FeatureTuple enrichment.
-			cluster := classifyProgram(req.Prog)
-			fuzzer.dezzer.RecordResult(req.MutOp, req.PrevMutOp, req.SubOp, covGain, SourceMutate, cluster)
+			fuzzer.dezzer.RecordResult(req.MutOp, req.PrevMutOp, req.SubOp, covGain, SourceMutate, progCluster)
 		}
 
 		// PROBE: Phase 15 — UCB-1 feedback: record BiGRU vs ChoiceTable success.
@@ -507,26 +516,20 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 			fuzzer.statRaceConcurrentAccess.Add(int(res.Info.EbpfConcurrentAccess))
 		}
 		// LACE race Focus trigger (independent 3-min cooldown, separate from memory 5-min).
-		// P90 auto-calibration: collect lock contention samples, compute P90 every 500 samples.
+		// Lock-free ring buffer for P90 calibration, recalculated every 2000 samples.
 		if res.Info.EbpfLockContention > 0 && res.Status != queue.Hanged {
-			fuzzer.focusMu.Lock()
-			raceCooldownOk := time.Since(fuzzer.lastRaceFocus) >= 3*time.Minute
-			// Record sample for P90 calibration.
-			fuzzer.raceSamples = append(fuzzer.raceSamples, res.Info.EbpfLockContention)
-			if len(fuzzer.raceSamples) >= 500 {
-				sorted := make([]uint32, len(fuzzer.raceSamples))
-				copy(sorted, fuzzer.raceSamples)
-				sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-				p90 := sorted[len(sorted)*90/100]
-				if p90 > 0 {
-					fuzzer.raceThreshold = p90
-					fuzzer.Logf(0, "PROBE: LACE raceThreshold auto-calibrated to P90=%d (from %d samples)", p90, len(sorted))
-				}
-				// Keep last 250 for rolling window.
-				fuzzer.raceSamples = append([]uint32{}, fuzzer.raceSamples[len(fuzzer.raceSamples)-250:]...)
+			// Lock-free sample collection via atomic ring buffer.
+			idx := fuzzer.raceSampleIdx.Add(1) - 1
+			fuzzer.raceSampleRing[idx%raceSampleRingSize] = res.Info.EbpfLockContention
+
+			// P90 recalculation: every 2000 samples (4x less frequent than before).
+			if idx > 0 && idx%2000 == 0 {
+				fuzzer.recalcRaceThreshold()
 			}
-			raceThresh := fuzzer.raceThreshold
-			fuzzer.focusMu.Unlock()
+
+			// Lock-free reads for threshold and cooldown.
+			raceThresh := fuzzer.raceThresholdAtomic.Load()
+			raceCooldownOk := time.Now().UnixNano()-fuzzer.lastRaceFocusNano.Load() >= int64(3*time.Minute)
 
 			if res.Info.EbpfLockContention > raceThresh &&
 				res.Info.EbpfConcurrentAccess > 0 &&
@@ -536,9 +539,9 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 				fuzzer.Logf(0, "PROBE: LACE race detected (lock_contention=%d, concurrent=%d, sched=%d) in %s",
 					res.Info.EbpfLockContention, res.Info.EbpfConcurrentAccess,
 					res.Info.EbpfSchedSwitch, req.Prog)
-				// Submit to race Focus queue (independent from memory focus).
+				// Submit to race Focus queue — only this part needs focusMu.
 				fuzzer.focusMu.Lock()
-				fuzzer.lastRaceFocus = time.Now()
+				fuzzer.lastRaceFocusNano.Store(time.Now().UnixNano())
 				if len(fuzzer.raceFocusPending) < 2 {
 					fuzzer.raceFocusPending = append(fuzzer.raceFocusPending, focusCandidate{
 						prog: req.Prog.Clone(), title: raceTitle, tier: 1,
@@ -556,7 +559,7 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 
 		// PROBE: Phase 11j — LinUCB delay feedback.
 		if fuzzer.linucb != nil && req.DelayPattern >= 0 {
-			features := fuzzer.buildDelayFeatures(req.Prog, req.Stat == fuzzer.statExecFocus)
+			features := fuzzer.buildDelayFeaturesWithCluster(req.Prog, req.Stat == fuzzer.statExecFocus, progCluster)
 			reward := 0.0
 			// Reward: sched_switch activity + coverage gain indicates delay effectiveness.
 			if res.Info.EbpfSchedSwitch > 5 {
@@ -631,7 +634,6 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 
 			// Phase 14 D9: Apply Anamnesis bonus to DEzzer mutation optimizer.
 			if assessment.Score >= 40 && req.MutOp != "" && fuzzer.dezzer != nil {
-				cluster := classifyProgram(req.Prog)
 				mult := 1.2
 				if assessment.ShouldFocus {
 					mult = 1.5
@@ -639,7 +641,7 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 				if assessment.FocusTier == 1 {
 					mult = 2.0
 				}
-				fuzzer.dezzer.RecordAnamnesisBonus(req.MutOp, cluster, mult)
+				fuzzer.dezzer.RecordAnamnesisBonus(req.MutOp, progCluster, mult)
 			}
 		}
 
@@ -872,6 +874,9 @@ type focusCandidate struct {
 // Prevents the same eBPF trigger (e.g., ebpf-uaf) from monopolizing focus for hours
 // when many different programs hit the same kernel bug.
 const focusTypeCooldownDur = 30 * time.Minute
+
+// raceSampleRingSize is the size of the lock-free ring buffer for LACE P90 calibration.
+const raceSampleRingSize = 4096
 
 // focusTypeKey extracts the bug type prefix from a focus title.
 // "PROBE:ebpf-uaf:<prog>" → "ebpf-uaf", "PROBE:priv-esc" → "priv-esc".
@@ -1718,6 +1723,11 @@ func (fuzzer *Fuzzer) applyBOParams(params [boNumParams]float64) {
 // Feature vector (d=8): [prog_len, lock_syscall_ratio, ebpf_contention, ebpf_concurrent,
 //   sched_switches, coverage_delta, prog_category, is_focus]
 func (fuzzer *Fuzzer) buildDelayFeatures(p *prog.Prog, isFocus bool) []float64 {
+	return fuzzer.buildDelayFeaturesWithCluster(p, isFocus, classifyProgram(p))
+}
+
+// buildDelayFeaturesWithCluster is the inner implementation that accepts a pre-computed cluster.
+func (fuzzer *Fuzzer) buildDelayFeaturesWithCluster(p *prog.Prog, isFocus bool, cluster int) []float64 {
 	features := make([]float64, linucbDim)
 
 	// Feature 0: program length (normalized to ~0-1 range).
@@ -1742,8 +1752,8 @@ func (fuzzer *Fuzzer) buildDelayFeatures(p *prog.Prog, isFocus bool) []float64 {
 	// Feature 5: coverage delta (recent coverage entropy as proxy).
 	features[5] = float64(fuzzer.coverageEntropy.Load()) / 3000.0 // entropy x1000, max ~2.5
 
-	// Feature 6: program category (cluster).
-	features[6] = float64(classifyProgram(p)) / float64(numClusters)
+	// Feature 6: program category (cluster) — uses pre-computed value.
+	features[6] = float64(cluster) / float64(numClusters)
 
 	// Feature 7: is focus execution.
 	if isFocus {
@@ -1751,6 +1761,31 @@ func (fuzzer *Fuzzer) buildDelayFeatures(p *prog.Prog, isFocus bool) []float64 {
 	}
 
 	return features
+}
+
+// recalcRaceThreshold recomputes the P90 lock-contention threshold from the ring buffer.
+func (fuzzer *Fuzzer) recalcRaceThreshold() {
+	fuzzer.focusMu.Lock()
+	defer fuzzer.focusMu.Unlock()
+
+	count := int(fuzzer.raceSampleIdx.Load())
+	if count > raceSampleRingSize {
+		count = raceSampleRingSize
+	}
+	if count == 0 {
+		return
+	}
+	sorted := make([]uint32, count)
+	for i := 0; i < count; i++ {
+		sorted[i] = fuzzer.raceSampleRing[i%raceSampleRingSize]
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	p90 := sorted[len(sorted)*90/100]
+	if p90 > 0 {
+		fuzzer.raceThresholdAtomic.Store(p90)
+		fuzzer.raceThreshold = p90
+		fuzzer.Logf(0, "PROBE: LACE raceThreshold auto-calibrated to P90=%d (from %d samples)", p90, len(sorted))
+	}
 }
 
 // isLockSyscall returns true if the syscall name indicates a lock-related operation.

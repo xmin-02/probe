@@ -38,6 +38,11 @@ type LinUCB struct {
 	totalObs int64                   // total observations for annealing
 	armPicks [linucbArms]int64       // arm selection counts for diagnostics
 	logf     func(level int, msg string, args ...any)
+
+	// Convergence cache: when one arm dominates (99%+), skip matrix computation.
+	cachedArm  int
+	cacheValid bool
+	cacheUntil int64 // totalObs threshold; cache valid while totalObs < cacheUntil
 }
 
 // NewLinUCB creates a new LinUCB contextual bandit with identity-initialized matrices.
@@ -67,13 +72,17 @@ func (l *LinUCB) SelectArm(features []float64) int {
 	var featArr [linucbDim]float64
 	copy(featArr[:], features)
 
-	// Forced exploration: ensure each arm is tried at least 10 times before UCB takes over.
-	// Without this, global alpha annealing (0.5→0.1 after 1000 obs) combined with strict
-	// tie-breaking causes arms 2 and 3 to never be selected after arm 0/1 accumulate data.
+	// Forced exploration FIRST: ensure each arm is tried at least 100 times.
+	// Must run before cache check — otherwise cache locks out under-explored arms.
 	for a := 0; a < linucbArms; a++ {
-		if l.armPicks[a] < 10 {
+		if l.armPicks[a] < 100 {
 			return a
 		}
+	}
+
+	// Convergence cache: skip matrix computation if one arm dominates.
+	if l.cacheValid && l.totalObs < l.cacheUntil {
+		return l.cachedArm
 	}
 
 	bestArm := 0
@@ -88,7 +97,11 @@ func (l *LinUCB) SelectArm(features []float64) int {
 		Ainvx := matVecMul(l.Ainv[a], features)
 		explore := l.alpha * math.Sqrt(math.Max(0, dotProduct(features, Ainvx)))
 		score := exploit + explore
-		if score > bestScore {
+		if score > bestScore+1e-9 {
+			bestScore = score
+			bestArm = a
+		} else if math.Abs(score-bestScore) < 1e-9 && l.armPicks[a] < l.armPicks[bestArm] {
+			// Tie-break: prefer less-explored arm to avoid index-0 bias.
 			bestScore = score
 			bestArm = a
 		}
@@ -108,29 +121,26 @@ func (l *LinUCB) Update(arm int, features []float64, reward float64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// A_a = A_a + x * x^T (conceptual, but we update Ainv directly)
-	// b_a = b_a + reward * x
+	// b_a = b_a + reward * x (always needed).
 	for i := 0; i < linucbDim; i++ {
 		l.b[arm][i] += reward * features[i]
 	}
 
-	// Sherman-Morrison update for A_a^{-1}:
-	// Ainv_new = Ainv - (Ainv * x * x^T * Ainv) / (1 + x^T * Ainv * x)
-	Ainv := l.Ainv[arm]
-	AinvxArr := matVecMul(Ainv, features)
-	denom := 1.0 + dotProduct(features, AinvxArr)
-	if denom < 1e-10 {
-		denom = 1e-10
-	}
-
-	// Outer product: Ainvx * Ainvx^T / denom, subtracted from Ainv.
-	for i := 0; i < linucbDim; i++ {
-		for j := 0; j < linucbDim; j++ {
-			Ainv[i][j] -= (AinvxArr[i] * AinvxArr[j]) / denom
+	// Sherman-Morrison update for A_a^{-1}: skip when convergence cache is active.
+	if !(l.cacheValid && l.totalObs < l.cacheUntil) {
+		Ainv := l.Ainv[arm]
+		AinvxArr := matVecMul(Ainv, features)
+		denom := 1.0 + dotProduct(features, AinvxArr)
+		if denom < 1e-10 {
+			denom = 1e-10
+		}
+		for i := 0; i < linucbDim; i++ {
+			for j := 0; j < linucbDim; j++ {
+				Ainv[i][j] -= (AinvxArr[i] * AinvxArr[j]) / denom
+			}
 		}
 	}
 
-	// Anneal alpha: alpha = max(0.1, 0.5 * (1 - totalObs/1000))
 	l.totalObs++
 	l.armPicks[arm]++
 	ratio := float64(l.totalObs) / float64(linucbAnnealN)
@@ -139,12 +149,38 @@ func (l *LinUCB) Update(arm int, features []float64, reward float64) {
 	}
 	l.alpha = math.Max(linucbAlphaMin, linucbAlphaMax*(1.0-ratio))
 
+	// Convergence detection: only cache AFTER annealing AND forced exploration complete.
+	// All arms must have >= 100 picks before caching is allowed.
+	if l.totalObs > linucbAnnealN {
+		allExplored := true
+		for a := 0; a < linucbArms; a++ {
+			if l.armPicks[a] < 100 {
+				allExplored = false
+				break
+			}
+		}
+		if allExplored {
+			for a := 0; a < linucbArms; a++ {
+				if l.armPicks[a]*1000 > l.totalObs*995 {
+					l.cachedArm = a
+					l.cacheValid = true
+					l.cacheUntil = l.totalObs + 5000
+					break
+				}
+			}
+		}
+	}
+
 	// Diagnostic log every 1000 observations.
 	if l.logf != nil && l.totalObs%1000 == 0 {
-		l.logf(0, "PROBE: LinUCB status: obs=%d, alpha=%.3f, arms=[None:%d Rand:%d Between:%d Locks:%d], reward=%.3f",
+		cached := ""
+		if l.cacheValid && l.totalObs < l.cacheUntil {
+			cached = " [CACHED]"
+		}
+		l.logf(0, "PROBE: LinUCB status: obs=%d, alpha=%.3f, arms=[None:%d Rand:%d Between:%d Locks:%d], reward=%.3f%s",
 			l.totalObs, l.alpha,
 			l.armPicks[0], l.armPicks[1], l.armPicks[2], l.armPicks[3],
-			reward)
+			reward, cached)
 	}
 }
 

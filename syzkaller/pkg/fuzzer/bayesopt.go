@@ -13,6 +13,7 @@ import (
 	"math"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -104,8 +105,11 @@ type BayesOpt struct {
 	bestParams [boNumParams]float64
 	bestValue  float64
 
-	// Active flag.
-	active bool
+	// Active flag (atomic for lock-free hot-path check).
+	active atomic.Bool
+
+	// Epoch deadline: fast path to skip lock when epoch hasn't expired.
+	epochDeadlineNano atomic.Int64
 
 	// Phase 12 C1: Multi-epoch averaging.
 	epochRateSum  float64 // sum of rates across sub-epochs for current vertex
@@ -134,11 +138,12 @@ type BayesOpt struct {
 func NewBayesOpt(logf func(level int, msg string, args ...any)) *BayesOpt {
 	bo := &BayesOpt{
 		logf:       logf,
-		active:     true,
 		bestParams: paramDefaults,
 		bestValue:  -1,
 		startTime:  time.Now(),
 	}
+	bo.active.Store(true)
+	bo.epochDeadlineNano.Store(time.Now().Add(time.Duration(boEpochSeconds) * time.Second).UnixNano())
 
 	// Initialize simplex: vertex 0 = defaults, others = defaults + perturbation along axis i.
 	bo.simplex[0] = paramDefaults
@@ -163,19 +168,25 @@ func (bo *BayesOpt) GetCurrentParams() [boNumParams]float64 {
 
 // IsActive returns whether BO is still running.
 func (bo *BayesOpt) IsActive() bool {
-	bo.mu.Lock()
-	defer bo.mu.Unlock()
-	return bo.active
+	return bo.active.Load()
 }
 
 // CheckEpoch checks if the current epoch has ended and starts a new one.
 // Returns true if parameters changed (caller should apply them).
 // covTotal = total coverage signal length at this moment.
 func (bo *BayesOpt) CheckEpoch(covTotal int64) bool {
+	// Fast path: skip lock if BO inactive or epoch not yet expired.
+	if !bo.active.Load() {
+		return false
+	}
+	if time.Now().UnixNano() < bo.epochDeadlineNano.Load() {
+		return false
+	}
+
 	bo.mu.Lock()
 	defer bo.mu.Unlock()
 
-	if !bo.active {
+	if !bo.active.Load() {
 		return false
 	}
 
@@ -207,6 +218,7 @@ func (bo *BayesOpt) CheckEpoch(covTotal int64) bool {
 		}
 		bo.epochStart = time.Now()
 		bo.epochCovStart = covTotal
+		bo.epochDeadlineNano.Store(bo.epochStart.Add(time.Duration(boEpochSeconds) * time.Second).UnixNano())
 		bo.epoch++
 		return true
 	}
@@ -240,7 +252,7 @@ func (bo *BayesOpt) CheckEpoch(covTotal int64) bool {
 	// Advance to next vertex or run Nelder-Mead step.
 	bo.epoch++
 	if bo.epoch >= boMaxEpochs {
-		bo.active = false
+		bo.active.Store(false)
 		bo.currentParams = bo.bestParams
 		bo.logf(0, "PROBE: BO completed %d epochs. Using best params.", bo.epoch)
 		return true
@@ -271,6 +283,7 @@ func (bo *BayesOpt) CheckEpoch(covTotal int64) bool {
 
 	bo.epochStart = time.Now()
 	bo.epochCovStart = covTotal
+	bo.epochDeadlineNano.Store(bo.epochStart.Add(time.Duration(boEpochSeconds) * time.Second).UnixNano())
 	return true
 }
 
@@ -357,7 +370,7 @@ func (bo *BayesOpt) nmStepReady() {
 
 	// Convergence detection: stop if simplex is too small.
 	if bo.nmSimplexDiameter() < nmConvergeEps {
-		bo.active = false
+		bo.active.Store(false)
 		bo.currentParams = bo.simplex[bo.nmBest]
 		bo.bestParams = bo.simplex[bo.nmBest]
 		bo.logf(0, "PROBE: BO Nelder-Mead converged (diameter < eps), using best params")
@@ -534,7 +547,7 @@ func (bo *BayesOpt) adaptiveNoiseMargin() float64 {
 func (bo *BayesOpt) CheckCascadeHealth(activeLayers int) {
 	bo.mu.Lock()
 	defer bo.mu.Unlock()
-	if !bo.active {
+	if !bo.active.Load() {
 		return
 	}
 	if activeLayers < boCascadeHealthMin {

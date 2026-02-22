@@ -17,6 +17,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -50,11 +51,11 @@ type NgramClient struct {
 	failCount   int
 	bypassUntil time.Time
 
-	// UCB-1 tracking: BiGRU vs ChoiceTable performance.
-	bigruWins   int64
-	bigruTrials int64
-	ctWins      int64
-	ctTrials    int64
+	// UCB-1 tracking: BiGRU vs ChoiceTable performance (atomic for lock-free hot path).
+	bigruWins   atomic.Int64
+	bigruTrials atomic.Int64
+	ctWins      atomic.Int64
+	ctTrials    atomic.Int64
 
 	// Prediction cache: avoids synchronous TCP on mutation hot path.
 	predCache   map[string]predCacheEntry
@@ -168,21 +169,17 @@ func (c *NgramClient) makeCacheKey(calls []string) string {
 
 // RecordBiGRUResult records whether the BiGRU's prediction led to success.
 func (c *NgramClient) RecordBiGRUResult(success bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.bigruTrials++
+	c.bigruTrials.Add(1)
 	if success {
-		c.bigruWins++
+		c.bigruWins.Add(1)
 	}
 }
 
 // RecordCTResult records whether the ChoiceTable's selection led to success.
 func (c *NgramClient) RecordCTResult(success bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.ctTrials++
+	c.ctTrials.Add(1)
 	if success {
-		c.ctWins++
+		c.ctWins.Add(1)
 	}
 }
 
@@ -190,24 +187,31 @@ func (c *NgramClient) RecordCTResult(success bool) {
 // Returns false if the server is unhealthy or BiGRU has insufficient data.
 func (c *NgramClient) ShouldUseBiGRU() bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	healthy := c.healthy
+	c.mu.Unlock()
 
-	if !c.healthy {
+	if !healthy {
 		return false
 	}
 
+	// Atomic reads — no mutex needed for UCB-1 counters.
+	bt := c.bigruTrials.Load()
+	ct := c.ctTrials.Load()
+
 	// Cold start: always use ChoiceTable until both have at least 100 trials.
-	if c.bigruTrials < 100 || c.ctTrials < 100 {
-		// 50% chance to use BiGRU during exploration.
-		return c.bigruTrials <= c.ctTrials
+	if bt < 100 || ct < 100 {
+		return bt <= ct
 	}
 
+	bw := c.bigruWins.Load()
+	cw := c.ctWins.Load()
+
 	// UCB-1 comparison with exploration bonus.
-	totalTrials := float64(c.bigruTrials + c.ctTrials)
-	bigruRate := float64(c.bigruWins) / float64(c.bigruTrials)
-	ctRate := float64(c.ctWins) / float64(c.ctTrials)
-	bigruUCB := bigruRate + math.Sqrt(2*math.Log(totalTrials)/float64(c.bigruTrials))
-	ctUCB := ctRate + math.Sqrt(2*math.Log(totalTrials)/float64(c.ctTrials))
+	totalTrials := float64(bt + ct)
+	bigruRate := float64(bw) / float64(bt)
+	ctRate := float64(cw) / float64(ct)
+	bigruUCB := bigruRate + math.Sqrt(2*math.Log(totalTrials)/float64(bt))
+	ctUCB := ctRate + math.Sqrt(2*math.Log(totalTrials)/float64(ct))
 	return bigruUCB >= ctUCB
 }
 
@@ -367,16 +371,18 @@ func (c *NgramClient) healthLoop() {
 		checkCount++
 		// Log UCB-1 status every ~60s (12 checks * 5s interval).
 		if checkCount%12 == 0 {
+			bw, bt := c.bigruWins.Load(), c.bigruTrials.Load()
+			cw, ct := c.ctWins.Load(), c.ctTrials.Load()
 			bigruRate, ctRate := 0.0, 0.0
-			if c.bigruTrials > 0 {
-				bigruRate = float64(c.bigruWins) / float64(c.bigruTrials) * 100
+			if bt > 0 {
+				bigruRate = float64(bw) / float64(bt) * 100
 			}
-			if c.ctTrials > 0 {
-				ctRate = float64(c.ctWins) / float64(c.ctTrials) * 100
+			if ct > 0 {
+				ctRate = float64(cw) / float64(ct) * 100
 			}
 			c.logf(0, "PROBE: N-gram UCB-1 status: healthy=%v, BiGRU=%d/%d (%.1f%%), CT=%d/%d (%.1f%%)",
-				c.healthy, c.bigruWins, c.bigruTrials, bigruRate,
-				c.ctWins, c.ctTrials, ctRate)
+				c.healthy, bw, bt, bigruRate,
+				cw, ct, ctRate)
 		}
 		c.mu.Unlock()
 	}

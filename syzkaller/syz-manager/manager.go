@@ -1458,8 +1458,9 @@ func (mgr *Manager) mockModelRetrainLoop(f *fuzzer.Fuzzer) {
 
 	corpusDir := mgr.cfg.Workdir + "/corpus.db"
 	for {
-		// Try to retrain via the fuzzer's ngram client.
-		if client := f.NgramClient(); client != nil && client.Healthy() {
+		// Allow cold-start retrain even when server reports unhealthy (model.pt missing).
+		// The server supports training from scratch — the Healthy() guard was preventing recovery.
+		if client := f.NgramClient(); client != nil {
 			if err := client.Retrain(corpusDir); err != nil {
 				log.Logf(0, "PROBE: MOCK model retrain error: %v", err)
 			} else {

@@ -246,7 +246,8 @@ type DEzzer struct {
 	objBeta    [NumObjectives][dezzerNumOps]float64
 	objRewards [NumObjectives]float64 // UCB-1 cumulative reward
 	objCounts  [NumObjectives]int64   // UCB-1 pull counts
-	currentObj int                    // current epoch objective
+	currentObj      int            // current epoch objective
+	currentObjCache atomic.Int64   // lock-free cache of currentObj for hot-path reads
 	epochLeft  int                    // remaining records in this epoch
 	startTime  time.Time             // fuzzer start time (dynamic coverage floor)
 
@@ -536,6 +537,7 @@ func (d *DEzzer) RecordResult(op, prevOp, subOp string, covGainBits int, source 
 	d.epochLeft--
 	if d.epochLeft <= 0 && d.warmupDone {
 		d.currentObj = d.selectObjective()
+		d.currentObjCache.Store(int64(d.currentObj))
 		d.epochLeft = objEpochSize
 	}
 
@@ -2071,7 +2073,7 @@ func (d *DEzzer) selectObjective() int {
 
 	if d.logf != nil {
 		objNames := [NumObjectives]string{"coverage", "memory_safety", "priv_esc"}
-		d.logf(0, "PROBE: DEzzer objective selected: %s (counts: cov=%d mem=%d priv=%d)",
+		d.logf(2, "PROBE: DEzzer objective selected: %s (counts: cov=%d mem=%d priv=%d)",
 			objNames[bestObj], d.objCounts[ObjCoverage], d.objCounts[ObjMemorySafety], d.objCounts[ObjPrivEsc])
 	}
 	return bestObj
@@ -2087,11 +2089,9 @@ func (d *DEzzer) RecordObjectiveReward(reward float64) {
 	}
 }
 
-// CurrentObjective returns the currently active objective.
+// CurrentObjective returns the currently active objective (lock-free via atomic cache).
 func (d *DEzzer) CurrentObjective() int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.currentObj
+	return int(d.currentObjCache.Load())
 }
 
 // --- Utility functions ---
