@@ -18,6 +18,7 @@ package fuzzer
 import (
 	"math"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -43,6 +44,9 @@ type LinUCB struct {
 	cachedArm  int
 	cacheValid bool
 	cacheUntil int64 // totalObs threshold; cache valid while totalObs < cacheUntil
+
+	// Exploration counter (atomic for lock-free access from fuzzer stats).
+	Explorations atomic.Int64
 }
 
 // NewLinUCB creates a new LinUCB contextual bandit with identity-initialized matrices.
@@ -76,6 +80,7 @@ func (l *LinUCB) SelectArm(features []float64) int {
 	// Must run before cache check — otherwise cache locks out under-explored arms.
 	for a := 0; a < linucbArms; a++ {
 		if l.armPicks[a] < 100 {
+			l.Explorations.Add(1)
 			return a
 		}
 	}
@@ -126,18 +131,18 @@ func (l *LinUCB) Update(arm int, features []float64, reward float64) {
 		l.b[arm][i] += reward * features[i]
 	}
 
-	// Sherman-Morrison update for A_a^{-1}: skip when convergence cache is active.
-	if !(l.cacheValid && l.totalObs < l.cacheUntil) {
-		Ainv := l.Ainv[arm]
-		AinvxArr := matVecMul(Ainv, features)
-		denom := 1.0 + dotProduct(features, AinvxArr)
-		if denom < 1e-10 {
-			denom = 1e-10
-		}
-		for i := 0; i < linucbDim; i++ {
-			for j := 0; j < linucbDim; j++ {
-				Ainv[i][j] -= (AinvxArr[i] * AinvxArr[j]) / denom
-			}
+	// Sherman-Morrison update for A_a^{-1}.
+	// Phase 18 B2: Always update Ainv (removed cache skip). d=8 means 64 float ops
+	// (~50ns) — cache skip saved nothing but caused Ainv/b mathematical inconsistency.
+	Ainv := l.Ainv[arm]
+	AinvxArr := matVecMul(Ainv, features)
+	denom := 1.0 + dotProduct(features, AinvxArr)
+	if denom < 1e-10 {
+		denom = 1e-10
+	}
+	for i := 0; i < linucbDim; i++ {
+		for j := 0; j < linucbDim; j++ {
+			Ainv[i][j] -= (AinvxArr[i] * AinvxArr[j]) / denom
 		}
 	}
 

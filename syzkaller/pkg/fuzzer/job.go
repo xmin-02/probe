@@ -46,9 +46,11 @@ func genProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 		fuzzer.RecommendedCalls(),
 		fuzzer.ChoiceTable())
 	return &queue.Request{
-		Prog:     p,
-		ExecOpts: setFlags(flatrpc.ExecFlagCollectSignal),
-		Stat:     fuzzer.statExecGenerate,
+		Prog:         p,
+		ExecOpts:     setFlags(flatrpc.ExecFlagCollectSignal),
+		Stat:         fuzzer.statExecGenerate,
+		SchedArm:     -1, // Phase 18.5 F4: no scheduling selected for generate
+		DelayPattern: -1, // Phase 18.5 F4: no delay pattern for generate
 	}
 }
 
@@ -110,7 +112,7 @@ func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 		total := fuzzer.delayTotal.Load()
 		if total > 0 && delayed*100/total > 20 {
 			// Rate cap: no delay, keep delayPattern=-1 so LinUCB doesn't get false arm-0 credit.
-		} else if rnd.Intn(10) == 0 { // 10% base injection rate
+		} else if rnd.Intn(100) < int(fuzzer.boDelayInjRate.Load()) { // Phase 18.5 F2a: BO-tunable injection rate
 			schedArm = fuzzer.schedTS.SelectArm(rnd)
 			switch schedArm {
 			case SchedNone:
@@ -448,7 +450,8 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool, highValue
 	if job.flags&ProgFromCorpus == 0 {
 		// For fuzzing programs we stop if we already have the right deflaked signal for all calls,
 		// or there's no chance to get coverage common to needRuns for all calls.
-		if run >= deflakeMaxRuns {
+		maxRuns := int(job.fuzzer.boDeflakeMax.Load()) // Phase 18.5 F2c: BO-tunable
+		if run >= maxRuns {
 			return true
 		}
 		// Phase 11b: Adaptive early stop — non-high-value programs stop sooner
@@ -458,7 +461,7 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool, highValue
 		}
 		noChance := true
 		for _, call := range job.calls {
-			if left := deflakeMaxRuns - run; left >= needRuns ||
+			if left := maxRuns - run; left >= needRuns ||
 				call.newSignal.IntersectsWith(call.signals[needRuns-left-1]) {
 				noChance = false
 			}
@@ -654,11 +657,18 @@ const (
 )
 
 func (job *focusJob) run(fuzzer *Fuzzer) {
+	crashExit := false // Phase 16c: track if focus ended due to VM crash
 	defer func() {
 		fuzzer.focusMu.Lock()
 		fuzzer.focusActive = false
 		fuzzer.focusTarget = ""
 		fuzzer.lastEbpfFocus.Store(time.Now()) // Reset cooldown at focus END (not start).
+		// Phase 16c: Update crash streak for circuit breaker.
+		if crashExit {
+			fuzzer.focusCrashStreak++
+		} else {
+			fuzzer.focusCrashStreak = 0
+		}
 		fuzzer.focusMu.Unlock()
 		// Launch next queued focus candidate if any.
 		fuzzer.drainFocusPending()
@@ -724,8 +734,13 @@ func (job *focusJob) run(fuzzer *Fuzzer) {
 			ExecOpts: setFlags(flatrpc.ExecFlagCollectSignal),
 			Stat:     fuzzer.statExecFocus,
 		})
-		if result.Stop() {
+		// Phase 18 B5: Only treat VM crash/hang as crashExit, not transient ExecFailure.
+		if result.Status == queue.Crashed || result.Status == queue.Hanged {
+			crashExit = true
 			break
+		}
+		if result.Status == queue.ExecFailure {
+			continue // transient exec error, retry next iteration
 		}
 		totalIters++
 		job.info.Execs.Add(1)
@@ -779,7 +794,9 @@ func (job *focusJob) run(fuzzer *Fuzzer) {
 	earlyExit := noProgress >= focusNoProgressMax
 	optimalStop := totalIters < focusMaxIters && !earlyExit && !wallTimeout && totalIters > observeIters
 	exitReason := "completed"
-	if wallTimeout {
+	if crashExit {
+		exitReason = "vm-crash"
+	} else if wallTimeout {
 		exitReason = fmt.Sprintf("wall-timeout(%v)", focusWallTimeout)
 	} else if earlyExit {
 		exitReason = fmt.Sprintf("no-progress(%d)", focusNoProgressMax)

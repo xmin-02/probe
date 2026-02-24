@@ -92,6 +92,7 @@ func (serv *HTTPServer) Serve(ctx context.Context) error {
 	handle("/ai/specgen", serv.httpAISpecGen)        // PROBE: AI spec generation
 	handle("/ai/triage", serv.httpAITriage)          // PROBE: AI triage
 	handle("/ai/crash", serv.httpAICrash)             // PROBE: AI crash detail
+	handle("/api/summary", serv.httpAPISummary)        // PROBE: hub aggregation endpoint
 	handle("/api/ai/analyze", serv.httpAIAnalyze)     // PROBE: manual Step A
 	handle("/api/ai/log", serv.httpAILog)             // PROBE: console log stream
 	handle("/api/ai/strategize", serv.httpAIStrategize) // PROBE: manual Step B
@@ -295,6 +296,39 @@ func (serv *HTTPServer) httpStats(w http.ResponseWriter, r *http.Request) {
 		HTML:         html,
 	}
 	executeTemplate(w, textTemplate, data)
+}
+
+// PROBE: JSON summary endpoint for syz-hub aggregation.
+func (serv *HTTPServer) httpAPISummary(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	sm := make(map[string]int)
+	for _, s := range stat.Collect(stat.All) {
+		sm[s.Name] = s.V
+	}
+
+	vmTotal, vmAlive := 0, 0
+	for _, pool := range serv.Pools {
+		for _, st := range pool.State() {
+			vmTotal++
+			if st.State != dispatcher.StateOffline {
+				vmAlive++
+			}
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]any{
+		"corpus":      sm["corpus"],
+		"coverage":    sm["coverage"],
+		"signal":      sm["signal"],
+		"crashes":     sm["crashes"],
+		"crash_types": sm["crash types"],
+		"exec_total":  sm["exec total"],
+		"uptime_sec":  int(time.Since(serv.StartTime).Seconds()),
+		"vms_total":   vmTotal,
+		"vms_alive":   vmAlive,
+	})
 }
 
 func (serv *HTTPServer) httpVMs(w http.ResponseWriter, r *http.Request) {

@@ -114,6 +114,11 @@ func (target *Target) isCompatibleResource(dst, src string) bool {
 	if target.isAnyRes(src) {
 		return false
 	}
+	// PROBE: Phase 16 — use precomputed compatibility matrix for O(1) lookup.
+	if m := target.resourceCompat[dst]; m != nil {
+		return m[src]
+	}
+	// Fallback for resources not in the precomputed matrix.
 	dstRes := target.resourceMap[dst]
 	if dstRes == nil {
 		panic(fmt.Sprintf("unknown resource %q", dst))

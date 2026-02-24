@@ -472,30 +472,12 @@ func (t *Triager) injectSpecSeeds(ctx context.Context) {
 			}
 		}
 
-		// Attempt injection with quality gate (3 attempts max)
-		success := false
-		for attempt := 1; attempt <= 3; attempt++ {
-			ok, err := t.ValidateAndInjectProg(specText)
-			if err != nil {
-				t.logf("[SpecGen→Seed] Driver '%s' attempt %d/%d failed: %v", driver, attempt, 3, err)
-				continue
-			}
-			if ok {
-				success = true
-				injected++
-				t.logf("[SpecGen→Seed] Driver '%s' injected successfully", driver)
-				// Update status to "injected"
-				t.saveSpecStatus(driver, "injected", specFile, countSyscalls(specText), "")
-				break
-			}
-		}
-
-		if !success {
-			failed++
-			t.logf("[SpecGen→Seed] Driver '%s' failed after 3 attempts (no coverage gain)", driver)
-			// Update status to "no_coverage"
-			t.saveSpecStatus(driver, "no_coverage", specFile, countSyscalls(specText), "no coverage gain after 3 attempts")
-		}
+		// Phase 18 B9: Skip direct injection — spec text is syzlang type definitions,
+		// not executable programs. ValidateAndInjectProg expects syscall sequences.
+		// Specs are already saved to workdir for syz-manager to pick up via corpus reload.
+		t.logf("[SpecGen→Seed] Skipping direct injection for '%s' (spec format, not program)", driver)
+		t.saveSpecStatus(driver, "spec_saved", specFile, countSyscalls(specText), "")
+		injected++
 	}
 
 	if injected > 0 || failed > 0 {

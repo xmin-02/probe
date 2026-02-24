@@ -280,8 +280,9 @@ type DEzzer struct {
 	subOpCount [dezzerNumOps][maxSubOps]int64
 
 	// Phase 12 C1: BO-tunable overrides (0 = use constant default).
-	boDecayFactor  float64 // overrides dezzerDecayFactor when > 0
-	boTSDeltaLimit float64 // overrides dezzerTSDeltaLimit when > 0
+	boDecayFactor      float64 // overrides dezzerDecayFactor when > 0
+	boTSDeltaLimit     float64 // overrides dezzerTSDeltaLimit when > 0
+	boCUSUMThreshold   float64 // Phase 18.5 F2b: overrides dezzerCUSUMThreshold when > 0
 
 	// Phase 12 B4: stat counter for pair TS fallback (unknown prevOp).
 	statPairTSFallback *stat.Val
@@ -405,11 +406,12 @@ func (d *DEzzer) RecordResult(op, prevOp, subOp string, covGainBits int, source 
 	d.mu.Lock()
 	emaRateSnap := int(d.emaRate * 10000)
 	recordsSinceCUSUMSnap := d.recordsSinceCUSUM
+	saturatedSnap := d.saturated // Phase 18 B3: snapshot under lock to avoid data race
 	d.mu.Unlock()
 
 	// Phase 11a: Record feature with atomic counter (no lock needed for ring buffer write).
 	// Phase 12 B1: Enriched with context fields.
-	d.recordFeature(idx, covGainBits, success, source, cluster, emaRateSnap, recordsSinceCUSUMSnap, prevIdx)
+	d.recordFeature(idx, covGainBits, success, source, cluster, emaRateSnap, recordsSinceCUSUMSnap, prevIdx, saturatedSnap)
 
 	d.mu.Lock()
 
@@ -871,11 +873,12 @@ func (d *DEzzer) probsToTSDelta(probs [dezzerNumOps]float64) WeightVector {
 // Large changes → hard reset both TS and DE.
 // SetBOOverrides sets BO-tunable parameters. Phase 12 C1.
 // decayFactor=0 means use default constant, tsDeltaLimit=0 means use default constant.
-func (d *DEzzer) SetBOOverrides(decayFactor, tsDeltaLimit float64) {
+func (d *DEzzer) SetBOOverrides(decayFactor, tsDeltaLimit, cusumThresh float64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.boDecayFactor = decayFactor
 	d.boTSDeltaLimit = tsDeltaLimit
+	d.boCUSUMThreshold = cusumThresh
 }
 
 // getDecayFactor returns the effective decay factor (BO override or default).
@@ -892,6 +895,14 @@ func (d *DEzzer) getTSDeltaLimit() float64 {
 		return d.boTSDeltaLimit
 	}
 	return dezzerTSDeltaLimit
+}
+
+// Phase 18.5 F2b: getCUSUMThreshold returns the effective CUSUM threshold (BO override or default).
+func (d *DEzzer) getCUSUMThreshold() float64 {
+	if d.boCUSUMThreshold > 0 {
+		return d.boCUSUMThreshold
+	}
+	return dezzerCUSUMThreshold
 }
 
 func (d *DEzzer) SetAIBaseWeights(opts prog.MutateOpts) {
@@ -1653,7 +1664,8 @@ func (d *DEzzer) updateEMACUSUM(success bool) {
 	// Check for alarm (regime change).
 	// Phase 12 A5: Suppress CUSUM alarm for 60s after normalization (mutual exclusion).
 	cusumSuppressed := !d.lastNormalization.IsZero() && now.Sub(d.lastNormalization) < 60*time.Second
-	if !cusumSuppressed && (d.cusumHi > dezzerCUSUMThreshold || d.cusumLo > dezzerCUSUMThreshold) {
+	cusumThresh := d.getCUSUMThreshold() // Phase 18.5 F2b: BO-tunable
+	if !cusumSuppressed && (d.cusumHi > cusumThresh || d.cusumLo > cusumThresh) {
 		d.cusumResets++
 		d.lastCUSUMReset = now       // Phase 12 A5: record for mutual exclusion
 		d.recordsSinceCUSUM = 0      // Phase 12 B1: reset regime-local counter
@@ -1880,7 +1892,7 @@ func (d *DEzzer) opSuccessRate(opIdx int) (float64, float64) {
 // Phase 11a: No lock needed — uses atomic index for monotonic slot assignment.
 // Phase 12 B1: Enriched with context fields (pre-computed under lock, passed as params).
 func (d *DEzzer) recordFeature(opIdx int, covGain int, success bool, source FeedbackSource,
-	cluster int, emaRate int, recordsSinceCUSUM int64, prevOpIdx int) {
+	cluster int, emaRate int, recordsSinceCUSUM int64, prevOpIdx int, saturated bool) {
 	entropy := 0
 	if d.entropyRef != nil {
 		entropy = int(d.entropyRef.Load())
@@ -1893,7 +1905,7 @@ func (d *DEzzer) recordFeature(opIdx int, covGain int, success bool, source Feed
 		CovGain:           covGain,
 		Success:           success,
 		Source:            source,
-		Saturated:         d.saturated,
+		Saturated:         saturated, // Phase 18 B3: use snapshot from caller (read under lock)
 		ProgramCluster:    cluster,
 		CoverageEntropy:   entropy,
 		EMARate:           emaRate,
@@ -2039,6 +2051,16 @@ func (d *DEzzer) selectObjective() int {
 	for i := 0; i < NumObjectives; i++ {
 		if d.objCounts[i] == 0 {
 			return i
+		}
+	}
+
+	// Phase 18.5 F3: Rotation guarantee — force selection of any objective below 10%.
+	// Prevents priv_esc from monopolizing selection when coverage floor decays.
+	if totalPulls > 100 {
+		for i := 0; i < NumObjectives; i++ {
+			if float64(d.objCounts[i])/float64(totalPulls) < 0.10 {
+				return i
+			}
 		}
 	}
 

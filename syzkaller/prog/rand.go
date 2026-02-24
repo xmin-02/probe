@@ -17,10 +17,12 @@ import (
 
 const (
 	// "Recommended" number of calls in programs that we try to aim at during fuzzing.
-	RecommendedCalls = 30
+	// PROBE: Phase 16 — reduced from 30 to 20. Most kernel bugs trigger within 10-15 calls.
+	// Shorter programs reduce ForeachArg traversal cost by 33%, directly cutting manager CPU.
+	RecommendedCalls = 20
 	// "Recommended" max number of calls in programs.
 	// If we receive longer programs from hub/corpus we discard them.
-	MaxCalls = 40
+	MaxCalls = 30
 	// "Recommended" number of calls in KFuzzTest mode. These targets test the behavior
 	// of internal kernel functions rather than system behavior, and for this reason
 	// it is more sensible to generate a smaller number of calls instead of long chains.
@@ -1035,19 +1037,15 @@ func (r *randGen) resourceCentric(s *state, t *ResourceType, dir Dir) (arg Arg, 
 	return MakeResultArg(t, dir, resource, 0), p.Calls
 }
 
+// PROBE: Phase 16b — uses cached output resources to avoid ForeachArg traversal.
+// The cache is built lazily on first access and stays valid for immutable corpus programs.
+// Phase 18 B1: Uses ensureOutputResourceCache (sync.Once) for thread-safe lazy init.
 func getCompatibleResources(p *Prog, resourceType string, r *randGen) (resources []*ResultArg) {
-	for _, c := range p.Calls {
-		ForeachArg(c, func(arg Arg, _ *ArgCtx) {
-			// Collect only initialized resources (the ones that are already used in other calls).
-			a, ok := arg.(*ResultArg)
-			if !ok || len(a.uses) == 0 || a.Dir() != DirOut {
-				return
-			}
-			if !r.target.isCompatibleResource(resourceType, a.Type().Name()) {
-				return
-			}
-			resources = append(resources, a)
-		})
+	p.ensureOutputResourceCache()
+	for typeName, args := range p.cachedOutputResources {
+		if r.target.isCompatibleResource(resourceType, typeName) {
+			resources = append(resources, args...)
+		}
 	}
 	return resources
 }

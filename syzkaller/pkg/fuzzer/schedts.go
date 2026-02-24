@@ -85,18 +85,6 @@ func (s *SchedTS) Update(arm int, reward float64) {
 	}
 }
 
-// GetProbs returns current posterior mean probabilities for each arm.
-func (s *SchedTS) GetProbs() [SchedNumArms]float64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var probs [SchedNumArms]float64
-	for a := 0; a < SchedNumArms; a++ {
-		probs[a] = s.alpha[a] / (s.alpha[a] + s.beta[a])
-	}
-	return probs
-}
-
 // betaSample samples from Beta(alpha, beta) using the Gamma function method.
 func betaSample(rnd *rand.Rand, alpha, beta float64) float64 {
 	x := gammaSample(rnd, alpha)

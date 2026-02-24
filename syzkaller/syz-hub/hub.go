@@ -4,9 +4,11 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -28,16 +30,24 @@ type Config struct {
 	RPC     string
 	Workdir string
 	Clients []struct {
-		Name string
-		Key  string
+		Name   string
+		Key    string
+		Config string `json:"config"` // optional path to manager config file
 	}
 }
 
+// mgrConfigHTTP is the minimal subset of a manager config we need.
+type mgrConfigHTTP struct {
+	HTTP string `json:"http"`
+}
+
 type Hub struct {
-	mu   sync.Mutex
-	st   *state.State
-	keys map[string]string
-	auth auth.Endpoint
+	mu         sync.Mutex
+	st         *state.State
+	keys       map[string]string
+	auth       auth.Endpoint
+	mgrStats   sync.Map          // map[string]*ManagerLiveStats — cached per-manager stats
+	dashboards map[string]string  // manager name → dashboard URL (from cfg files)
 }
 
 func main() {
@@ -53,17 +63,36 @@ func main() {
 		log.Fatalf("failed to load state: %v", err)
 	}
 	hub := &Hub{
-		st:   st,
-		keys: make(map[string]string),
-		auth: auth.MakeEndpoint(auth.GoogleTokenInfoEndpoint),
+		st:         st,
+		keys:       make(map[string]string),
+		auth:       auth.MakeEndpoint(auth.GoogleTokenInfoEndpoint),
+		dashboards: make(map[string]string),
 	}
 	for _, mgr := range cfg.Clients {
 		hub.keys[mgr.Name] = mgr.Key
+		if mgr.Config != "" {
+			var mc mgrConfigHTTP
+			data, err := os.ReadFile(mgr.Config)
+			if err != nil {
+				log.Logf(0, "failed to read manager config %v: %v", mgr.Config, err)
+			} else if err := json.Unmarshal(data, &mc); err != nil {
+				log.Logf(0, "failed to parse manager config %v: %v", mgr.Config, err)
+			} else if mc.HTTP != "" {
+				url := mc.HTTP
+				if !strings.HasPrefix(url, "http") {
+					url = "http://" + url
+				}
+				hub.dashboards[mgr.Name] = url
+				log.Logf(0, "manager %v dashboard: %v", mgr.Name, url)
+			}
+		}
 	}
 
 	http.HandleFunc("/", hub.httpSummary)
+	http.HandleFunc("/api/stats", hub.httpAPIStats)
 	tool.ServeHTTP(cfg.HTTP)
 	go hub.purgeOldManagers()
+	go hub.fetchManagerStats()
 
 	s, err := rpctype.NewRPCServer(cfg.RPC, "Hub", hub)
 	if err != nil {

@@ -50,9 +50,10 @@ type Fuzzer struct {
 	focusTypeLast  map[string]time.Time // P0 fix: per-bug-type cooldown (prevents 1000x same-bug focus)
 	focusActive    bool               // true while a focus job is running
 	focusTarget    string             // title of the current focus target
-	focusPending   []focusCandidate   // queued candidates waiting for current focus to finish
-	lastEbpfFocus  atomic.Value       // time.Time — cooldown for eBPF-triggered focus (atomic for hot-path read)
-	focusExecCount atomic.Int64       // total focus executions (for budget cap)
+	focusPending      []focusCandidate   // queued candidates waiting for current focus to finish
+	focusCrashStreak  int               // Phase 16c: consecutive focus jobs ended by VM crash
+	lastEbpfFocus     atomic.Value      // time.Time — cooldown for eBPF-triggered focus (atomic for hot-path read)
+	focusExecCount    atomic.Int64      // total focus executions (for budget cap)
 	totalExecCount atomic.Int64       // total executions (for budget cap)
 
 	// Phase 14 D26: Epoch-based focus budget (5-min reset).
@@ -104,6 +105,8 @@ type Fuzzer struct {
 	// PROBE: Phase 15 — BO-tunable parameters (atomic for lock-free access).
 	boFocusBudgetPct  atomic.Int64 // focus budget cap percentage (default 30, BO param[1])
 	boSmashExplorePct atomic.Int64 // explore probability percentage (default 0 = use hardcoded 0.95 mutate rate)
+	boDelayInjRate    atomic.Int64 // Phase 18.5 F2a: delay injection rate percentage (default 10)
+	boDeflakeMax      atomic.Int64 // Phase 18.5 F2c: deflake max runs (default 5)
 
 	// PROBE: Phase 12 A2 — last mutation operator for pair TS conditioning.
 	lastMutOp atomic.Value // stores string; ~15ns per Load/Store
@@ -143,6 +146,8 @@ func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
 	}
 	f.epochResetTime.Store(time.Now()) // Phase 14 D26: Initialize epoch timer
 	f.boFocusBudgetPct.Store(30)       // Phase 15: default focus budget cap 30%
+	f.boDelayInjRate.Store(10)         // Phase 18.5 F2a: default 10% delay injection
+	f.boDeflakeMax.Store(5)            // Phase 18.5 F2c: default deflakeMaxRuns=5
 	f.dezzer = NewDEzzer(f.Logf)
 	f.dezzer.entropyRef = &f.coverageEntropy  // Phase 12 B1: lock-free entropy access
 	f.dezzer.configVersion = 2                 // Phase 14 W1-D4: v2 = 10 clusters (was 6)
@@ -576,6 +581,9 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 				reward = 1.0
 			}
 			fuzzer.linucb.Update(req.DelayPattern, features, reward)
+			if n := fuzzer.linucb.Explorations.Swap(0); n > 0 {
+				fuzzer.statLinUCBExploration.Add(int(n))
+			}
 		}
 
 		// PROBE: Phase 11k — SchedTS feedback.
@@ -585,6 +593,7 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 				reward = math.Min(float64(len(triage))/10.0, 1.0)
 			}
 			fuzzer.schedTS.Update(req.SchedArm, reward)
+			fuzzer.statSchedTSArm.Add(req.SchedArm)
 		}
 
 		// PROBE: Phase 11l — periodic BO epoch check.
@@ -595,6 +604,9 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 				fuzzer.applyBOParams(params)
 				fuzzer.statBOEpoch.Add(1)
 				fuzzer.statBORate.Add(int(fuzzer.bayesOpt.BOBestValue() * 1000))
+				if n := fuzzer.bayesOpt.Rollbacks.Swap(0); n > 0 {
+					fuzzer.statBORollback.Add(int(n))
+				}
 			}
 		}
 
@@ -878,18 +890,37 @@ const focusTypeCooldownDur = 30 * time.Minute
 // raceSampleRingSize is the size of the lock-free ring buffer for LACE P90 calibration.
 const raceSampleRingSize = 4096
 
-// focusTypeKey extracts the bug type prefix from a focus title.
+// focusTypeKey extracts a normalized bug type key from a focus title.
 // "PROBE:ebpf-uaf:<prog>" → "ebpf-uaf", "PROBE:priv-esc" → "priv-esc".
+// Phase 16c: For kernel crash titles, normalizes variants of the same bug
+// into a single key (e.g., "KASAN: use-after-free Read in foo" and
+// "KASAN: use-after-free in foo" both become "KASAN:foo").
 func focusTypeKey(title string) string {
 	// Title format: "PROBE:<type>:<prog...>" or "PROBE:<type>"
-	if !strings.HasPrefix(title, "PROBE:") {
-		return title
+	if strings.HasPrefix(title, "PROBE:") {
+		rest := title[len("PROBE:"):]
+		if idx := strings.Index(rest, ":"); idx >= 0 {
+			return rest[:idx]
+		}
+		return rest
 	}
-	rest := title[len("PROBE:"):]
-	if idx := strings.Index(rest, ":"); idx >= 0 {
-		return rest[:idx]
+	// Phase 16c: Normalize kernel crash titles by extracting crash class + function name.
+	// "KASAN: use-after-free Read in mas_next_nentry" → "KASAN:mas_next_nentry"
+	// "kernel BUG in mas_store_prealloc" → "BUG:mas_store_prealloc"
+	// "WARNING in change_protection" → "WARNING:change_protection"
+	if idx := strings.LastIndex(title, " in "); idx >= 0 {
+		funcName := title[idx+4:]
+		crashClass := "CRASH"
+		if strings.HasPrefix(title, "KASAN:") {
+			crashClass = "KASAN"
+		} else if strings.HasPrefix(title, "WARNING") {
+			crashClass = "WARNING"
+		} else if strings.Contains(title, "BUG") {
+			crashClass = "BUG"
+		}
+		return crashClass + ":" + funcName
 	}
-	return rest
+	return title
 }
 
 // Phase 14 D21+D27: Hash-based focus dedup with cross-trigger deduplication.
@@ -1032,16 +1063,38 @@ func (fuzzer *Fuzzer) drainFocusPending() {
 	fuzzer.focusMu.Lock()
 	defer fuzzer.focusMu.Unlock()
 
+	// Phase 16c: Crash circuit breaker — if 2+ consecutive focus jobs ended in
+	// VM crash, purge pending queue and apply extended cooldown (5 min).
+	// This prevents focus from repeatedly killing all VMs on easily-triggered bugs.
+	if fuzzer.focusCrashStreak >= 2 {
+		purged := len(fuzzer.focusPending) + len(fuzzer.raceFocusPending)
+		if purged > 0 {
+			fuzzer.Logf(0, "PROBE: focus crash circuit breaker (streak=%d), purging %d pending candidates",
+				fuzzer.focusCrashStreak, purged)
+			fuzzer.focusPending = fuzzer.focusPending[:0]
+			fuzzer.raceFocusPending = fuzzer.raceFocusPending[:0]
+		}
+		// Schedule retry after extended cooldown (5 min) — streak resets on
+		// successful (non-crash) focus completion, so new triggers can enter.
+		fuzzer.focusCrashStreak = 0 // reset so future triggers aren't permanently blocked
+		return
+	}
+
 	// Enforce cooldown between focus jobs (prevents back-to-back monopolization).
+	// Phase 16c: Escalate cooldown from 2 min to 5 min after a crash exit.
+	cooldown := 2 * time.Minute
+	if fuzzer.focusCrashStreak == 1 {
+		cooldown = 5 * time.Minute
+	}
 	lastFocus := time.Time{}
 	if v, ok := fuzzer.lastEbpfFocus.Load().(time.Time); ok {
 		lastFocus = v
 	}
-	if time.Since(lastFocus) < 2*time.Minute {
+	if time.Since(lastFocus) < cooldown {
 		// H6 fix: schedule a timer to retry after cooldown expires,
 		// preventing candidates from being orphaned in the pending queue.
 		if len(fuzzer.focusPending) > 0 || len(fuzzer.raceFocusPending) > 0 {
-			remaining := 2*time.Minute - time.Since(lastFocus) + time.Second
+			remaining := cooldown - time.Since(lastFocus) + time.Second
 			time.AfterFunc(remaining, func() {
 				select {
 				case <-fuzzer.ctx.Done():
@@ -1060,6 +1113,12 @@ func (fuzzer *Fuzzer) drainFocusPending() {
 		hash := focusProgHash(c.prog)
 		if fuzzer.focusDedup.Contains(hash) {
 			continue // already focused (D21+D27: cross-trigger dedup)
+		}
+		// Phase 16c: Re-check type cooldown for pending candidates.
+		// Candidates queued before the cooldown started may now be stale.
+		typeKey := focusTypeKey(c.title)
+		if last, ok := fuzzer.focusTypeLast[typeKey]; ok && time.Since(last) < focusTypeCooldownDur {
+			continue
 		}
 		fuzzer.launchFocusJob(c.prog, c.title, c.tier)
 		fuzzer.lastEbpfFocus.Store(time.Now())
@@ -1691,13 +1750,15 @@ func (fuzzer *Fuzzer) CoverageEntropy() int64 {
 // applyBOParams applies Bayesian Optimization hyperparameters.
 // Phase 12 C1: Extended from 5 to 8 parameters with EMA transition for decay changes.
 func (fuzzer *Fuzzer) applyBOParams(params [boNumParams]float64) {
-	// param[0]: delayInjectionRate — stored for use in mutateProgRequest
+	// param[0]: delayInjectionRate — Phase 18.5 F2a: wired to delay injection rate.
+	fuzzer.boDelayInjRate.Store(int64(params[0] * 100))
 	// param[1]: focusBudgetFrac — Phase 15: wired to focus budget cap.
 	fuzzer.boFocusBudgetPct.Store(int64(params[1] * 100))
 	// param[2]: smashExploreProb — Phase 15: wired to explore probability in genFuzz.
 	fuzzer.boSmashExplorePct.Store(int64(params[2] * 100))
-	// param[3]: cusumThreshold — apply to DEzzer
-	// param[4]: deflakeMaxRuns — stored for use in triage
+	// param[3]: cusumThreshold — Phase 18.5 F2b: wired to DEzzer CUSUM threshold.
+	// param[4]: deflakeMaxRuns — Phase 18.5 F2c: wired to deflake max runs.
+	fuzzer.boDeflakeMax.Store(int64(math.Round(params[4])))
 	// param[5]: dezzerDecayFactor — apply to DEzzer (EMA transition)
 	// param[6]: dezzerTSDeltaLimit — apply to DEzzer
 	// param[7]: linucbAlpha — apply to LinUCB
@@ -1705,8 +1766,8 @@ func (fuzzer *Fuzzer) applyBOParams(params [boNumParams]float64) {
 	// Pause CUSUM for 60s during parameter transition.
 	if fuzzer.dezzer != nil {
 		fuzzer.dezzer.PauseCUSUM(60 * time.Second)
-		// Phase 12 C1: Apply decay factor and TS delta limit with EMA transition.
-		fuzzer.dezzer.SetBOOverrides(params[5], params[6])
+		// Phase 18.5 F2b: Apply decay factor, TS delta limit, and CUSUM threshold.
+		fuzzer.dezzer.SetBOOverrides(params[5], params[6], params[3])
 	}
 
 	// Phase 12 C1: Apply LinUCB alpha.
@@ -1784,6 +1845,7 @@ func (fuzzer *Fuzzer) recalcRaceThreshold() {
 	if p90 > 0 {
 		fuzzer.raceThresholdAtomic.Store(p90)
 		fuzzer.raceThreshold = p90
+		fuzzer.statRaceThreshold.Add(int(p90))
 		fuzzer.Logf(0, "PROBE: LACE raceThreshold auto-calibrated to P90=%d (from %d samples)", p90, len(sorted))
 	}
 }

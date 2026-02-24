@@ -1,13 +1,26 @@
 #!/bin/bash
+
+# Check root privileges
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: This script must be run with sudo privileges"
+    echo "  Please run: sudo $0"
+    exit 1
+fi
+
 PROBE_DIR="/home/sumin/probe"
 SYZKALLER_DIR="$PROBE_DIR/syzkaller"
+SETUP_DIR="$SYZKALLER_DIR/setup"
 LOG_DIR="$SYZKALLER_DIR/probe_log"
 LOG_TS="$(date +%y%m%d_%H%M%S)"
 LOG_FILE="$LOG_DIR/probe_run_${LOG_TS}.log"
 MOCK_SERVER="$SYZKALLER_DIR/tools/mock_model/server.py"
-CONFIG="$SYZKALLER_DIR/setup/probe.cfg"
 BPF_DIR="$SYZKALLER_DIR/executor/ebpf"
 MOUNT_POINT="/mnt/trixie"
+
+# Phase 17: 2-Tier Mixed-Mode Fuzzing configs
+HUB_CONFIG="$SETUP_DIR/hub.cfg"
+FAST_CONFIG="$SETUP_DIR/probe-fast.cfg"
+KASAN_CONFIG="$SETUP_DIR/probe-kasan.cfg"
 
 # Ensure root can use sumin's Python packages (torch, grpc, etc.)
 export PYTHONPATH="/home/sumin/.local/lib/python3.12/site-packages:$PYTHONPATH"
@@ -15,27 +28,34 @@ export PATH="/home/sumin/probe/goroot/bin:/home/sumin/probe/gopath/bin:$PATH"
 export GOROOT="/home/sumin/probe/goroot"
 export GOPATH="/home/sumin/probe/gopath"
 
-# Kill previous PROBE instances only (not original syzkaller).
-# Use config path to identify our specific instance.
-sudo pkill -9 -f "syz-manager.*probe\.cfg" 2>/dev/null
-pkill -f "python.*server.py" 2>/dev/null
+# Kill previous PROBE instances (managers, hub, mock model).
+# Wrap in block to suppress bash "killed" notifications from QEMU death.
+{
+    sudo pkill -9 -f "syz-manager.*probe-"
+    sudo pkill -9 -f "syz-manager.*probe\.cfg"
+    pkill -f "syz-hub"
+    pkill -f "python.*server.py"
+} >/dev/null 2>&1
 sleep 1
 
 mkdir -p "$LOG_DIR"
 
+# Reset terminal after killing previous processes (QEMU corrupts tty on exit).
+stty sane 2>/dev/null
+
 # =============================================================
 # eBPF Auto-Preparation: vmlinux.h + BPF compile + VM deploy
-# Reads kernel/image paths from probe.cfg automatically.
+# Uses KASAN kernel for vmlinux.h (has CONFIG_DEBUG_INFO_BTF).
 # =============================================================
 echo "=== PROBE eBPF Auto-Preparation ==="
 
-# Parse paths from probe.cfg (JSON).
-KERNEL_OBJ=$(python3 -c "import json; print(json.load(open('$CONFIG'))['kernel_obj'])" 2>/dev/null)
-VM_IMAGE=$(python3 -c "import json; print(json.load(open('$CONFIG'))['image'])" 2>/dev/null)
+# Parse paths from KASAN config (has BTF-enabled vmlinux).
+KERNEL_OBJ=$(python3 -c "import json; print(json.load(open('$KASAN_CONFIG'))['kernel_obj'])" 2>/dev/null)
+VM_IMAGE=$(python3 -c "import json; print(json.load(open('$KASAN_CONFIG'))['image'])" 2>/dev/null)
 VMLINUX="$KERNEL_OBJ/vmlinux"
 
 if [ -z "$KERNEL_OBJ" ] || [ -z "$VM_IMAGE" ]; then
-    echo "[WARN] Could not parse kernel_obj/image from $CONFIG, skipping eBPF prep"
+    echo "[WARN] Could not parse kernel_obj/image from $KASAN_CONFIG, skipping eBPF prep"
 else
     EBPF_OK=true
 
@@ -144,17 +164,64 @@ SVCEOF
 fi
 
 echo ""
-echo "Starting PROBE fuzzer with probe.cfg"
+echo "============================================="
+echo " PROBE Phase 17: 2-Tier Mixed-Mode Fuzzing"
+echo "   Fast Pool: 8 VM (Non-KASAN) -> :56741"
+echo "   KASAN Pool: 2 VM (KASAN)    -> :56742"
+echo "   Hub:                        -> :56740"
+echo "============================================="
 
 # Start MOCK BiGRU server in background.
 if [ -f "$MOCK_SERVER" ]; then
     echo "Starting MOCK BiGRU server (port 50051)..."
-    python3 "$MOCK_SERVER" 50051 >> "$LOG_DIR/mock_bigru_run.log" 2>&1 &
+    python3 "$MOCK_SERVER" 50051 </dev/null >> "$LOG_DIR/mock_bigru_run.log" 2>&1 &
     sleep 2
 fi
 
-echo "Logging: probe | $LOG_FILE"
-echo "Logging: MOCK BiGRU server | $LOG_DIR/mock_bigru_run.log"
+# Create workdirs if needed.
+mkdir -p "$SYZKALLER_DIR/workdir-hub"
+mkdir -p "$SYZKALLER_DIR/workdir-fast"
+mkdir -p "$SYZKALLER_DIR/workdir-kasan"
 
-# Start PROBE fuzzer.
-sudo $SYZKALLER_DIR/bin/syz-manager -config $CONFIG 2>&1 | tee "$LOG_FILE"
+# 1. Start syz-hub (corpus/repro exchange between managers).
+echo "Starting syz-hub (RPC :55555, Dashboard :56740)..."
+setsid $SYZKALLER_DIR/bin/syz-hub -config $HUB_CONFIG </dev/null >> "$LOG_DIR/hub_run_${LOG_TS}.log" 2>&1 &
+HUB_PID=$!
+sleep 2
+
+# Verify hub started.
+if kill -0 $HUB_PID 2>/dev/null; then
+    echo "syz-hub started (PID $HUB_PID)"
+else
+    echo "[ERROR] syz-hub failed to start. Check $LOG_DIR/hub_run_${LOG_TS}.log"
+    exit 1
+fi
+
+# 2. Start Fast Manager (Non-KASAN, 8 VM — high exec/sec coverage exploration).
+echo "Starting Fast Manager (Non-KASAN, 8 VM, Dashboard :56741)..."
+setsid sudo $SYZKALLER_DIR/bin/syz-manager -config $FAST_CONFIG </dev/null >> "$LOG_DIR/fast_run_${LOG_TS}.log" 2>&1 &
+FAST_PID=$!
+
+# 3. Start KASAN Manager (2 VM — crash reproduction + KASAN reports).
+echo "Starting KASAN Manager (KASAN, 2 VM, Dashboard :56742)..."
+setsid sudo $SYZKALLER_DIR/bin/syz-manager -config $KASAN_CONFIG </dev/null >> "$LOG_DIR/kasan_run_${LOG_TS}.log" 2>&1 &
+KASAN_PID=$!
+
+sleep 3
+
+echo ""
+echo "Logging:"
+echo "  Hub:           $LOG_DIR/hub_run_${LOG_TS}.log"
+echo "  Fast Manager:  $LOG_DIR/fast_run_${LOG_TS}.log"
+echo "  KASAN Manager: $LOG_DIR/kasan_run_${LOG_TS}.log"
+echo "  MOCK BiGRU:    $LOG_DIR/mock_bigru_run.log"
+echo ""
+echo "Dashboards:"
+echo "  Hub:    http://127.0.0.1:56740"
+echo "  Fast:   http://127.0.0.1:56741"
+echo "  KASAN:  http://127.0.0.1:56742"
+echo ""
+echo "PROBE Phase 17 fuzzer started. Press Ctrl+C to stop."
+
+# Wait for any manager to exit (keeps script alive for signal handling).
+wait $FAST_PID $KASAN_PID

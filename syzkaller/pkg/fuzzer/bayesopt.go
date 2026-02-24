@@ -20,7 +20,6 @@ import (
 const (
 	boNumParams    = 8     // Phase 12 C1: expanded from 5 to 8
 	boEpochSeconds = 300   // Phase 12 C1: 5 min per epoch (was 10min, halved for 8D convergence)
-	boSafetyFrac   = 0.70  // rollback if coverage rate drops below 70% of baseline
 	boMaxEpochs    = 200   // Phase 12 C1: doubled for 8D (was 100)
 	boEMATransAlpha = 0.3  // Phase 12 C1: EMA transition smoothing for param changes
 	boEpochsPerEval = 2    // Phase 12 C1: multi-epoch averaging per vertex
@@ -95,11 +94,14 @@ type BayesOpt struct {
 	nmLastShrink int                   // epoch of last shrink (HIGH-8: max once per 20 epochs)
 	nmStuckCount int                   // consecutive epochs where same vertex is worst
 
-	// Baseline tracking for safety rollback.
-	baselineRate float64 // coverage gain rate during first 2 epochs (baseline)
-	baselineSet  bool
-	baseRateSum  float64
-	baseRateN    int
+	// Phase 18.5 F1: Rolling window baseline for safety rollback.
+	// Replaces fixed baseline that caused 98.2% rollback (9.5h permanent freeze).
+	recentRates   [5]float64 // rolling window of last 5 epoch rates
+	recentRateIdx int
+	recentRateN   int // how many rates recorded (up to 5)
+
+	// Rollback counter (atomic for lock-free access from fuzzer stats).
+	Rollbacks atomic.Int64
 
 	// Best known parameters.
 	bestParams [boNumParams]float64
@@ -205,34 +207,37 @@ func (bo *BayesOpt) CheckEpoch(covTotal int64) bool {
 		bo.currentParams[3], bo.currentParams[4],
 		bo.currentParams[5], bo.currentParams[6], bo.currentParams[7])
 
+	// Phase 18.5 F1: Always record rate in rolling window.
+	bo.recentRates[bo.recentRateIdx] = rate
+	bo.recentRateIdx = (bo.recentRateIdx + 1) % 5
+	if bo.recentRateN < 5 {
+		bo.recentRateN++
+	}
+
 	// Phase 12 C3: Check warm-start safety (discard if underperforming).
 	bo.checkWarmStartSafety(rate)
 
-	// Safety check: rollback if rate drops below 70% of baseline.
-	// Phase 12 C1: EMA transition (not sudden revert) — Edge Case B.
-	if bo.baselineSet && rate < bo.baselineRate*boSafetyFrac {
-		bo.logf(0, "PROBE: BO safety rollback! rate=%.2f < %.2f (70%% baseline). EMA revert to best.",
-			rate, bo.baselineRate*boSafetyFrac)
-		for i := 0; i < boNumParams; i++ {
-			bo.currentParams[i] = 0.7*bo.currentParams[i] + 0.3*bo.bestParams[i]
+	// Phase 18.5 F1: Safety check using rolling window average (replaces fixed baseline).
+	// Skip during initial simplex evaluation (epoch < boNumParams+1 = 9).
+	// Use 50% of rolling average (was 70% of fixed baseline → caused 98.2% rollback).
+	if bo.recentRateN >= 3 && bo.epoch >= boNumParams+1 {
+		avg := 0.0
+		for i := 0; i < bo.recentRateN; i++ {
+			avg += bo.recentRates[i]
 		}
-		bo.epochStart = time.Now()
-		bo.epochCovStart = covTotal
-		bo.epochDeadlineNano.Store(bo.epochStart.Add(time.Duration(boEpochSeconds) * time.Second).UnixNano())
-		bo.epoch++
-		return true
-	}
-
-	// Record baseline from first 2 epochs — but skip epochs 0-2 (startup burst).
-	// Burst coverage rate (epoch 0: ~380/s) would inflate the baseline, causing
-	// all subsequent epochs to fall below 70% threshold → perpetual rollback.
-	if !bo.baselineSet && bo.epoch >= 3 {
-		bo.baseRateSum += rate
-		bo.baseRateN++
-		if bo.baseRateN >= 2 {
-			bo.baselineRate = bo.baseRateSum / float64(bo.baseRateN)
-			bo.baselineSet = true
-			bo.logf(0, "PROBE: BO baseline rate set: %.2f/s", bo.baselineRate)
+		avg /= float64(bo.recentRateN)
+		if rate < avg*0.50 {
+			bo.Rollbacks.Add(1)
+			bo.logf(0, "PROBE: BO safety rollback! rate=%.2f < %.2f (50%% of rolling avg %.2f). EMA revert to best.",
+				rate, avg*0.50, avg)
+			for i := 0; i < boNumParams; i++ {
+				bo.currentParams[i] = 0.7*bo.currentParams[i] + 0.3*bo.bestParams[i]
+			}
+			bo.epochStart = time.Now()
+			bo.epochCovStart = covTotal
+			bo.epochDeadlineNano.Store(bo.epochStart.Add(time.Duration(boEpochSeconds) * time.Second).UnixNano())
+			bo.epoch++
+			return true
 		}
 	}
 
@@ -315,6 +320,16 @@ func (bo *BayesOpt) nmFindVertices() {
 		}
 		if bo.values[i] > bo.values[bo.nmBest] {
 			bo.nmBest = i
+		}
+	}
+	// Phase 18 B4: Post-loop correction — if nmSecWorst was never updated
+	// (still equals nmWorst), find the actual second-worst vertex.
+	if bo.nmSecWorst == bo.nmWorst {
+		bo.nmSecWorst = bo.nmBest // start from best (guaranteed != worst)
+		for i := 0; i <= boNumParams; i++ {
+			if i != bo.nmWorst && bo.values[i] < bo.values[bo.nmSecWorst] {
+				bo.nmSecWorst = i
+			}
 		}
 	}
 }
@@ -707,15 +722,20 @@ func (bo *BayesOpt) LoadState(path, kernelHash string, corpusSize int) bool {
 // If rate < 50% of baseline after 3 epochs, discard warm-start and revert to defaults.
 // Called from CheckEpoch.
 func (bo *BayesOpt) checkWarmStartSafety(rate float64) {
-	if !bo.warmStarted || !bo.baselineSet {
+	if !bo.warmStarted || bo.recentRateN < 3 {
 		return
 	}
 	if bo.epoch-bo.warmStartEpoch < 3 {
 		return // need at least 3 epochs of data
 	}
-	if rate < bo.baselineRate*0.50 {
-		bo.logf(0, "PROBE: BO warm-start safety: rate=%.2f < 50%% baseline=%.2f, reverting to defaults",
-			rate, bo.baselineRate)
+	avg := 0.0
+	for i := 0; i < bo.recentRateN; i++ {
+		avg += bo.recentRates[i]
+	}
+	avg /= float64(bo.recentRateN)
+	if rate < avg*0.50 {
+		bo.logf(0, "PROBE: BO warm-start safety: rate=%.2f < 50%% rolling avg=%.2f, reverting to defaults",
+			rate, avg)
 		bo.simplex[0] = paramDefaults
 		bo.currentParams = paramDefaults
 		bo.bestParams = paramDefaults

@@ -215,13 +215,6 @@ func (c *NgramClient) ShouldUseBiGRU() bool {
 	return bigruUCB >= ctUCB
 }
 
-// Healthy returns whether the MOCK server is reachable.
-func (c *NgramClient) Healthy() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.healthy
-}
-
 // Retrain triggers a model retrain on the server side.
 func (c *NgramClient) Retrain(corpusDir string) error {
 	resp, err := c.send(ngramRequest{Method: "retrain", Dir: corpusDir})

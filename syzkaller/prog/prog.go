@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 )
 
 type Prog struct {
@@ -20,6 +21,11 @@ type Prog struct {
 	// PROBE: Phase 11j — cached spectral dependency partitions for reorderConcurrent.
 	// Invalidated when calls are added/removed.
 	dependencyPartitions [][]int
+
+	// PROBE: Phase 16b — cached output resources grouped by type name.
+	// Lazily built on first getCompatibleResources call. Only valid for immutable corpus programs.
+	cachedOutputResources     map[string][]*ResultArg
+	cachedOutputResourcesOnce sync.Once // Phase 18 B1: thread-safe lazy init
 }
 
 const ExtraCallName = ".extra"
@@ -411,7 +417,9 @@ func (p *Prog) insertBefore(c *Call, calls []*Call) {
 		newCalls = append(newCalls, p.Calls[idx+1:]...)
 	}
 	p.Calls = newCalls
-	p.dependencyPartitions = nil // PROBE: invalidate spectral cache
+	p.dependencyPartitions = nil      // PROBE: invalidate spectral cache
+	p.cachedOutputResources = nil     // PROBE: Phase 16b: invalidate resource cache
+	p.cachedOutputResourcesOnce = sync.Once{} // Phase 18 B1: reset for next lazy init
 }
 
 // replaceArg replaces arg with arg1 in a program.
@@ -513,7 +521,35 @@ func (p *Prog) RemoveCall(idx int) {
 	}
 	copy(p.Calls[idx:], p.Calls[idx+1:])
 	p.Calls = p.Calls[:len(p.Calls)-1]
-	p.dependencyPartitions = nil // PROBE: invalidate spectral cache
+	p.dependencyPartitions = nil      // PROBE: invalidate spectral cache
+	p.cachedOutputResources = nil     // PROBE: Phase 16b: invalidate resource cache
+	p.cachedOutputResourcesOnce = sync.Once{} // Phase 18 B1: reset for next lazy init
+}
+
+// ensureOutputResourceCache thread-safely initializes the output resource cache.
+// Phase 18 B1: Uses sync.Once to prevent concurrent map write panic when multiple
+// fuzzer goroutines access the same corpus program simultaneously.
+func (p *Prog) ensureOutputResourceCache() {
+	p.cachedOutputResourcesOnce.Do(func() {
+		p.buildOutputResourceCache()
+	})
+}
+
+// PROBE: Phase 16b — buildOutputResourceCache traverses all args once to collect
+// output ResultArgs with uses > 0, grouped by type name. Only meaningful for
+// immutable corpus programs where the cache stays valid indefinitely.
+func (p *Prog) buildOutputResourceCache() {
+	p.cachedOutputResources = make(map[string][]*ResultArg)
+	for _, c := range p.Calls {
+		ForeachArg(c, func(arg Arg, _ *ArgCtx) {
+			a, ok := arg.(*ResultArg)
+			if !ok || len(a.uses) == 0 || a.Dir() != DirOut {
+				return
+			}
+			typeName := a.Type().Name()
+			p.cachedOutputResources[typeName] = append(p.cachedOutputResources[typeName], a)
+		})
+	}
 }
 
 func (p *Prog) sanitizeFix() {

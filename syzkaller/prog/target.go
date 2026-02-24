@@ -73,7 +73,8 @@ type Target struct {
 	init        sync.Once
 	fillArch    func(target *Target)
 	initArch    func(target *Target)
-	resourceMap map[string]*ResourceDesc
+	resourceMap    map[string]*ResourceDesc
+	resourceCompat map[string]map[string]bool // Phase 16: precomputed resource compatibility matrix.
 	// Maps resource name to a list of calls that can create the resource.
 	resourceCtors map[string][]ResourceCtor
 	any           anyTypes
@@ -195,6 +196,16 @@ func (target *Target) initTarget() {
 	target.resourceCtors = make(map[string][]ResourceCtor)
 	for _, res := range target.Resources {
 		target.resourceCtors[res.Name] = target.calcResourceCtors(res, false)
+	}
+
+	// PROBE: Phase 16 — precompute resource compatibility matrix for O(1) lookups.
+	target.resourceCompat = make(map[string]map[string]bool, len(target.resourceMap))
+	for dst, dstRes := range target.resourceMap {
+		m := make(map[string]bool, len(target.resourceMap))
+		for src, srcRes := range target.resourceMap {
+			m[src] = isCompatibleResourceImpl(dstRes.Kind, srcRes.Kind, false)
+		}
+		target.resourceCompat[dst] = m
 	}
 }
 

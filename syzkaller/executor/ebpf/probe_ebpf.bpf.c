@@ -551,6 +551,8 @@ int trace_sched_switch(struct trace_event_raw_sched_switch *ctx)
 
 // Measure mutex lock contention: record entry timestamp.
 // 1/16 sampling to reduce overhead on ultra-hot lock paths.
+// Phase 18 B6: lock_held increment moved here from kretprobe for consistent
+// address-based sampling domain (prevents LACE false positives).
 SEC("kprobe/mutex_lock")
 int BPF_KPROBE(kprobe_mutex_lock, void *lock)
 {
@@ -565,29 +567,21 @@ int BPF_KPROBE(kprobe_mutex_lock, void *lock)
 
 	__u64 ts = bpf_ktime_get_ns();
 	bpf_map_update_elem(&lock_entry_ts, &lock_addr, &ts, BPF_ANY);
-	return 0;
-}
 
-// Measure mutex unlock: check if lock was held long enough to indicate contention.
-// 1/16 sampling (matches kprobe_mutex_lock).
-SEC("kretprobe/mutex_lock")
-int BPF_KRETPROBE(kretprobe_mutex_lock)
-{
-	// Note: kretprobe cannot access original args, so we use pid-based sampling
-	// to approximately match the kprobe sampling rate.
-	__u64 pidtgid = bpf_get_current_pid_tgid();
-	if ((pidtgid & 0xf) != 0) // 1/16 sampling
-		return 0;
-
-	__u32 key = 0;
-	struct probe_metrics *m = bpf_map_lookup_elem(&metrics, &key);
-	if (!m || m->execution_start_ns == 0)
-		return 0;
-
+	// Phase 18 B6: lock_held increment here (same address-based sampling as unlock).
 	__u64 *held = bpf_map_lookup_elem(&lock_held, &key);
 	if (held)
 		__sync_fetch_and_add(held, 1);
 
+	return 0;
+}
+
+// Phase 18 B6: kretprobe_mutex_lock no longer tracks lock_held.
+// lock_held increment moved to kprobe_mutex_lock for consistent address-based
+// sampling domain (was pid-based here, causing LACE false positives).
+SEC("kretprobe/mutex_lock")
+int BPF_KRETPROBE(kretprobe_mutex_lock)
+{
 	return 0;
 }
 

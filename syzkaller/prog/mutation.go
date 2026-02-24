@@ -149,6 +149,10 @@ type mutator struct {
 	noMutate map[int]bool // Set of IDs of syscalls which should not be mutated.
 	corpus   []*Prog      // The entire corpus, including original program p.
 	opts     MutateOpts
+	// PROBE: Phase 16 — cached chooseCall priorities to avoid redundant ForeachArg traversals.
+	callPriorities []float64
+	callPrioSum    float64
+	callPrioValid  bool
 }
 
 // This function selects a random other program p0 out of the corpus, and
@@ -166,6 +170,7 @@ func (ctx *mutator) splice() bool {
 	for i := len(p.Calls) - 1; i >= ctx.ncalls; i-- {
 		p.RemoveCall(i)
 	}
+	ctx.callPrioValid = false // Phase 16: invalidate priority cache after splice.
 	return true
 }
 
@@ -258,6 +263,7 @@ func (ctx *mutator) insertCall() bool {
 	for len(p.Calls) > ctx.ncalls {
 		p.RemoveCall(idx)
 	}
+	ctx.callPrioValid = false // Phase 16: invalidate priority cache after insertCall.
 	return true
 }
 
@@ -269,6 +275,7 @@ func (ctx *mutator) removeCall() bool {
 	}
 	idx := r.Intn(len(p.Calls))
 	p.RemoveCall(idx)
+	ctx.callPrioValid = false // Phase 16: invalidate priority cache after removeCall.
 	return true
 }
 
@@ -279,7 +286,8 @@ func (ctx *mutator) mutateArg() bool {
 		return false
 	}
 
-	idx := chooseCall(p, r)
+	// PROBE: Phase 16 — use cached call priorities instead of full ForeachArg traversal.
+	idx := ctx.cachedChooseCall()
 	if idx < 0 {
 		return false
 	}
@@ -328,24 +336,35 @@ func (ctx *mutator) mutateArg() bool {
 	return true
 }
 
-// Select a call based on the complexity of the arguments.
-func chooseCall(p *Prog, r *randGen) int {
-	var prioSum float64
-	var callPriorities []float64
-	for _, c := range p.Calls {
+// PROBE: Phase 16 — computeCallPriorities builds the per-call mutation priority
+// cache. This avoids redundant ForeachArg traversals across multiple mutateArg
+// iterations within a single MutateWithOpts call.
+func (ctx *mutator) computeCallPriorities() {
+	ctx.callPriorities = ctx.callPriorities[:0]
+	ctx.callPrioSum = 0
+	for _, c := range ctx.p.Calls {
 		var totalPrio float64
-		ForeachArg(c, func(arg Arg, ctx *ArgCtx) {
-			prio, stopRecursion := arg.Type().getMutationPrio(p.Target, arg, false, c.Meta.Attrs.KFuzzTest)
+		ForeachArg(c, func(arg Arg, actx *ArgCtx) {
+			prio, stop := arg.Type().getMutationPrio(ctx.p.Target, arg, false, c.Meta.Attrs.KFuzzTest)
 			totalPrio += prio
-			ctx.Stop = stopRecursion
+			actx.Stop = stop
 		})
-		prioSum += totalPrio
-		callPriorities = append(callPriorities, prioSum)
+		ctx.callPrioSum += totalPrio
+		ctx.callPriorities = append(ctx.callPriorities, ctx.callPrioSum)
 	}
-	if prioSum == 0 {
-		return -1 // All calls are without arguments.
+	ctx.callPrioValid = true
+}
+
+// PROBE: Phase 16 — cachedChooseCall returns a weighted random call index,
+// reusing cached priorities when valid to skip ForeachArg traversals.
+func (ctx *mutator) cachedChooseCall() int {
+	if !ctx.callPrioValid || len(ctx.callPriorities) != len(ctx.p.Calls) {
+		ctx.computeCallPriorities()
 	}
-	return sort.SearchFloat64s(callPriorities, prioSum*r.Float64())
+	if ctx.callPrioSum == 0 {
+		return -1
+	}
+	return sort.SearchFloat64s(ctx.callPriorities, ctx.callPrioSum*ctx.r.Float64())
 }
 
 func (target *Target) mutateArg(r *randGen, s *state, arg Arg, ctx ArgCtx, updateSizes *bool) ([]*Call, bool) {
@@ -1068,6 +1087,7 @@ func (ctx *mutator) reorderConcurrent() bool {
 			if !deps[i][j] && !deps[j][i] {
 				p.Calls[i], p.Calls[j] = p.Calls[j], p.Calls[i]
 				p.dependencyPartitions = nil
+				ctx.callPrioValid = false // Phase 16: invalidate priority cache after reorder.
 				p.sanitizeFix()
 				p.debugValidate()
 				return true
@@ -1092,6 +1112,7 @@ func (ctx *mutator) reorderConcurrent() bool {
 	chosen := indep[r.Intn(len(indep))]
 	p.Calls[chosen.i], p.Calls[chosen.j] = p.Calls[chosen.j], p.Calls[chosen.i]
 	p.dependencyPartitions = nil
+	ctx.callPrioValid = false // Phase 16: invalidate priority cache after reorder.
 	p.sanitizeFix()
 	p.debugValidate()
 	return true
