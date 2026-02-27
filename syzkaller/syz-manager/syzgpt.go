@@ -16,6 +16,45 @@ import (
 	"github.com/google/syzkaller/prog"
 )
 
+// lfsAlwaysSkipPatterns lists substrings found in syscall names that indicate
+// architecture-specific syscalls (e.g. ARM MTE, x32 ABI) which will never
+// produce coverage on an x86_64 kernel and waste LFS API budget.
+var lfsAlwaysSkipPatterns = []string{
+	"TAGGED_ADDR",       // ARM MTE: ARCH_ENABLE_TAGGED_ADDR, ARCH_GET_UNTAG_MASK, etc.
+	"FORCE_TAGGED_SVA",  // ARM MTE: ARCH_FORCE_TAGGED_SVA
+	"XCOMP_GUEST_PERM",  // ARM AMU: ARCH_REQ_XCOMP_GUEST_PERM
+	"XCOMP_PERM",        // ARM AMU: ARCH_REQ_XCOMP_PERM
+	"MAP_VDSO_X32",      // x32 ABI vDSO: not active in standard x86_64 kernels
+	"GET_MAX_TAG_BITS",  // ARM MTE: ARCH_GET_MAX_TAG_BITS
+}
+
+// lfsZeroHits tracks how many consecutive LFS cycles each syscall has been
+// selected with zero coverage. After lfsMaxZeroHits it enters cooldown.
+var lfsZeroHits = map[string]int{}
+
+// lfsCooldown tracks remaining cooldown cycles per syscall.
+var lfsCooldown = map[string]int{}
+
+const lfsMaxZeroHits   = 3 // consecutive zero-cov selections before suppression
+const lfsCooldownCycles = 5 // cycles to suppress after hitting the limit
+
+// isLFSBlocked returns true if the syscall should be excluded from LFS targeting.
+// It checks the static arch-specific blocklist and the dynamic zero-hit suppressor.
+func isLFSBlocked(name string) bool {
+	// Static: known non-x86_64 syscalls.
+	for _, pat := range lfsAlwaysSkipPatterns {
+		if strings.Contains(name, pat) {
+			return true
+		}
+	}
+	// Dynamic: cooldown after repeated zero-coverage selections.
+	if rem, ok := lfsCooldown[name]; ok && rem > 0 {
+		lfsCooldown[name] = rem - 1
+		return true
+	}
+	return false
+}
+
 // aiGetLFSTargets identifies low-frequency syscalls and builds LFSTarget structs
 // with dependency information and corpus examples for the LLM prompt.
 func (mgr *Manager) aiGetLFSTargets(maxTargets int) []aitriage.LFSTarget {
@@ -35,6 +74,10 @@ func (mgr *Manager) aiGetLFSTargets(maxTargets int) []aitriage.LFSTarget {
 	var candidates []lfsCandidate
 	for sc := range f.Config.EnabledCalls {
 		if sc.Attrs.Disabled || sc.Attrs.NoGenerate {
+			continue
+		}
+		// Skip arch-specific or repeatedly unproductive syscalls.
+		if isLFSBlocked(sc.Name) {
 			continue
 		}
 		cov := 0
@@ -61,6 +104,26 @@ func (mgr *Manager) aiGetLFSTargets(maxTargets int) []aitriage.LFSTarget {
 
 	if len(candidates) > maxTargets {
 		candidates = candidates[:maxTargets]
+	}
+
+	// Update zero-hit tracker for selected candidates.
+	// If a syscall has been selected lfsMaxZeroHits times in a row with cov=0,
+	// put it in cooldown so other syscalls get a chance.
+	selectedNames := map[string]bool{}
+	for _, c := range candidates {
+		selectedNames[c.syscall.Name] = true
+		if c.coverage == 0 {
+			lfsZeroHits[c.syscall.Name]++
+			if lfsZeroHits[c.syscall.Name] >= lfsMaxZeroHits {
+				lfsCooldown[c.syscall.Name] = lfsCooldownCycles
+				delete(lfsZeroHits, c.syscall.Name)
+				log.Logf(1, "PROBE: LFS suppressing '%s' for %d cycles (zero-cov %d times)",
+					c.syscall.Name, lfsCooldownCycles, lfsMaxZeroHits)
+			}
+		} else {
+			// Coverage appeared — reset the counter.
+			delete(lfsZeroHits, c.syscall.Name)
+		}
 	}
 
 	// Build available syscall name list (for prompt).
