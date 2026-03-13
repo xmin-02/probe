@@ -90,7 +90,6 @@ type Stats struct {
 	statDelayRandom         *stat.Val // PROBE: Phase 11j (ACTOR delay)
 	statDelayBetween        *stat.Val // PROBE: Phase 11j (ACTOR delay)
 	statDelayAroundLocks    *stat.Val // PROBE: Phase 11j (ACTOR delay)
-	statLinUCBExploration   *stat.Val // PROBE: Phase 11j (ACTOR LinUCB)
 	statSchedYield          *stat.Val // PROBE: Phase 11k (OZZ sched_yield)
 	statSchedBoth           *stat.Val // PROBE: Phase 11k (OZZ delay+yield)
 	statSchedTSArm          *stat.Val // PROBE: Phase 11k (OZZ current TS arm)
@@ -250,7 +249,7 @@ func newStats(target *prog.Target) Stats {
 			stat.Graph("lace")),
 		statMutOpReorder: stat.New("mut reorder", "Reorder operator applications",
 			stat.Rate{}, stat.StackedGraph("mut ops")),
-		statDelayApplied: stat.New("delay applied", "Delay injection decisions made by LinUCB",
+		statDelayApplied: stat.New("delay applied", "Delay injection decisions made by SchedTS",
 			stat.Rate{}, stat.Graph("actor")),
 		statDelayNone: stat.New("delay none", "Delay pattern: none selected",
 			stat.Rate{}, stat.StackedGraph("actor delay")),
@@ -260,8 +259,6 @@ func newStats(target *prog.Target) Stats {
 			stat.Rate{}, stat.StackedGraph("actor delay")),
 		statDelayAroundLocks: stat.New("delay locks", "Delay pattern: around lock syscalls",
 			stat.Rate{}, stat.StackedGraph("actor delay")),
-		statLinUCBExploration: stat.New("linucb explore", "LinUCB exploration vs exploitation ratio",
-			stat.Rate{}, stat.Graph("actor")),
 		statSchedYield: stat.New("sched yield", "OZZ sched_yield injections",
 			stat.Rate{}, stat.StackedGraph("actor delay")),
 		statSchedBoth: stat.New("sched both", "OZZ combined delay+yield injections",

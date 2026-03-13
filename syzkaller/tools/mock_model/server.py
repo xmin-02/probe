@@ -80,6 +80,11 @@ class MockModelServicer(mock_pb2_grpc.MockModelServicer):
         """Predict the next syscall given a context sequence."""
         with self.lock:
             if self.model is None or self.vocab is None:
+                # Cold-start: still log training data for auto-train bootstrap.
+                if len(request.calls) >= 2 and self.collect_training_data:
+                    self.inference_count += 1
+                    if self.inference_count % 10 == 0:  # 1/10 rate during cold start
+                        self._log_training_sample(request.calls, request.calls[-1])
                 context.set_code(grpc.StatusCode.UNAVAILABLE)
                 context.set_details("Model not loaded")
                 return mock_pb2.PredictResponse()
@@ -121,6 +126,41 @@ class MockModelServicer(mock_pb2_grpc.MockModelServicer):
                 confidence=best_conf,
                 top_k=candidates,
             )
+
+    def _auto_train_loop(self):
+        """Background thread: auto-train model from collected inference data."""
+        while True:
+            time.sleep(300)  # check every 5 min
+            if self.model is not None:
+                continue  # already have a model
+            if not os.path.exists(self.training_data_path):
+                logger.info("Auto-train: no training data yet, waiting...")
+                continue
+            try:
+                with open(self.training_data_path) as f:
+                    lines = f.readlines()
+                if len(lines) < 50:
+                    logger.info("Auto-train: %d samples collected, need 50", len(lines))
+                    continue
+                logger.info("Auto-train: starting training (%d samples)", len(lines))
+                from train import train_model_from_jsonl
+                result = train_model_from_jsonl(
+                    data_path=self.training_data_path,
+                    model_path=self.model_path,
+                    vocab_path=self.vocab_path,
+                    epochs=10,
+                    device=self.device,
+                )
+                if result and result.get("success"):
+                    with self.lock:
+                        self._load_model()
+                    logger.info("Auto-train: model loaded successfully, healthy=%s",
+                                self.model is not None)
+                else:
+                    logger.warning("Auto-train: training did not succeed: %s",
+                                   result.get("message", "unknown"))
+            except Exception as e:
+                logger.error("Auto-train failed: %s", e)
 
     def _log_training_sample(self, calls: list, predicted: str):
         """Log inference sample for future training (Phase 14 D25)."""
@@ -200,6 +240,15 @@ class JSONTCPHandler:
         elif method == "predict":
             calls = req.get("calls", [])
             if not calls or self.servicer.model is None:
+                # Cold-start: collect context for auto-training even without a model.
+                if calls and self.servicer.collect_training_data:
+                    try:
+                        import json as _json2
+                        sample = {"context": list(calls[-20:]), "predicted": ""}
+                        with open(self.servicer.training_data_path, "a") as _f:
+                            _f.write(_json2.dumps(sample) + "\n")
+                    except Exception:
+                        pass
                 return _json.dumps({"call": "", "confidence": 0.0}).encode() + b"\n"
             with self.servicer.lock:
                 indices = [self.servicer.vocab.encode(c) for c in calls[-20:]]
@@ -292,6 +341,10 @@ def serve(port: int = DEFAULT_PORT, model_path: str = DEFAULT_MODEL_PATH,
           vocab_path: str = DEFAULT_VOCAB_PATH):
     """Start the gRPC server + JSON-TCP listener."""
     servicer = MockModelServicer(model_path=model_path, vocab_path=vocab_path)
+
+    # Start auto-train background thread (cold-start bootstrap).
+    auto_train_thread = threading.Thread(target=servicer._auto_train_loop, daemon=True)
+    auto_train_thread.start()
 
     # Start JSON-TCP listener for Go fuzzer client (same port).
     handler = JSONTCPHandler(servicer)

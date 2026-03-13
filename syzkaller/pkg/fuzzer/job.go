@@ -102,38 +102,27 @@ func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 		}
 	}
 
-	// PROBE: Phase 11k — OZZ: 4-arm strategy selection wrapping ACTOR delay.
+	// PROBE: Phase 11k — OZZ: 4-arm strategy selection (SchedTS only; LinUCB removed Phase 11j retired).
 	delayPattern := -1
 	schedArm := -1
-	if fuzzer.schedTS != nil && fuzzer.linucb != nil {
-		fuzzer.delayTotal.Add(1)
-		// Adaptive rate control: 10% start, 20% max cap.
-		delayed := fuzzer.delayedExecs.Load()
-		total := fuzzer.delayTotal.Load()
-		if total > 0 && delayed*100/total > 20 {
-			// Rate cap: no delay, keep delayPattern=-1 so LinUCB doesn't get false arm-0 credit.
-		} else if rnd.Intn(100) < int(fuzzer.boDelayInjRate.Load()) { // Phase 18.5 F2a: BO-tunable injection rate
+	if fuzzer.schedTS != nil {
+		if rnd.Intn(100) < int(fuzzer.boDelayInjRate.Load()) { // Phase 18.5 F2a: BO-tunable injection rate
 			schedArm = fuzzer.schedTS.SelectArm(rnd)
 			switch schedArm {
 			case SchedNone:
-				// Keep delayPattern=-1: LinUCB didn't choose this, don't credit arm 0.
 				fuzzer.statDelayNone.Add(1)
 			case SchedDelayOnly:
-				features := fuzzer.buildDelayFeatures(newP, false)
-				delayPattern = fuzzer.linucb.SelectArm(features)
-				if delayPattern != prog.DelayNone {
-					applyDelayPattern(newP, delayPattern, rnd)
-					fuzzer.delayedExecs.Add(1)
-					switch delayPattern {
-					case prog.DelayRandom:
-						fuzzer.statDelayRandom.Add(1)
-					case prog.DelayBetween:
-						fuzzer.statDelayBetween.Add(1)
-					case prog.DelayAroundLocks:
-						fuzzer.statDelayAroundLocks.Add(1)
-					}
-				} else {
-					fuzzer.statDelayNone.Add(1)
+				// Pick a random non-None delay pattern without LinUCB.
+				patterns := []int{prog.DelayRandom, prog.DelayBetween, prog.DelayAroundLocks}
+				delayPattern = patterns[rnd.Intn(len(patterns))]
+				applyDelayPattern(newP, delayPattern, rnd)
+				switch delayPattern {
+				case prog.DelayRandom:
+					fuzzer.statDelayRandom.Add(1)
+				case prog.DelayBetween:
+					fuzzer.statDelayBetween.Add(1)
+				case prog.DelayAroundLocks:
+					fuzzer.statDelayAroundLocks.Add(1)
 				}
 			case SchedYieldOnly:
 				// Set sched_yield on ~33% of calls.
@@ -142,21 +131,17 @@ func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 						newP.Calls[i].Props.SchedYield = true
 					}
 				}
-				fuzzer.delayedExecs.Add(1)
 				fuzzer.statSchedYield.Add(1)
 			case SchedBoth:
-				// Combined: delay + yield.
-				features := fuzzer.buildDelayFeatures(newP, false)
-				delayPattern = fuzzer.linucb.SelectArm(features)
-				if delayPattern != prog.DelayNone {
-					applyDelayPattern(newP, delayPattern, rnd)
-				}
+				// Combined: random delay + yield.
+				patterns := []int{prog.DelayRandom, prog.DelayBetween, prog.DelayAroundLocks}
+				delayPattern = patterns[rnd.Intn(len(patterns))]
+				applyDelayPattern(newP, delayPattern, rnd)
 				for i := range newP.Calls {
 					if rnd.Intn(3) == 0 {
 						newP.Calls[i].Props.SchedYield = true
 					}
 				}
-				fuzzer.delayedExecs.Add(1)
 				fuzzer.statSchedBoth.Add(1)
 			}
 			fuzzer.statDelayApplied.Add(1)
@@ -173,7 +158,7 @@ func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 		MutOp:        op,           // PROBE: carry operator to processResult for DEzzer feedback
 		PrevMutOp:    prevOp,       // PROBE: Phase 12 A2 — carry prev op for pair TS conditioning
 		SubOp:        subOp,        // PROBE: Phase 12 B4 — carry sub-op for two-level feedback
-		DelayPattern: delayPattern, // PROBE: Phase 11j — carry delay pattern for LinUCB feedback
+		DelayPattern: delayPattern, // PROBE: Phase 11j — carry delay pattern for SchedTS feedback
 		SchedArm:     schedArm,     // PROBE: Phase 11k — carry schedTS arm for Global TS feedback
 		UsedBiGRU:    usedBiGRU,    // PROBE: Phase 15 — UCB-1 feedback tracking
 	}

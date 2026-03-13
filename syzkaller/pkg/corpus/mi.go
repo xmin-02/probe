@@ -15,11 +15,12 @@ import (
 )
 
 const (
-	miSampleSize     = 500
+	miSampleSize     = 2000
 	miUpdateInterval = 5 * time.Minute
 	miEarlyInterval  = 2 * time.Minute
 	miEarlyDuration  = 1 * time.Hour
 	miBlendWeight    = 0.3 // MI weight in blended score (0.7 coverage + 0.3 MI)
+	miDecayFactor    = 0.8 // EMA decay for old scores when merging new samples
 )
 
 // MIScorer calculates mutual information scores for corpus programs.
@@ -132,9 +133,34 @@ func (mi *MIScorer) calcMI(corpus *Corpus) {
 		}
 	}
 
-	// Step 6: Store results.
+	// Step 6: Merge with existing scores using EMA decay.
+	// Old scores are decayed by miDecayFactor, new scores replace or blend in.
+	// This ensures all previously-scored programs retain some weight,
+	// while freshly sampled programs get updated scores.
 	mi.mu.Lock()
-	mi.scores = rawScores
+	// Decay existing scores and remove programs no longer in corpus.
+	corpusSet := make(map[string]struct{}, len(allProgs))
+	for _, p := range allProgs {
+		corpusSet[p.hash] = struct{}{}
+	}
+	for h, oldScore := range mi.scores {
+		if _, inCorpus := corpusSet[h]; !inCorpus {
+			delete(mi.scores, h)
+			continue
+		}
+		if _, inNew := rawScores[h]; !inNew {
+			// Not re-sampled: decay old score.
+			mi.scores[h] = oldScore * miDecayFactor
+		}
+	}
+	// Merge new scores: EMA blend with existing.
+	for h, newScore := range rawScores {
+		if oldScore, exists := mi.scores[h]; exists {
+			mi.scores[h] = oldScore*miDecayFactor + newScore*(1.0-miDecayFactor)
+		} else {
+			mi.scores[h] = newScore
+		}
+	}
 	mi.lastCalc = time.Now()
 	mi.mu.Unlock()
 
@@ -148,8 +174,11 @@ func (mi *MIScorer) calcMI(corpus *Corpus) {
 		}
 		avgScore /= float64(len(rawScores))
 	}
-	log.Printf("PROBE: MI recalc done: %d/%d programs scored, avg=%.3f, max=%.3f",
-		sampleSize, n, avgScore, maxScore)
+	mi.mu.RLock()
+	totalScored := len(mi.scores)
+	mi.mu.RUnlock()
+	log.Printf("PROBE: MI recalc done: sampled=%d, total_scored=%d/%d, avg=%.3f, max=%.3f",
+		sampleSize, totalScored, n, avgScore, maxScore)
 }
 
 // getScore returns the MI score for a program, or 0 if not yet scored.

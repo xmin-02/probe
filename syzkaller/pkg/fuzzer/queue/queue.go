@@ -54,7 +54,7 @@ type Request struct {
 	// Without this field, processResult uses MutOp as both op and prevOp → diagonal-only update.
 	PrevMutOp string
 
-	// PROBE: Phase 11j — delay pattern index for LinUCB feedback.
+	// PROBE: Phase 11j — delay pattern index for SchedTS feedback.
 	// -1 = no delay decision made, 0-3 = delay pattern arm.
 	DelayPattern int
 

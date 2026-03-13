@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/cilium/ebpf"
 	"github.com/google/syzkaller/pkg/aitriage"
@@ -208,6 +209,29 @@ func (mgr *Manager) aiOnTriageResult(crashID string, result *aitriage.TriageResu
 				}
 			}
 		}
+	}
+
+	// Parse FocusHints and apply syscall-level weight steering.
+	if len(result.FocusHints) > 0 {
+		f := mgr.fuzzer.Load()
+		if f != nil {
+			weights := make(map[int]float64)
+			for _, hint := range result.FocusHints {
+				hint = strings.TrimSpace(hint)
+				if hint == "" {
+					continue
+				}
+				for name, syscall := range mgr.target.SyscallMap {
+					if strings.Contains(name, hint) || strings.Contains(hint, name) {
+						weights[syscall.ID] = 2.0
+					}
+				}
+			}
+			if len(weights) > 0 {
+				f.ApplyAIWeights(weights)
+			}
+		}
+		log.Logf(0, "PROBE: AI Triage FocusHints applied: %v (score=%d)", result.FocusHints, result.Score)
 	}
 }
 

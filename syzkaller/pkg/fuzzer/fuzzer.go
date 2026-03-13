@@ -91,11 +91,6 @@ type Fuzzer struct {
 	raceThresholdAtomic atomic.Uint32              // lock-free threshold for hot path
 	lastRaceFocusNano   atomic.Int64               // UnixNano for 3-min cooldown (lock-free)
 
-	// PROBE: Phase 11j — LinUCB delay pattern bandit (separate from DEzzer).
-	linucb       *LinUCB
-	delayedExecs atomic.Int64 // total executions with delay applied
-	delayTotal   atomic.Int64 // total executions considered for delay
-
 	// PROBE: Phase 11k — Global Thompson Sampling for schedule strategy.
 	schedTS *SchedTS
 
@@ -154,8 +149,6 @@ func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
 	f.dezzer.statPairTSFallback = f.statPairTSFallback // Phase 12 B4: pair TS fallback counter
 	f.dezzer.StartNormalization(ctx)           // Phase 12 A5: periodic normalization goroutine (60s)
 	f.dezzer.StartAutoExport(ctx, cfg.Workdir) // Phase 12 B2: periodic feature log export (2min)
-	f.linucb = NewLinUCB() // Phase 11j: LinUCB delay pattern bandit
-	f.linucb.logf = f.Logf
 	f.schedTS = NewSchedTS()       // Phase 11k: Global Thompson Sampling for schedule strategy
 	f.bayesOpt = NewBayesOpt(cfg.Logf) // Phase 11l: Bayesian Optimization for hyperparameter tuning
 	// Phase 12 C3: BO warm-start — load saved params and set save path.
@@ -301,6 +294,15 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 				fuzzer.ngramClient.RecordBiGRUResult(success)
 			} else {
 				fuzzer.ngramClient.RecordCTResult(success)
+			}
+			// Feed program's call sequence into n-gram pair frequency table
+			// so the fallback predictor has data even before BiGRU model exists.
+			if req.Prog != nil && len(req.Prog.Calls) >= 2 {
+				callNames := make([]string, len(req.Prog.Calls))
+				for i := range req.Prog.Calls {
+					callNames[i] = req.Prog.CallName(i)
+				}
+				fuzzer.ngramClient.RecordSequence(callNames)
 			}
 		}
 
@@ -559,30 +561,6 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 					bestFocusTitle = raceTitle
 					bestFocusTier = 1
 				}
-			}
-		}
-
-		// PROBE: Phase 11j — LinUCB delay feedback.
-		if fuzzer.linucb != nil && req.DelayPattern >= 0 {
-			features := fuzzer.buildDelayFeaturesWithCluster(req.Prog, req.Stat == fuzzer.statExecFocus, progCluster)
-			reward := 0.0
-			// Reward: sched_switch activity + coverage gain indicates delay effectiveness.
-			if res.Info.EbpfSchedSwitch > 5 {
-				reward += 0.5
-			}
-			if len(triage) > 0 {
-				reward += 0.5
-			}
-			// Concurrent access is a strong signal of race window creation.
-			if res.Info.EbpfConcurrentAccess > 0 {
-				reward += 0.5
-			}
-			if reward > 1.0 {
-				reward = 1.0
-			}
-			fuzzer.linucb.Update(req.DelayPattern, features, reward)
-			if n := fuzzer.linucb.Explorations.Swap(0); n > 0 {
-				fuzzer.statLinUCBExploration.Add(int(n))
 			}
 		}
 
@@ -1761,7 +1739,7 @@ func (fuzzer *Fuzzer) applyBOParams(params [boNumParams]float64) {
 	fuzzer.boDeflakeMax.Store(int64(math.Round(params[4])))
 	// param[5]: dezzerDecayFactor — apply to DEzzer (EMA transition)
 	// param[6]: dezzerTSDeltaLimit — apply to DEzzer
-	// param[7]: linucbAlpha — apply to LinUCB
+
 
 	// Pause CUSUM for 60s during parameter transition.
 	if fuzzer.dezzer != nil {
@@ -1770,58 +1748,9 @@ func (fuzzer *Fuzzer) applyBOParams(params [boNumParams]float64) {
 		fuzzer.dezzer.SetBOOverrides(params[5], params[6], params[3])
 	}
 
-	// Phase 12 C1: Apply LinUCB alpha.
-	if fuzzer.linucb != nil {
-		fuzzer.linucb.SetAlpha(params[7])
-	}
-
-	fuzzer.Logf(0, "PROBE: BO params applied: delay=%.2f focus=%.2f smash=%.2f cusum=%.1f deflake=%.0f decay=%.3f tsLimit=%.3f lucbAlpha=%.2f",
+	fuzzer.Logf(0, "PROBE: BO params applied: delay=%.2f focus=%.2f smash=%.2f cusum=%.1f deflake=%.0f decay=%.3f tsLimit=%.3f",
 		params[0], params[1], params[2], params[3], params[4],
-		params[5], params[6], params[7])
-}
-
-// PROBE: Phase 11j — buildDelayFeatures constructs the LinUCB feature vector from program + eBPF metrics.
-// Feature vector (d=8): [prog_len, lock_syscall_ratio, ebpf_contention, ebpf_concurrent,
-//   sched_switches, coverage_delta, prog_category, is_focus]
-func (fuzzer *Fuzzer) buildDelayFeatures(p *prog.Prog, isFocus bool) []float64 {
-	return fuzzer.buildDelayFeaturesWithCluster(p, isFocus, classifyProgram(p))
-}
-
-// buildDelayFeaturesWithCluster is the inner implementation that accepts a pre-computed cluster.
-func (fuzzer *Fuzzer) buildDelayFeaturesWithCluster(p *prog.Prog, isFocus bool, cluster int) []float64 {
-	features := make([]float64, linucbDim)
-
-	// Feature 0: program length (normalized to ~0-1 range).
-	features[0] = math.Min(float64(len(p.Calls))/float64(prog.RecommendedCalls), 2.0)
-
-	// Feature 1: lock-related syscall ratio.
-	lockCount := 0
-	for _, c := range p.Calls {
-		if isLockSyscall(c.Meta.Name) {
-			lockCount++
-		}
-	}
-	if len(p.Calls) > 0 {
-		features[1] = float64(lockCount) / float64(len(p.Calls))
-	}
-
-	// Features 2-4: eBPF race metrics (from recent stats, normalized).
-	features[2] = math.Min(float64(fuzzer.statRaceLockContention.Val())/100.0, 1.0)
-	features[3] = math.Min(float64(fuzzer.statRaceConcurrentAccess.Val())/100.0, 1.0)
-	features[4] = math.Min(float64(fuzzer.statRaceSchedSwitch.Val())/100.0, 1.0)
-
-	// Feature 5: coverage delta (recent coverage entropy as proxy).
-	features[5] = float64(fuzzer.coverageEntropy.Load()) / 3000.0 // entropy x1000, max ~2.5
-
-	// Feature 6: program category (cluster) — uses pre-computed value.
-	features[6] = float64(cluster) / float64(numClusters)
-
-	// Feature 7: is focus execution.
-	if isFocus {
-		features[7] = 1.0
-	}
-
-	return features
+		params[5], params[6])
 }
 
 // recalcRaceThreshold recomputes the P90 lock-contention threshold from the ring buffer.

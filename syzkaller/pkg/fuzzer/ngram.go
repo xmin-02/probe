@@ -61,6 +61,13 @@ type NgramClient struct {
 	predCache   map[string]predCacheEntry
 	predCacheMu sync.RWMutex
 
+	// Frequency-based fallback when BiGRU is unhealthy.
+	pairFreq   map[string]map[string]int // predecessor -> successor -> count
+	pairFreqMu sync.RWMutex
+
+	// Cold-start data collection counter (async send every 100th call when unhealthy).
+	coldSendCount atomic.Int64
+
 	logf func(level int, msg string, args ...any)
 }
 
@@ -96,21 +103,69 @@ func NewNgramClient(addr string, logf func(level int, msg string, args ...any)) 
 		logf:      logf,
 		done:      make(chan struct{}),
 		predCache: make(map[string]predCacheEntry, ngramCacheSize),
+		pairFreq:  make(map[string]map[string]int),
 	}
 	go c.healthLoop()
 	return c
 }
 
+// RecordSequence records a syscall sequence into the frequency-based fallback table.
+// Should be called for each program in the corpus so the fallback has data immediately.
+func (c *NgramClient) RecordSequence(calls []string) {
+	if len(calls) < 2 {
+		return
+	}
+	c.pairFreqMu.Lock()
+	defer c.pairFreqMu.Unlock()
+	for i := 0; i < len(calls)-1; i++ {
+		if c.pairFreq[calls[i]] == nil {
+			c.pairFreq[calls[i]] = make(map[string]int)
+		}
+		c.pairFreq[calls[i]][calls[i+1]]++
+	}
+}
+
 // PredictNextCall returns the BiGRU's predicted next syscall given a context.
 // Uses LRU cache to avoid synchronous TCP on mutation hot path.
-// Returns ("", 0, nil) if the server is unavailable or confidence is too low.
+// Falls back to frequency-based n-gram prediction when BiGRU is unhealthy.
+// Returns ("", 0, nil) if no prediction is available.
 func (c *NgramClient) PredictNextCall(calls []string) (string, float64, error) {
 	c.mu.Lock()
 	healthy := c.healthy
 	c.mu.Unlock()
 
-	if !healthy || len(calls) == 0 {
+	if len(calls) == 0 {
 		return "", 0, nil
+	}
+
+	if !healthy {
+		// Cold-start data collection: periodically send call context to server
+		// so auto-train can bootstrap a model from real fuzzing sequences.
+		c.coldSendCount.Add(1)
+		if c.coldSendCount.Load()%100 == 0 {
+			go c.send(ngramRequest{Method: "predict", Calls: calls})
+		}
+
+		// Frequency-based fallback: return most common successor for last call.
+		last := calls[len(calls)-1]
+		c.pairFreqMu.RLock()
+		successors := c.pairFreq[last]
+		c.pairFreqMu.RUnlock()
+		if len(successors) == 0 {
+			return "", 0, nil
+		}
+		bestCall := ""
+		bestCount := 0
+		for succ, cnt := range successors {
+			if cnt > bestCount {
+				bestCount = cnt
+				bestCall = succ
+			}
+		}
+		if bestCall == "" {
+			return "", 0, nil
+		}
+		return bestCall, 0.5, nil
 	}
 
 	// Cache lookup: use last 3 calls as key (covers most context).

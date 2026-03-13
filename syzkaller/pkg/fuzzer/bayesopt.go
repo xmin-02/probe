@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	boNumParams    = 8     // Phase 12 C1: expanded from 5 to 8
+	boNumParams    = 7     // Phase 12 C1: expanded from 5 to 8; linucbAlpha removed (Phase 11j retired)
 	boEpochSeconds = 300   // Phase 12 C1: 5 min per epoch (was 10min, halved for 8D convergence)
 	boMaxEpochs    = 200   // Phase 12 C1: doubled for 8D (was 100)
 	boEMATransAlpha = 0.3  // Phase 12 C1: EMA transition smoothing for param changes
@@ -58,11 +58,10 @@ var paramBounds = [boNumParams][2]float64{
 	{3.0, 6.0},   // [4] deflakeMaxRuns
 	{0.90, 0.95}, // [5] dezzerDecayFactor (CRIT-5: lower bound 0.90)
 	{0.10, 0.25}, // [6] dezzerTSDeltaLimit
-	{0.30, 1.00}, // [7] linucbAlpha (NEW-2: tightened from [0.5, 3.0])
 }
 
 // paramDefaults provides safe starting values.
-var paramDefaults = [boNumParams]float64{0.10, 0.30, 0.20, 5.0, 4.0, 0.90, 0.20, 1.0}
+var paramDefaults = [boNumParams]float64{0.10, 0.30, 0.20, 5.0, 4.0, 0.90, 0.20}
 
 // BayesOpt implements Nelder-Mead simplex optimization for hyperparameter tuning.
 type BayesOpt struct {
@@ -201,11 +200,11 @@ func (bo *BayesOpt) CheckEpoch(covTotal int64) bool {
 	covGain := covTotal - bo.epochCovStart
 	rate := float64(covGain) / elapsed
 
-	bo.logf(0, "PROBE: BO epoch %d complete: covGain=%d rate=%.2f/s params=[%.3f,%.3f,%.3f,%.1f,%.0f,%.3f,%.3f,%.2f]",
+	bo.logf(0, "PROBE: BO epoch %d complete: covGain=%d rate=%.2f/s params=[%.3f,%.3f,%.3f,%.1f,%.0f,%.3f,%.3f]",
 		bo.epoch, covGain, rate,
 		bo.currentParams[0], bo.currentParams[1], bo.currentParams[2],
 		bo.currentParams[3], bo.currentParams[4],
-		bo.currentParams[5], bo.currentParams[6], bo.currentParams[7])
+		bo.currentParams[5], bo.currentParams[6])
 
 	// Phase 18.5 F1: Always record rate in rolling window.
 	bo.recentRates[bo.recentRateIdx] = rate

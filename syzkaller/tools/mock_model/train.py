@@ -269,6 +269,89 @@ def incremental_train(training_data_path: str, model_path: str = "model.pt",
     }
 
 
+def train_model_from_jsonl(data_path: str, model_path: str = "model.pt",
+                           vocab_path: str = "vocab.pt",
+                           epochs: int = 10, batch_size: int = 64,
+                           lr: float = 0.001, device: str = None) -> dict:
+    """Train BiGRU from scratch using a JSONL inference log (cold-start bootstrap).
+
+    Each line in data_path must be JSON with {"context": [...], "predicted": "..."}.
+    Unlike incremental_train(), this does NOT require an existing model checkpoint.
+
+    Returns:
+        Dict with keys: success (bool), message (str), samples (int).
+    """
+    import json as _json
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if not os.path.exists(data_path):
+        return {"success": False, "message": f"Data file not found: {data_path}", "samples": 0}
+
+    sequences = []
+    with open(data_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                sample = _json.loads(line)
+                seq = list(sample.get("context", [])) + [sample["predicted"]]
+                if len(seq) >= 2:
+                    sequences.append(seq)
+            except Exception:
+                continue
+
+    if len(sequences) < 10:
+        return {"success": False,
+                "message": f"Too few valid sequences ({len(sequences)})", "samples": 0}
+
+    # Build vocabulary from scratch.
+    vocab = Vocabulary()
+    for seq in sequences:
+        for s in seq:
+            vocab.add(s)
+
+    logger.info("Auto-train vocab size: %d, sequences: %d", len(vocab), len(sequences))
+
+    dataset = SyscallDataset(sequences, vocab)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+
+    model = SyscallBiGRU(vocab_size=len(vocab)).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss(ignore_index=0)
+
+    model.train()
+    total_loss = 0.0
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        for batch_ctx, batch_target in loader:
+            batch_ctx = batch_ctx.to(device)
+            batch_target = batch_target.to(device)
+            optimizer.zero_grad()
+            logits = model(batch_ctx)
+            loss = criterion(logits, batch_target)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            epoch_loss += loss.item()
+        avg_loss = epoch_loss / max(len(loader), 1)
+        total_loss = avg_loss
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            logger.info("Auto-train epoch %d/%d — loss: %.4f", epoch + 1, epochs, avg_loss)
+
+    torch.save(model.state_dict(), model_path)
+    torch.save({"word2idx": vocab.word2idx, "idx2word": vocab.idx2word,
+                "next_idx": vocab.next_idx}, vocab_path)
+
+    return {
+        "success": True,
+        "message": f"Cold-start trained on {len(dataset)} samples, loss={total_loss:.4f}",
+        "samples": len(dataset),
+    }
+
+
 if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO)
