@@ -1456,19 +1456,46 @@ func (mgr *Manager) mockModelRetrainLoop(f *fuzzer.Fuzzer) {
 	// Wait 1 hour before first retrain attempt (allow corpus to build up).
 	time.Sleep(1 * time.Hour)
 
-	corpusDir := mgr.cfg.Workdir + "/corpus.db"
+	exportDir := filepath.Join(mgr.cfg.Workdir, "corpus_export")
 	for {
-		// Allow cold-start retrain even when server reports unhealthy (model.pt missing).
-		// The server supports training from scratch — the Healthy() guard was preventing recovery.
 		if client := f.NgramClient(); client != nil {
-			if err := client.Retrain(corpusDir); err != nil {
+			if err := mgr.exportCorpusForRetrain(exportDir); err != nil {
+				log.Logf(0, "PROBE: corpus export failed: %v", err)
+			} else if err := client.Retrain(exportDir); err != nil {
 				log.Logf(0, "PROBE: MOCK model retrain error: %v", err)
 			} else {
-				log.Logf(0, "PROBE: MOCK model retrain triggered (corpus: %s)", corpusDir)
+				log.Logf(0, "PROBE: MOCK model retrain triggered (corpus: %s)", exportDir)
 			}
 		}
 		time.Sleep(2 * time.Hour)
 	}
+}
+
+// exportCorpusForRetrain exports corpus.db records to individual files in a directory.
+// Re-reads from disk because DiscardData() clears in-memory Record.Val to nil.
+func (mgr *Manager) exportCorpusForRetrain(exportDir string) error {
+	os.RemoveAll(exportDir)
+	if err := os.MkdirAll(exportDir, 0755); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+	corpusFile := filepath.Join(mgr.cfg.Workdir, "corpus.db")
+	freshDB, err := db.Open(corpusFile, true)
+	if err != nil {
+		return fmt.Errorf("open corpus.db: %w", err)
+	}
+
+	exported := 0
+	for key, rec := range freshDB.Records {
+		if len(rec.Val) == 0 {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(exportDir, key), rec.Val, 0644); err != nil {
+			continue
+		}
+		exported++
+	}
+	log.Logf(0, "PROBE: exported %d corpus programs for retrain", exported)
+	return nil
 }
 
 func (mgr *Manager) setPhaseLocked(newPhase int) {
